@@ -378,7 +378,9 @@ def _ledger_from_records(records: dict[str, list[dict[str, Any]]]) -> InMemoryLe
     for c in records["candidates"]:
         ledger.add(Candidate(**{**c, "changed_files": tuple(c["changed_files"])}))
     for p in records["replay_plans"]:
-        cases = tuple(BugCase(**{**case, "expected_checks": tuple(case["expected_checks"])}) for case in p["cases"])
+        cases = tuple(
+            BugCase(**{**case, "expected_checks": tuple(case.get("expected_checks", ()))}) for case in p["cases"]
+        )
         ledger.add(ReplayPlan(p["candidate_id"], tuple(p["bug_shas"]), id=p["id"], cases=cases))
     for e in records["evidence"]:
         ledger.add(_evidence(e))
@@ -417,7 +419,24 @@ def test_demo_scenario_hits_targets_and_matches_rater(demo_dump: dict[str, Any],
     assert len(evidence["candidate_seconds"]) >= 5
     assert [o["caught"] for o in evidence["bug_outcomes"]].count(False) == 4 - caught
     assert {o["kind"] for o in evidence["bug_outcomes"]} == {"commit", "mutation"}
-    assert all(set(o) == {"kind", "ref", "baseline_failed", "caught", "run_url"} for o in evidence["bug_outcomes"])
+    assert all(
+        set(o)
+        == {
+            "kind",
+            "ref",
+            "baseline_failed",
+            "caught",
+            "run_url",
+            "modality",
+            "visual_evidence_seen",
+            "visual_summary",
+            "baseline_artifact_urls",
+            "candidate_artifact_urls",
+            "baseline_preview_path",
+            "candidate_preview_path",
+        }
+        for o in evidence["bug_outcomes"]
+    )
     assert all(content.startswith("name: CI") for content in records["candidates"][0]["files"].values())
 
     rated = rate(_evidence(evidence))

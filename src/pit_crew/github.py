@@ -10,13 +10,14 @@ offline without network calls or secrets.
 
 import base64
 import os
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -24,11 +25,17 @@ DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_DISPATCH_POLL_ATTEMPTS = 10
 DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS = 1.0
+MAX_ARTIFACT_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB ZIP archive download cap
+DEFAULT_FAILED_LOG_MAX_BYTES = 262_144  # 256 KiB cap for failed job log excerpts
 API_VERSION = "2022-11-28"
 USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
 _HTTP_NOT_FOUND = 404
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECT_HOPS = 3
+_ARTIFACTS_PER_PAGE = "100"
+_MATRIX_SUFFIX = re.compile(r"\s*\(.*\)$")
 
 
 def _utc_now() -> datetime:
@@ -65,6 +72,42 @@ class WorkflowRunResult:
     html_url: str
     head_sha: str
     head_branch: str
+
+
+@dataclass(frozen=True)
+class RunArtifact:
+    """Metadata for one GitHub Actions workflow run artifact."""
+
+    id: int
+    name: str
+    size_in_bytes: int
+    archive_download_url: str
+    expired: bool
+    created_at: str = ""
+
+
+@runtime_checkable
+class RunArtifactsClient(Protocol):
+    """Reads GitHub Actions run artifacts and failed job logs for multimodal Proof verification."""
+
+    def list_run_artifacts(self, repo: str, run_id: int | str) -> list[RunArtifact]:
+        """List artifacts uploaded by workflow run ``run_id`` in ``repo``."""
+        ...
+
+    def download_artifact(self, repo: str, artifact_id: int) -> bytes:
+        """Download artifact ZIP archive bytes for ``artifact_id``, stripping auth on redirects."""
+        ...
+
+    def get_failed_job_logs(
+        self,
+        repo: str,
+        run_id: int | str,
+        *,
+        check: str | None = None,
+        max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
+    ) -> bytes:
+        """Download logs for failed jobs in workflow run ``run_id``, capped at ``max_bytes``."""
+        ...
 
 
 @runtime_checkable
@@ -251,19 +294,16 @@ class HttpxGitHubClient:
         repo: str,
         branch: str,
         base_sha: str,
-        files: dict[str, str],
+        files: Mapping[str, str | bytes],
         message: str,
     ) -> str:
-        """Create a commit on ``branch`` atop ``base_sha`` with ``files``; returns new ``head_sha``."""
+        """Create a commit on ``branch`` atop ``base_sha`` with text or binary ``files``; returns new ``head_sha``."""
         repo_path = _repo_path(repo)
         base_commit = self._request_json("GET", f"/repos/{repo_path}/git/commits/{quote(base_sha, safe='')}")
         base_tree_sha = _require_str(_require_dict(base_commit, "tree"), "sha")
 
         if files:
-            tree_entries = [
-                {"path": path, "mode": "100644", "type": "blob", "content": content}
-                for path, content in sorted(files.items())
-            ]
+            tree_entries = [self._build_tree_entry(repo_path, path, content) for path, content in sorted(files.items())]
             created_tree = self._request_json(
                 "POST",
                 f"/repos/{repo_path}/git/trees",
@@ -286,6 +326,21 @@ class HttpxGitHubClient:
             json_body={"sha": new_commit_sha},
         )
         return new_commit_sha
+
+    def _build_tree_entry(self, repo_path: str, path: str, content: str | bytes) -> dict[str, str]:
+        if isinstance(content, bytes):
+            created_blob = self._request_json(
+                "POST",
+                f"/repos/{repo_path}/git/blobs",
+                json_body={"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"},
+            )
+            return {
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": _require_str(created_blob, "sha"),
+            }
+        return {"path": path, "mode": "100644", "type": "blob", "content": content}
 
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
         """Trigger ``workflow_dispatch`` for ``workflow`` on ``ref`` and return the ``run_id``."""
@@ -399,6 +454,132 @@ class HttpxGitHubClient:
             json_body={"title": title, "body": body, "head": head, "base": base},
         )
         return _require_str(pr_data, "html_url")
+
+    def list_run_artifacts(self, repo: str, run_id: int | str) -> list[RunArtifact]:
+        """List GitHub Actions artifacts uploaded by workflow run ``run_id`` in ``repo``."""
+        repo_path = _repo_path(repo)
+        run_segment = quote(str(run_id), safe="")
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{run_segment}/artifacts",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        raw_artifacts = data.get("artifacts")
+        if not isinstance(raw_artifacts, list):
+            return []
+        artifacts: list[RunArtifact] = []
+        for item in raw_artifacts:
+            if not isinstance(item, dict):
+                continue
+            artifacts.append(
+                RunArtifact(
+                    id=_require_int(item, "id"),
+                    name=_require_str(item, "name"),
+                    size_in_bytes=_require_int(item, "size_in_bytes"),
+                    archive_download_url=_optional_str(item, "archive_download_url") or "",
+                    expired=bool(item.get("expired", False)),
+                    created_at=_optional_str(item, "created_at") or "",
+                )
+            )
+        return artifacts
+
+    def download_artifact(
+        self,
+        repo: str,
+        artifact_id: int,
+        *,
+        max_bytes: int = MAX_ARTIFACT_DOWNLOAD_BYTES,
+    ) -> bytes:
+        """Download artifact ZIP bytes for ``artifact_id``, stripping ``Authorization`` on 302 redirects."""
+        repo_path = _repo_path(repo)
+        url = f"{self._base_url}/repos/{repo_path}/actions/artifacts/{artifact_id}/zip"
+        return self._download_with_stripped_redirect(url, max_bytes=max_bytes)
+
+    def get_failed_job_logs(
+        self,
+        repo: str,
+        run_id: int | str,
+        *,
+        check: str | None = None,
+        max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
+    ) -> bytes:
+        """Download logs for failed jobs in ``run_id`` (auth-stripped redirects), capped at ``max_bytes``."""
+        failed_jobs = self._list_failed_jobs(repo, run_id)
+        if not failed_jobs:
+            return b""
+        selected = _filter_jobs_for_check(failed_jobs, check)
+        repo_path = _repo_path(repo)
+        sections: list[bytes] = []
+        for job_id, job_name in selected:
+            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job_id}/logs"
+            raw_log = self._download_with_stripped_redirect(url, max_bytes=max_bytes, allow_not_found=True)
+            if raw_log:
+                sections.append(f"=== {job_name} ===\n".encode() + raw_log)
+        combined = b"\n".join(sections)
+        if len(combined) > max_bytes:
+            return combined[-max_bytes:]
+        return combined
+
+    def list_failed_job_names(self, repo: str, run_id: int | str) -> list[str]:
+        """Return display names of jobs whose conclusion is ``failure`` in ``run_id``."""
+        return [job_name for _, job_name in self._list_failed_jobs(repo, run_id)]
+
+    def _list_failed_jobs(self, repo: str, run_id: int | str) -> list[tuple[int, str]]:
+        repo_path = _repo_path(repo)
+        run_segment = quote(str(run_id), safe="")
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{run_segment}/jobs",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        raw_jobs = data.get("jobs")
+        if not isinstance(raw_jobs, list):
+            return []
+        failed: list[tuple[int, str]] = []
+        for job in raw_jobs:
+            if not isinstance(job, dict):
+                continue
+            if _optional_str(job, "conclusion") == "failure":
+                failed.append((_require_int(job, "id"), _require_str(job, "name")))
+        return failed
+
+    def _download_with_stripped_redirect(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        allow_not_found: bool = False,
+    ) -> bytes:
+        current_url = url
+        headers: dict[str, str] = dict(self._headers)
+        for _ in range(_MAX_REDIRECT_HOPS + 1):
+            response = self._client.request(
+                "GET",
+                current_url,
+                headers=headers,
+                follow_redirects=False,
+            )
+            if allow_not_found and response.status_code == _HTTP_NOT_FOUND:
+                return b""
+            if response.status_code in _REDIRECT_STATUSES:
+                location = response.headers.get("location", "").strip()
+                if not location:
+                    msg = f"Redirect response from {current_url!r} is missing Location header."
+                    raise ValueError(msg)
+                next_url = urljoin(current_url, location)
+                _require_http_url(next_url)
+                current_url = next_url
+                # Never forward GitHub bearer credentials to external blob storage redirects.
+                headers = {"User-Agent": USER_AGENT}
+                continue
+            response.raise_for_status()
+            body = response.content
+            if len(body) > max_bytes:
+                msg = f"Download from {current_url!r} exceeded {max_bytes}-byte limit ({len(body)} bytes)."
+                raise ValueError(msg)
+            return body
+        msg = f"Too many redirects while downloading {url!r}."
+        raise ValueError(msg)
 
     def _request(
         self,
@@ -528,6 +709,26 @@ def _require_int(data: Mapping[str, object], key: str) -> int:
 
 def _parse_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _require_http_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        msg = f"Refusing redirect to non-HTTP(S) URL: {url!r}."
+        raise ValueError(msg)
+
+
+def _filter_jobs_for_check(failed_jobs: list[tuple[int, str]], check: str | None) -> list[tuple[int, str]]:
+    if not check or not check.strip():
+        return failed_jobs
+    target = _fold_job_name(check)
+    short_target = target.rsplit("/", maxsplit=1)[-1].strip()
+    matched = [(job_id, name) for job_id, name in failed_jobs if _fold_job_name(name) in {target, short_target}]
+    return matched or failed_jobs
+
+
+def _fold_job_name(name: str) -> str:
+    return _MATRIX_SUFFIX.sub("", name.strip()).strip().lower()
 
 
 def _compute_duration_seconds(data: Mapping[str, object], status: str) -> float:

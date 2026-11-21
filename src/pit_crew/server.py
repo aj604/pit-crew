@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
-from pit_crew.contracts import Candidate, Hypothesis, Verdict
+from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.demo import DemoEngine, create_demo_router
 from pit_crew.ledger import Ledger, SqliteLedger
 from pit_crew.run_tracker import RunTracker
@@ -232,6 +232,101 @@ def _current_base_sha(
     return None
 
 
+def _resolve_preview_url(repo: str, head_sha: str, raw_path: object) -> str:
+    """Resolve a relative committed proof preview path to a raw GitHub URL, or keep safe URLs."""
+    if not isinstance(raw_path, str):
+        return ""
+    path = raw_path.strip()
+    if not path:
+        return ""
+    if path.startswith(("https://", "http://", "/web/", "/brand/")):
+        return path
+    if head_sha and "/" in repo and not path.startswith("/") and ".." not in path.split("/"):
+        return f"https://raw.githubusercontent.com/{repo}/{head_sha}/{path}"
+    return ""
+
+
+def _enrich_bug_outcome(repo: str, head_sha: str, outcome: dict[str, Any]) -> dict[str, Any]:
+    """Ensure attempt detail bug_outcomes expose multimodal fields and resolved preview URLs."""
+    enriched = dict(outcome)
+    enriched.setdefault("modality", "")
+    enriched.setdefault("visual_evidence_seen", False)
+    enriched.setdefault("visual_summary", str(enriched.get("seen") or ""))
+    enriched.setdefault("baseline_artifact_urls", [])
+    enriched.setdefault("candidate_artifact_urls", [])
+    enriched.setdefault("baseline_preview_path", "")
+    enriched.setdefault("candidate_preview_path", "")
+    enriched["baseline_preview_url"] = _resolve_preview_url(
+        repo,
+        head_sha,
+        enriched.get("baseline_preview_url") or enriched.get("baseline_preview_path"),
+    )
+    enriched["candidate_preview_url"] = _resolve_preview_url(
+        repo,
+        head_sha,
+        enriched.get("candidate_preview_url") or enriched.get("candidate_preview_path"),
+    )
+    return enriched
+
+
+def _attempt_detail(ledger: Ledger, repo: str, candidate_id: str) -> dict[str, Any] | None:
+    """Build detailed telemetry and multimodal visual proof payload for one attempt."""
+    repo_key = _normalize_repo(repo)
+    hypotheses = {h.id: h for h in ledger.hypotheses_for_repo(repo)}
+    candidate = next(
+        (
+            c
+            for c in ledger.all(Candidate)
+            if c.id == candidate_id and (c.hypothesis_id in hypotheses or _normalize_repo(c.repo) == repo_key)
+        ),
+        None,
+    )
+    if candidate is None:
+        return None
+
+    hypothesis = hypotheses.get(candidate.hypothesis_id)
+    replay_plan = next((p for p in reversed(ledger.all(ReplayPlan)) if p.candidate_id == candidate_id), None)
+    evidence = next((e for e in reversed(ledger.all(Evidence)) if e.candidate_id == candidate_id), None)
+    verdict = next((v for v in reversed(ledger.all(Verdict)) if v.candidate_id == candidate_id), None)
+    attempt = next((a for a in ledger.prior_attempts(repo) if a.get("candidate_id") == candidate_id), None)
+
+    evidence_payload: dict[str, Any] | None = None
+    visual_proof: list[dict[str, Any]] = []
+    if evidence is not None:
+        evidence_payload = asdict(evidence)
+        enriched_outcomes = [_enrich_bug_outcome(repo, candidate.head_sha, row) for row in evidence.bug_outcomes]
+        evidence_payload["bug_outcomes"] = enriched_outcomes
+        visual_proof = [
+            {
+                "ref": str(row.get("ref") or row.get("sha") or row.get("commit_sha") or ""),
+                "check": str(row.get("check") or ""),
+                "status": str(row.get("status") or ("caught" if row.get("caught") else "missed")),
+                "modality": row["modality"],
+                "visual_evidence_seen": bool(row["visual_evidence_seen"]),
+                "visual_summary": str(row["visual_summary"]),
+                "baseline_artifact_urls": list(row["baseline_artifact_urls"]),
+                "candidate_artifact_urls": list(row["candidate_artifact_urls"]),
+                "baseline_preview_path": str(row["baseline_preview_path"]),
+                "candidate_preview_path": str(row["candidate_preview_path"]),
+                "baseline_preview_url": row["baseline_preview_url"],
+                "candidate_preview_url": row["candidate_preview_url"],
+            }
+            for row in enriched_outcomes
+        ]
+
+    return {
+        "repo": repo,
+        "candidate_id": candidate_id,
+        "attempt": attempt,
+        "hypothesis": asdict(hypothesis) if hypothesis is not None else None,
+        "candidate": asdict(candidate),
+        "replay_plan": asdict(replay_plan) if replay_plan is not None else None,
+        "evidence": evidence_payload,
+        "verdict": asdict(verdict) if verdict is not None else None,
+        "visual_proof": visual_proof,
+    }
+
+
 def _repo_status(
     ledger: Ledger,
     repo: str,
@@ -378,6 +473,20 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
     def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
         """Return prior optimization attempts for a repository."""
         return ledger.prior_attempts(f"{owner}/{name}")
+
+    @app.get(
+        "/api/repos/{owner}/{name}/attempts/{candidate_id}",
+        dependencies=api_auth_dependencies,
+    )
+    def repo_attempt_detail(owner: str, name: str, candidate_id: str) -> dict[str, Any]:
+        """Return detailed telemetry, artifact modality, visual summaries, and preview URLs for one attempt."""
+        detail = _attempt_detail(ledger, f"{owner}/{name}", candidate_id)
+        if detail is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Candidate {candidate_id!r} not found for {owner}/{name}",
+            )
+        return detail
 
     @app.get(
         "/api/repos/{owner}/{name}/records",
