@@ -5,6 +5,7 @@ import { DEMO_SCENARIO_IDS, DEMO_SCENARIOS, DEMO_STAGE_LABELS } from "./demo_sce
 import { createLapHistory } from "./lap_history.js";
 import { createSectorPipeline } from "./pipeline.js";
 import { createPitWallStore, resolveInitialBoot } from "./store.js";
+import { createTelemetryCenter } from "./telemetry.js";
 
 export const SLA_MEDIAN_TARGET_SECONDS = 60;
 export const SLA_P95_TARGET_SECONDS = 120;
@@ -235,8 +236,9 @@ export function bootPitWall(root, search) {
   const switcher = createDemoSwitcher(root, root.getElementById("demo-switcher"), store);
   const pipelineSlot = root.getElementById("sector-pipeline");
   const pipeline = pipelineSlot ? createSectorPipeline(root, pipelineSlot, store) : null;
+  const telemetry = createTelemetryCenter(root, root.getElementById("telemetry-center"), store);
   const lapHistory = createLapHistory(root, root.getElementById("lap-history"), store);
-  return { header, store, switcher, pipeline, lapHistory };
+  return { header, store, switcher, pipeline, telemetry, lapHistory };
 }
 
 if (typeof document !== "undefined") {
