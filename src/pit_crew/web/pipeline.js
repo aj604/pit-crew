@@ -26,7 +26,8 @@ const MAX_INTERLEAVE_PAIRS = 6;
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 
 /** Return the compound ring descriptor for an Optimizer playbook skill. */
-export const compoundForSkill = (skill) => (typeof skill === "string" && COMPOUND_RINGS[skill]) || FALLBACK_COMPOUND;
+export const compoundForSkill = (skill) =>
+  typeof skill === "string" && Object.hasOwn(COMPOUND_RINGS, skill) ? COMPOUND_RINGS[skill] : FALLBACK_COMPOUND;
 
 /** Format expected savings seconds as a telemetry delta (e.g. `-40.0s`). */
 export const formatSavings = (s) => (!isNum(s) ? EMPTY : s > 0 ? `-${s.toFixed(1)}s` : `${Math.abs(s).toFixed(1)}s`);
@@ -55,10 +56,10 @@ export function resolveAttemptRecords(state) {
   const candidate = hasIds
     ? attempt.candidate_id ? (candidates.find((c) => c.id === attempt.candidate_id) ?? null) : null
     : (candidates.at(-1) ?? null);
-  const hypId = attempt?.hypothesis_id ?? candidate?.hypothesis_id ?? null;
+  const hypId = attempt?.hypothesis_id || candidate?.hypothesis_id || null;
   const hypothesis = hypId
     ? (hypotheses.find((h) => h.id === hypId) ?? (hasIds ? null : (hypotheses.at(-1) ?? null)))
-    : (hypotheses.at(-1) ?? null);
+    : hasIds ? null : (hypotheses.at(-1) ?? null);
   const candId = attempt?.candidate_id ?? candidate?.id ?? null;
   const byCand = (k) => {
     const items = list(k);

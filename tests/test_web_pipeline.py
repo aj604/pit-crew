@@ -57,13 +57,24 @@ def test_pipeline_styles_use_brand_tokens_compound_rings_and_file_viewer() -> No
         assert f"var({token})" in section
     assert re.search(r"\.pipeline-files__code\s*\{[^}]*var\(--pc-bg-void\)", section)
     assert re.search(r"\.pipeline-files__code\s*\{[^}]*var\(--pc-font-mono\)", section)
+    assert re.search(
+        r"\.pipeline-files__code\s+code\s*\{[^}]*font-family\s*:\s*(?:inherit|var\(--pc-font-mono\))", section
+    )
+    assert re.search(
+        r'\.pipeline-stage\[data-state="done"\]\s*\{[^}]*border-top-color\s*:\s*var\(--stage-accent\)', section
+    )
+    assert re.search(
+        r'\.pipeline-stage\[data-state="current"\]\s*\{[^}]*border-top-color\s*:\s*var\(--stage-accent\)', section
+    )
     assert re.search(r"\.pipeline-trust-wall\s*\{[^}]*var\(--pc-f1-red\)", section)
     assert "@media (max-width: 1100px)" in section
 
 
 _VIEW_MODEL_SCRIPT = """
 const p = await import(process.argv[1]);
-const skills = ["dep-cache", "shard-by-timing", "affected-tests", "dedupe-jobs", "parallelize-dag", "other", null];
+const skills = [
+  "dep-cache", "shard-by-timing", "affected-tests", "dedupe-jobs", "parallelize-dag", "other", "toString", null,
+];
 const compounds = Object.fromEntries(skills.map((s) => [String(s), p.compoundForSkill(s)]));
 const joinView = p.pipelineViewFromState({
   mode: "live", stageIndex: 0, selectedAttempt: null,
@@ -78,36 +89,62 @@ const joinView = p.pipelineViewFromState({
     verdicts: [{ id: "v1", candidate_id: "c1", keep: false, speedup: 0, p_value: null, reason: "short-circuit" }],
   },
 });
+const multiRecords = {
+  hypotheses: [
+    { id: "h1", workflow_path: "w1.yml", job: "j1", step: "s1", bucket: "running",
+      expected_savings_seconds: 20, confidence: 0.8, skill: "shard-by-timing" },
+    { id: "h2", workflow_path: "w2.yml", job: "j2", step: "s2", bucket: "setup",
+      expected_savings_seconds: 5, confidence: 0.5, skill: "dep-cache" },
+    { id: "h3", workflow_path: "w3.yml", job: "j3", step: "s3", bucket: "running",
+      expected_savings_seconds: 15, confidence: 0.7, skill: "parallelize-dag" },
+  ],
+  candidates: [
+    { id: "c1", hypothesis_id: "h1", branch: "b1", summary: "first",
+      changed_files: ["w1.yml"], files: { "w1.yml": "first-yaml" } },
+    { id: "c2", hypothesis_id: "h2", branch: "b2", summary: "second",
+      changed_files: ["w2.yml"], files: { "w2.yml": "second-yaml" } },
+  ],
+  replay_plans: [
+    { id: "p1", candidate_id: "c1", bug_shas: [],
+      cases: [{ kind: "commit" }, { kind: "mutation" }, { kind: "mutation" }] },
+    { id: "p2", candidate_id: "c2", bug_shas: ["x"], cases: [{ kind: "commit" }] },
+  ],
+  evidence: [
+    { id: "e2", candidate_id: "c2", baseline_seconds: [90, 91], candidate_seconds: [50, 51],
+      bugs_caught: 1, bugs_total: 1 },
+  ],
+  verdicts: [
+    { id: "v2", candidate_id: "c2", keep: true, speedup: 1.8, p_value: 0.004, reason: "fast" },
+  ],
+};
 const multiView = p.pipelineViewFromState({
   mode: "live", stageIndex: 0,
   selectedAttempt: { hypothesis_id: "h1", candidate_id: "c1", skill: "shard-by-timing" },
-  records: {
-    hypotheses: [
-      { id: "h1", workflow_path: "w1.yml", job: "j1", step: "s1", bucket: "running",
-        expected_savings_seconds: 20, confidence: 0.8, skill: "shard-by-timing" },
-      { id: "h2", workflow_path: "w2.yml", job: "j2", step: "s2", bucket: "setup",
-        expected_savings_seconds: 5, confidence: 0.5, skill: "dep-cache" },
-    ],
-    candidates: [
-      { id: "c1", hypothesis_id: "h1", branch: "b1", summary: "first",
-        changed_files: ["w1.yml"], files: { "w1.yml": "first-yaml" } },
-      { id: "c2", hypothesis_id: "h2", branch: "b2", summary: "second",
-        changed_files: ["w2.yml"], files: { "w2.yml": "second-yaml" } },
-    ],
-    replay_plans: [
-      { id: "p1", candidate_id: "c1", bug_shas: [],
-        cases: [{ kind: "commit" }, { kind: "mutation" }, { kind: "mutation" }] },
-      { id: "p2", candidate_id: "c2", bug_shas: ["x"], cases: [{ kind: "commit" }] },
-    ],
-    evidence: [], verdicts: [],
-  },
+  records: multiRecords,
+});
+const unattemptedView = p.pipelineViewFromState({
+  mode: "live", stageIndex: 0,
+  selectedAttempt: { hypothesis_id: "h3", candidate_id: null, skill: "parallelize-dag" },
+  records: multiRecords,
+});
+const emptyHypIdView = p.pipelineViewFromState({
+  mode: "live", stageIndex: 0,
+  selectedAttempt: { hypothesis_id: "", candidate_id: "c1" },
+  records: multiRecords,
+});
+const missingKeyedView = p.pipelineViewFromState({
+  mode: "live", stageIndex: 0,
+  selectedAttempt: { hypothesis_id: "", candidate_id: "c-missing" },
+  records: multiRecords,
 });
 const emptyLive = p.pipelineViewFromState({
   mode: "live", stageIndex: 4, selectedAttempt: null,
   records: { hypotheses: [], candidates: [], replay_plans: [], evidence: [], verdicts: [] },
 });
 const pvals = [null, 0.0004, 0.004, 0.24].map(p.formatPValue);
-console.log(JSON.stringify({ compounds, joinView, multiView, emptyLive, pvals }));
+console.log(JSON.stringify({
+  compounds, joinView, multiView, unattemptedView, emptyHypIdView, missingKeyedView, emptyLive, pvals,
+}));
 """
 
 
@@ -124,6 +161,7 @@ def test_pipeline_view_model_compound_rings_and_edge_cases() -> None:
         "dedupe-jobs": "--pc-compound-hypersoft",
         "parallelize-dag": "--pc-compound-inter",
         "other": "--pc-ink-muted",
+        "toString": "--pc-ink-muted",
         "null": "--pc-ink-muted",
     }
     jv = out["joinView"]
@@ -143,6 +181,17 @@ def test_pipeline_view_model_compound_rings_and_edge_cases() -> None:
     assert (mv["stages"][0]["data"]["workflowPath"], mv["stages"][1]["data"]["branch"]) == ("w1.yml", "b1")
     assert mv["stages"][1]["data"]["files"] == [{"path": "w1.yml", "content": "first-yaml"}]
     assert mv["stages"][2]["data"] == {"commitCount": 1, "mutationCount": 2, "totalCount": 3}
+    assert (mv["stages"][3]["data"], mv["stages"][4]["data"]) == (None, None)
+
+    uv = out["unattemptedView"]
+    assert [s["state"] for s in uv["stages"]] == ["current", "pending", "pending", "pending", "pending"]
+    assert uv["trustWall"]["crossed"] is False
+    assert uv["stages"][0]["data"]["workflowPath"] == "w3.yml"
+    assert [s["data"] for s in uv["stages"][1:]] == [None, None, None, None]
+
+    assert out["emptyHypIdView"]["stages"][0]["data"]["workflowPath"] == "w1.yml"
+    assert [s["data"] for s in out["missingKeyedView"]["stages"]] == [None] * 5
+    assert [s["state"] for s in out["missingKeyedView"]["stages"]] == ["pending"] * 5
 
     assert [s["state"] for s in out["emptyLive"]["stages"]] == ["pending"] * 5
     assert out["emptyLive"]["trustWall"]["crossed"] is False
@@ -209,6 +258,7 @@ sw.stepButton.click(); const collapsed = pl.fileViewer.open;
 pl.fileViewer.open = true; pl.fileViewer.dispatchEvent({ type: "toggle" });
 sw.stepButton.click(); const staysOpen = pl.fileViewer.open;
 pw.store.selectScenario("unsafe_reject"); const resetsOnSwitch = pl.fileViewer.open;
+pw.store.selectScenario("proven_keep"); const resetsOnReturn = pl.fileViewer.open;
 live.click(); const liveEmpty = snap();
 pw.store.setLiveData({
   status: { repo: "owner/repo", active: false, base_sha: "abc1234", sla_met: false, latest_verdict: null },
@@ -235,7 +285,7 @@ pw.store.setLiveData({
 const live2 = snap(); pw.store.selectAttempt(0); const live1 = snap();
 console.log(JSON.stringify({
   wallRole: pl.trustWall.attrs.role, wallText: allText(pl.trustWall), scenarios, playStart,
-  collapsed, staysOpen, resetsOnSwitch, liveEmpty, live2, live1,
+  collapsed, staysOpen, resetsOnSwitch, resetsOnReturn, liveEmpty, live2, live1,
 }));
 """
 
@@ -281,7 +331,9 @@ def test_sector_pipeline_dom_playback_and_file_viewer() -> None:
         assert all(tok in stages[4]["raterText"] for tok in (flag, speedup, pval))
 
     assert (out["playStart"]["analysis"], out["playStart"]["optimizer"]) == ("current", "pending")
-    assert (out["collapsed"], out["staysOpen"], out["resetsOnSwitch"]) == (False, True, False)
+    assert (out["collapsed"], out["staysOpen"], out["resetsOnSwitch"], out["resetsOnReturn"]) == (
+        False, True, False, False,
+    )  # fmt: skip
     assert out["liveEmpty"]["states"] == dict.fromkeys(("analysis", "optimizer", "proof", "ci", "rater"), "pending")
     assert (out["live2"]["codeText"], out["live2"]["compound"]["skill"]) == ("FILE_B", "affected-tests")
     assert (out["live1"]["codeText"], out["live1"]["compound"]["skill"]) == ("FILE_A", "dep-cache")
