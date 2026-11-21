@@ -33,15 +33,17 @@ An agent inspects your repository and run history, proposes a single targeted CI
 
 Lanes never call each other. Every handoff flows through immutable records in the SQLite ledger ([`src/pit_crew/contracts.py`](src/pit_crew/contracts.py)), so each lane can be built and tested in isolation.
 
-| Code | Lane | Runtime / Model | Reads | Writes | Location |
-|---|---|---|---|---|---|
-| `ANA` | **Analysis** | `gemini-4-hydrogen` | Repo, workflow DAG, run history | `Hypothesis` | [`src/pit_crew/lanes/analysis/`](src/pit_crew/lanes/analysis/) |
-| `OPT` | **Optimizer** | `gemini-4-neon` | `Hypothesis`, prior verdicts | `Candidate` | [`src/pit_crew/lanes/optimizer/`](src/pit_crew/lanes/optimizer/) |
-| `PRF` | **Proof** | `gemini-4-carbon` | `Candidate`, git history, failure artifacts | `ReplayPlan` | [`src/pit_crew/lanes/proof/`](src/pit_crew/lanes/proof/) |
-| `DSP` | **Dispatcher** | Deterministic code | Ledger, `workflow_run` webhooks | `Evidence` | [`src/pit_crew/dispatcher.py`](src/pit_crew/dispatcher.py), [`managed_agent.py`](src/pit_crew/managed_agent.py) |
-| `RAT` | **Rater** | Deterministic code | `Evidence` | `Verdict` | [`src/pit_crew/rater.py`](src/pit_crew/rater.py) |
+| Code | Lane | Lane Owner | Runtime / Model | Reads | Writes | Location |
+|---|---|---|---|---|---|---|
+| `ANA` | **Analysis** | [@TARUNSAIYAKKALA](https://github.com/TARUNSAIYAKKALA) | `gemini-4-hydrogen` | Repo, workflow DAG, run history | `Hypothesis` | [`src/pit_crew/lanes/analysis/`](src/pit_crew/lanes/analysis/) |
+| `OPT` | **Optimizer** | [@mdmorsalinm](https://github.com/mdmorsalinm) | `gemini-4-neon` | `Hypothesis`, prior verdicts | `Candidate` | [`src/pit_crew/lanes/optimizer/`](src/pit_crew/lanes/optimizer/) |
+| `PRF` | **Proof** | [@kreda-ship-it](https://github.com/kreda-ship-it) | `gemini-4-carbon` | `Candidate`, git history, failure artifacts | `ReplayPlan` | [`src/pit_crew/lanes/proof/`](src/pit_crew/lanes/proof/) |
+| `DSP` | **Dispatcher** | [@aj604](https://github.com/aj604) | Deterministic code | Ledger, `workflow_run` webhooks | `Evidence` | [`src/pit_crew/dispatcher.py`](src/pit_crew/dispatcher.py), [`managed_agent.py`](src/pit_crew/managed_agent.py) |
+| `RAT` | **Rater** | [@aj604](https://github.com/aj604) | Deterministic code | `Evidence` | `Verdict` | [`src/pit_crew/rater.py`](src/pit_crew/rater.py) |
 
 Each agent lane is defined by a `SKILL.md` (instructions mounted into the sandbox) and a `tools.py` (host-mediated `@tool` functions).
+
+Core platform surfaces (`contracts.py`, `ledger.py`, `server.py`, `webhooks.py`, `run_tracker.py`, `demo/`, and the Pit Wall `web/` UI) are owned by [@aj604](https://github.com/aj604). Review routing lives in [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
 ## Optimizer Playbooks
 
@@ -109,6 +111,14 @@ See the [Lane Owner Guide](docs/lane-guide.md#live-smoke-test-milestone-2) for t
 ## Documentation
 
 - [**Architecture**](docs/architecture.md) — End-to-end lifecycle, trust boundaries, data contracts, and platform decisions.
+- [**Master Specifications**](docs/specs/) — Seven design specs that drive the remaining milestones:
+  - [Spec 1A — Core Dispatcher & GitHub Actions Orchestrator](docs/specs/dispatcher-core.md)
+  - [Spec 1B — Webhook Server & Pit Wall API](docs/specs/dispatcher-server.md)
+  - [Spec 2 — Pit Wall UI & Telemetry Dashboard](docs/specs/pit-wall-ui.md)
+  - [Spec 3 — End-to-End Integration & Live Smoke Harness](docs/specs/e2e-integration.md)
+  - [Spec 3B — Cross-Lane Seam & Event-Driven Runtime Wiring](docs/specs/cross-lane-wiring.md)
+  - [Spec 4A — Runtime Packaging, Webhook Ingress & Repo Governance](docs/specs/infra-and-ops.md)
+  - [Spec 4B — Target Benchmark Repository & Seeded CI History](docs/specs/benchmark-target-repo.md)
 - [**Lane Owner Guide**](docs/lane-guide.md) — Working agreements, `@tool` and `SKILL.md` conventions, testing, and per-lane starting points.
 - [**Contributing**](CONTRIBUTING.md) — Branching, contract PR rules, and pre-merge checks.
 - [**Brand Guidelines**](brand/BRAND.md) — Las Vegas Night Race visual identity, color tokens, and PR verdict templates.

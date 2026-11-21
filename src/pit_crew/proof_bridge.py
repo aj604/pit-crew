@@ -12,10 +12,10 @@ from functools import partial
 from typing import Protocol
 
 from pit_crew.contracts import Candidate, Evidence, Verdict
-from pit_crew.github import ProofHistoryClient, PullRequestClient
+from pit_crew.github import PullRequestClient
 from pit_crew.lanes.proof.card import pr_body, render_card
 from pit_crew.lanes.proof.checks import Check, FileChange, touched_checks
-from pit_crew.lanes.proof.miner import RedCommit, flaky_checks, red_commits
+from pit_crew.lanes.proof.miner import JobRun, RedCommit, flaky_checks, red_commits
 from pit_crew.lanes.proof.tools import MAX_REPLAYS, pick_replays, uncovered_checks
 from pit_crew.lanes.proof.verify import AskModel, Replay, compare_failures, tally, verify_replays
 from pit_crew.ledger import Ledger
@@ -45,6 +45,22 @@ class ProofBridgeError(ValueError):
     def missing_pr_client(cls) -> "ProofBridgeError":
         """Build error when ``open_kept_pr()`` is called without a ``PullRequestClient``."""
         return cls("ProofBridge.open_kept_pr() requires a PullRequestClient (github or pr_client)")
+
+
+class ProofHistoryClient(Protocol):
+    """Reads base files and recent workflow job runs for Proof pre-pass mining."""
+
+    def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
+        """Return UTF-8 file content at ``ref`` in ``repo``, or ``None`` if absent."""
+        ...
+
+    def list_workflow_job_runs(self, repo: str) -> Sequence[JobRun]:
+        """Return recent GitHub Actions job run attempts for ``repo``."""
+        ...
+
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        """Return failed job logs or recorded artifact bytes for workflow run ``run_id`` in ``repo``."""
+        ...
 
 
 class LaneRunner(Protocol):

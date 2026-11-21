@@ -16,7 +16,7 @@ from pit_crew.publisher import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from pit_crew.github import CandidatePublisherClient, GitHubClient
+    from pit_crew.github import CandidatePublisherClient, PullRequestClient
     from pit_crew.lanes.proof.miner import JobRun
 
 REPO = "org/fork"
@@ -86,9 +86,10 @@ def _candidate(**overrides: object) -> Candidate:
 
 
 def test_fake_satisfies_protocols(gh: FakeGitHub) -> None:
-    client: GitHubClient = gh
-    publisher_client: CandidatePublisherClient = client
+    publisher_client: CandidatePublisherClient = gh
+    pr_client: PullRequestClient = gh
     assert publisher_client is gh
+    assert pr_client is gh
 
 
 def test_publishes_files_onto_branch_from_resolved_base(gh: FakeGitHub, ledger: SqliteLedger) -> None:

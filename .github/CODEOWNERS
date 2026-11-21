@@ -1,0 +1,27 @@
+# Pit Crew code owners. Later patterns take precedence over earlier ones.
+# Lane owners are also listed in README.md (The Five Lanes).
+
+# Default: core platform owner reviews anything not claimed below.
+*                                   @aj604
+
+# Agent lanes
+/src/pit_crew/lanes/analysis/       @TARUNSAIYAKKALA
+/src/pit_crew/lanes/optimizer/      @mdmorsalinm
+/src/pit_crew/lanes/proof/          @kreda-ship-it
+
+# Core platform: contracts, ledger, rater, dispatcher, runtime, server
+/src/pit_crew/contracts.py          @aj604
+/src/pit_crew/ledger.py             @aj604
+/src/pit_crew/rater.py              @aj604
+/src/pit_crew/dispatcher.py         @aj604
+/src/pit_crew/managed_agent.py      @aj604
+/src/pit_crew/server.py             @aj604
+/src/pit_crew/webhooks.py           @aj604
+/src/pit_crew/run_tracker.py        @aj604
+/src/pit_crew/demo/                 @aj604
+# Reserved for the Pit Wall UI (#33); the directory does not exist yet.
+/src/pit_crew/web/                  @aj604
+
+# Repo governance and CI
+/.github/                           @aj604
+/docs/specs/                        @aj604
