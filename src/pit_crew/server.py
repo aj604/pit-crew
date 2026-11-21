@@ -4,9 +4,10 @@ import asyncio
 import hmac
 import inspect
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Literal, Protocol, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -26,7 +27,12 @@ def _normalize_repo(repo: str) -> str:
 
 
 class DispatcherProtocol(Protocol):
-    """Protocol for dispatcher instances wired into the FastAPI server."""
+    """Protocol for dispatcher instances wired into the FastAPI server.
+
+    To report live progress, a dispatcher adds an optional keyword argument
+    ``on_progress: ProgressCallback | None = None`` to either method; the server
+    detects it at call time and passes a :class:`ProgressCallback`.
+    """
 
     def run_cycle(self, repo: str) -> object:
         """Run a single optimization cycle for a repository."""
@@ -35,6 +41,123 @@ class DispatcherProtocol(Protocol):
     def run_until_sla(self, repo: str) -> object:
         """Run optimization cycles for a repository until its SLA is met."""
         ...
+
+
+CycleStage = Literal["analysis", "optimizer", "proof", "timing", "replay", "rating"]
+CYCLE_STAGES: tuple[CycleStage, ...] = get_args(CycleStage)
+
+
+class ProgressCallback(Protocol):
+    """Callback a dispatcher calls to report live cycle progress.
+
+    Dispatchers opt in by accepting an ``on_progress`` keyword argument on
+    ``run_cycle`` / ``run_until_sla``. Dispatchers that do not accept it are
+    still called without it, so their status shows ``active`` with no stage.
+    """
+
+    def __call__(self, stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
+        """Report the active stage and how many workflow runs have completed."""
+        ...
+
+
+@dataclass(frozen=True)
+class CycleProgress:
+    """Snapshot of a running cycle's stage and workflow-run counts."""
+
+    stage: CycleStage | None = None
+    completed_runs: int = 0
+    total_runs: int = 0
+
+
+IDLE_PROGRESS = CycleProgress()
+
+
+class CycleProgressBoard:
+    """Thread-safe per-repo progress state for running cycles.
+
+    Each cycle gets a fresh token from :meth:`start`. Updates and clears carry
+    that token, so a reporter left over from a finished or cancelled cycle can
+    never overwrite the progress of a later cycle for the same repo.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty board."""
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[object, CycleProgress]] = {}
+
+    def start(self, repo_key: str) -> object:
+        """Begin tracking a new cycle for ``repo_key`` and return its token."""
+        token = object()
+        with self._lock:
+            self._entries[repo_key] = (token, IDLE_PROGRESS)
+        return token
+
+    def update(self, repo_key: str, token: object, progress: CycleProgress) -> bool:
+        """Record ``progress`` if ``token`` still owns ``repo_key``; return whether it did."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+            if entry is None or entry[0] is not token:
+                return False
+            self._entries[repo_key] = (token, progress)
+            return True
+
+    def clear(self, repo_key: str, token: object) -> None:
+        """Drop progress for ``repo_key`` if ``token`` still owns it."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+            if entry is not None and entry[0] is token:
+                del self._entries[repo_key]
+
+    def get(self, repo_key: str) -> CycleProgress:
+        """Return the current progress for ``repo_key``, or idle defaults."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+        return entry[1] if entry is not None else IDLE_PROGRESS
+
+    def reporter(self, repo_key: str, token: object) -> ProgressCallback:
+        """Build the ``on_progress`` callback handed to the dispatcher for one cycle."""
+
+        def on_progress(stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
+            if not _valid_progress(stage, completed_runs, total_runs):
+                logger.warning(
+                    "Ignoring invalid progress for %s: stage=%r completed_runs=%r total_runs=%r",
+                    repo_key,
+                    stage,
+                    completed_runs,
+                    total_runs,
+                )
+                return
+            progress = CycleProgress(stage=stage, completed_runs=completed_runs, total_runs=total_runs)
+            if not self.update(repo_key, token, progress):
+                logger.debug("Ignoring progress for %s from a finished cycle", repo_key)
+
+        return on_progress
+
+
+def _valid_progress(stage: object, completed_runs: object, total_runs: object) -> bool:
+    """Return whether a progress report has a known stage and sane run counts."""
+    if stage not in CYCLE_STAGES:
+        return False
+    if type(completed_runs) is not int or type(total_runs) is not int:
+        return False
+    return 0 <= completed_runs <= total_runs
+
+
+def _accepts_on_progress(fn: Callable[..., object]) -> bool:
+    """Return whether ``fn`` can be called with an ``on_progress`` keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "on_progress" and param.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -49,22 +172,30 @@ async def _run_cycle_task(
     dispatcher: DispatcherProtocol,
     repo: str,
     *,
-    repo_key: str,
     until_sla: bool,
     active_repos: set[str],
+    progress_board: CycleProgressBoard | None = None,
 ) -> None:
-    """Execute a dispatcher cycle and always release the per-repo lock."""
+    """Execute a dispatcher cycle, reporting progress, and always release the per-repo lock."""
+    repo_key = _normalize_repo(repo)
+    board = progress_board if progress_board is not None else CycleProgressBoard()
+    token = board.start(repo_key)
     try:
-        fn = dispatcher.run_until_sla if until_sla else dispatcher.run_cycle
+        fn: Callable[..., object] = dispatcher.run_until_sla if until_sla else dispatcher.run_cycle
+        kwargs: dict[str, Any] = {}
+        if _accepts_on_progress(fn):
+            kwargs["on_progress"] = board.reporter(repo_key, token)
         if inspect.iscoroutinefunction(fn):
-            await fn(repo)
+            await fn(repo, **kwargs)
         else:
-            result = await asyncio.to_thread(fn, repo)
+            result = await asyncio.to_thread(fn, repo, **kwargs)
             if inspect.isawaitable(result):
                 await result
     except Exception:
         logger.exception("Cycle failed for %s", repo)
     finally:
+        # Clear progress before releasing the lock so an idle status never shows a stale stage.
+        board.clear(repo_key, token)
         active_repos.discard(repo_key)
 
 
@@ -92,9 +223,16 @@ def _current_base_sha(
     return None
 
 
-def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str, Any]:
+def _repo_status(
+    ledger: Ledger,
+    repo: str,
+    active_repos: set[str],
+    progress_board: CycleProgressBoard | None = None,
+) -> dict[str, Any]:
     """Build the Pit Wall status payload for ``repo``."""
     repo_key = _normalize_repo(repo)
+    active = repo_key in active_repos
+    progress = progress_board.get(repo_key) if active and progress_board is not None else IDLE_PROGRESS
     hypotheses = ledger.hypotheses_for_repo(repo)
     hypothesis_ids = {h.id for h in hypotheses}
     repo_candidates = [
@@ -114,10 +252,13 @@ def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str,
     base_sha = _current_base_sha(latest_kept, repo_candidates, hypotheses)
     return {
         "repo": repo,
-        "active": repo_key in active_repos,
+        "active": active,
         "base_sha": base_sha,
         "latest_verdict": asdict(latest_verdict) if latest_verdict is not None else None,
         "sla_met": latest_kept_verdict.sla_met if latest_kept_verdict is not None else False,
+        "stage": progress.stage,
+        "completed_runs": progress.completed_runs,
+        "total_runs": progress.total_runs,
     }
 
 
@@ -156,6 +297,7 @@ def create_app(
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
+    progress_board = CycleProgressBoard()
     tracker = run_tracker if run_tracker is not None else RunTracker()
     engine = DemoEngine()
     app.state.ledger = ledger
@@ -165,6 +307,7 @@ def create_app(
     app.state.api_token = api_token
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
+    app.state.progress_board = progress_board
     app.state.demo_engine = engine
 
     api_auth_dependencies = [Depends(_make_api_token_dependency(api_token))] if api_token is not None else []
@@ -202,9 +345,9 @@ def create_app(
             _run_cycle_task(
                 dispatcher,
                 payload.repo,
-                repo_key=repo_key,
                 until_sla=payload.until_sla,
                 active_repos=active_repos,
+                progress_board=progress_board,
             )
         )
         background_tasks.add(task)
@@ -232,7 +375,7 @@ def create_app(
         dependencies=api_auth_dependencies,
     )
     def repo_status(owner: str, name: str) -> dict[str, Any]:
-        """Return current cycle state, base SHA, latest verdict, and SLA status."""
-        return _repo_status(ledger, f"{owner}/{name}", active_repos)
+        """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
+        return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
     return app
