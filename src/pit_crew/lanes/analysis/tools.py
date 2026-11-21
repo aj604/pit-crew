@@ -5,6 +5,7 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +16,24 @@ from pit_crew.lanes.analysis.workflow import parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_WORKFLOW_FILE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
+
 
 def workspace() -> Path:
     """Where the fork is checked out: /workspace in the managed-agent sandbox."""
     return Path(os.environ.get("PIT_CREW_WORKSPACE", "/workspace"))
+
+
+def workflow_path(workflow: str) -> Path:
+    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+    if not _WORKFLOW_FILE.fullmatch(workflow) or workflow.startswith("."):
+        raise ValueError(f"workflow must be a file name like ci.yml, got {workflow!r}")
+    folder = (workspace() / ".github" / "workflows").resolve()
+    path = (folder / workflow).resolve()
+    if path.parent != folder:  # a symlink pointing out of the folder
+        raise ValueError(f"workflow {workflow!r} resolves outside .github/workflows")
+    return path
 
 
 @tool(
@@ -43,7 +58,9 @@ def profile_ci(ledger: Ledger, repo: str, workflow: str, runs: int = 30, branch:
     Jobs with max_saving_seconds of 0 are off the critical path; speeding them up saves nothing.
     Also returns the slowest steps.
     """
-    spec = parse_workflow((workspace() / ".github" / "workflows" / workflow).read_text())
+    if not _REPO.fullmatch(repo) or ".." in repo:
+        raise ValueError(f"repo must be owner/name, got {repo!r}")
+    spec = parse_workflow(workflow_path(workflow).read_text())
     raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
     return profile(spec, history.parse_runs(raw)).to_dict()
 

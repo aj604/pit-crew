@@ -307,3 +307,32 @@ def test_profile_ci_tool_reads_the_workspace_workflow(monkeypatch, tmp_path):
     json.dumps(result)  # must be JSON-serializable for the agent
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
     assert len(result["steps"]) == 15
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"repo": "o/r", "workflow": "../../etc/passwd"},
+        {"repo": "o/r", "workflow": "sub/ci.yml"},
+        {"repo": "o/r", "workflow": "..yml"},
+        {"repo": "o/r/../../user", "workflow": "ci.yml"},
+        {"repo": "o/..", "workflow": "ci.yml"},
+        {"repo": "o", "workflow": "ci.yml"},
+    ],
+)
+def test_profile_ci_rejects_paths_outside_the_workflows_folder(monkeypatch, tmp_path, args):
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(history, "fetch_history", lambda *a, **k: pytest.fail("must not fetch"))
+    build_request("analysis", "")
+    with pytest.raises(ValueError):
+        tools.call("profile_ci", InMemoryLedger(), args)
+
+
+def test_profile_ci_rejects_a_workflow_symlinked_out_of_the_folder(monkeypatch, tmp_path):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / "secret.yml").write_text("jobs: {}")
+    (tmp_path / ".github" / "workflows" / "ci.yml").symlink_to(tmp_path / "secret.yml")
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    build_request("analysis", "")
+    with pytest.raises(ValueError, match="outside"):
+        tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml"})
