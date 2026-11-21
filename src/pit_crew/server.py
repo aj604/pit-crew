@@ -64,8 +64,8 @@ def _current_base_sha(
     hypotheses: list[Hypothesis],
 ) -> str | None:
     """Resolve the current base SHA for a repository from its ledger records."""
-    if latest_kept is not None:
-        return latest_kept.head_sha or latest_kept.base_sha or None
+    if latest_kept is not None and (latest_kept.head_sha or latest_kept.base_sha):
+        return latest_kept.head_sha or latest_kept.base_sha
     for cand in reversed(candidates):
         if cand.base_sha:
             return cand.base_sha

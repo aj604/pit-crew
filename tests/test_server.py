@@ -402,6 +402,38 @@ def test_repo_status_reflects_active_and_idle_cycle() -> None:
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_repo_status_kept_candidate_without_shas_falls_back_to_hypothesis(backend: str, tmp_path: Path) -> None:
+    ledger = _make_ledger(backend, tmp_path)
+    ledger.add(
+        Hypothesis(
+            id="h1",
+            repo="acme/widget",
+            description="Cache pip dependencies",
+            skill="dep-cache",
+            expected_savings_seconds=30.0,
+            base_sha="abc123",
+        )
+    )
+    ledger.add(
+        Candidate(
+            id="c1",
+            hypothesis_id="h1",
+            repo="acme/widget",
+            branch="pit-crew/dep-cache",
+            summary="Cached dependencies",
+        )
+    )
+    ledger.add(Verdict(id="v1", candidate_id="c1", keep=True, speedup=2.0, p_value=0.01, reason="Faster"))
+
+    with TestClient(create_app(ledger=ledger)) as client:
+        response = client.get("/api/repos/acme/widget/status")
+
+    assert response.status_code == 200
+    assert response.json()["base_sha"] == "abc123"
+    assert response.json()["latest_verdict"]["keep"] is True
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_repo_status_post_verdict_and_base_sha_progression(backend: str, tmp_path: Path) -> None:
     ledger = _make_ledger(backend, tmp_path)
     app = create_app(ledger=ledger)
