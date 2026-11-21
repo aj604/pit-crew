@@ -509,6 +509,7 @@ def test_profile_ci_accepts_workflow_content_without_host_checkout(
     raw = fastapi_raw()
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
     monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
+    _match_every_run(monkeypatch, (FIXTURES / "fastapi" / "test.yml").read_text())
 
     build_request("analysis", "")
     result = tools.call(
@@ -535,6 +536,7 @@ def test_profile_ci_accepts_explicit_ref_without_host_checkout(monkeypatch: pyte
 
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    _match_every_run(monkeypatch, workflow_text)
 
     build_request("analysis", "")
     result = tools.call(
