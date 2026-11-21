@@ -55,3 +55,36 @@ def test_widening_a_conditional_continue_on_error_is_rejected() -> None:
     before = head + "    continue-on-error: ${{ matrix.xfail && true || false }}\n" + steps
     problems = _problems(head + "    continue-on-error: true\n" + steps, before)
     assert problems == [f"{CI}: job `t` widens `continue-on-error` to True"]
+
+
+MATRIX_HEAD = (
+    "on: push\njobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n"
+)
+HTTPX_ROW = "          - os: ubuntu-latest\n            python-version: '3.13'\n            without-httpx2: true\n"
+PLAIN_ROW = "          - os: ubuntu-latest\n            python-version: '3.13'\n"
+MATRIX_STEPS = (
+    "    steps:\n      - run: uv pip uninstall httpx2\n        if: matrix.without-httpx2\n      - run: pytest\n"
+)
+
+
+def test_dropping_a_matrix_row_that_only_changes_a_condition_is_rejected() -> None:
+    before = MATRIX_HEAD + HTTPX_ROW + PLAIN_ROW + MATRIX_STEPS
+    after = MATRIX_HEAD + PLAIN_ROW + MATRIX_STEPS
+    problems = _problems(after, before)
+    assert any("drops the matrix row" in p and "without-httpx2" in p for p in problems), problems
+
+
+def test_rows_that_gain_a_shard_key_still_count() -> None:
+    before = MATRIX_HEAD + HTTPX_ROW + PLAIN_ROW + MATRIX_STEPS
+    shard = (
+        HTTPX_ROW
+        + "            shard: 1\n"
+        + HTTPX_ROW
+        + "            shard: 2\n"
+        + PLAIN_ROW
+        + "            shard: 1\n"
+        + PLAIN_ROW
+        + "            shard: 2\n"
+    )
+    after = MATRIX_HEAD + shard + MATRIX_STEPS.replace("- run: pytest", "- run: pytest --shard=${{ matrix.shard }}/2")
+    assert _problems(after, before) == []

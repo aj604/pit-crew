@@ -529,13 +529,29 @@ def _matrix_kept(old: Workflow, new: Workflow) -> list[str]:
             continue
         before, after = _matrix_values(job), _matrix_values(new_jobs[job_id])
         for key, values in before.items():
-            if key in ("include", "exclude"):  # include rows are compared row by row in _checks_kept
+            if key in ("include", "exclude"):  # include and exclude are judged by the rows they produce
                 continue
             if lost := values - after.get(key, set()):
                 problems.append(f"job `{job_id}` drops matrix {key} values {sorted(lost)}")
         if len(after.get("exclude", set())) > len(before.get("exclude", set())):
             problems.append(f"job `{job_id}` excludes more matrix combinations")
+        problems += _rows_kept(job_id, job, new_jobs[job_id])
     return problems
+
+
+def _rows_kept(job_id: str, old: Workflow, new: Workflow) -> list[str]:
+    """Every original matrix row must still run, matched on all of its keys.
+
+    A row can matter only through a value a step's `if:` or `env` reads (FastAPI's
+    `without-httpx2` row), so commands and runners alone cannot tell rows apart. A new row may add
+    keys, such as `shard`, and still stands for the old one.
+    """
+    new_rows = _combinations(job_id, new)
+    return [
+        f"job `{job_id}` drops the matrix row {json.dumps(row, sort_keys=True)}"
+        for row in _combinations(job_id, old)
+        if row and not any(all(candidate.get(k) == v for k, v in row.items()) for candidate in new_rows)
+    ]
 
 
 def _matrix_values(job: Workflow) -> dict[str, set[str]]:

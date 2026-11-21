@@ -155,6 +155,17 @@ def drop_matrix_value(workflow: Workflow) -> Workflow | None:
     return None
 
 
+def drop_include_row(workflow: Workflow) -> Workflow | None:
+    """Delete one `matrix.include` row, such as a dependency-variant row."""
+    for job in _jobs(workflow).values():
+        matrix = job.get("strategy", {}).get("matrix") if isinstance(job.get("strategy"), dict) else None
+        include = matrix.get("include") if isinstance(matrix, dict) else None
+        if isinstance(include, list) and len(include) > 1:
+            include.pop()
+            return workflow
+    return None
+
+
 def append_or_true(workflow: Workflow) -> Workflow | None:
     """Let the test command fail without failing the job."""
     return _edit_test_line(workflow, lambda line: line + " || true")
@@ -444,6 +455,7 @@ def _split(workflow: Workflow, *, gate: bool) -> Workflow | None:
 
 WEAKENING: tuple[Operator, ...] = (
     drop_matrix_value,
+    drop_include_row,
     append_or_true,
     add_continue_on_error,
     disable_job,
