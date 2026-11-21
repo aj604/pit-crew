@@ -484,6 +484,50 @@ def test_profile_ci_rejects_a_workflow_symlinked_out_of_the_folder(
         tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml"})
 
 
+def test_profile_ci_accepts_workflow_content_without_host_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    raw = fastapi_raw()
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci",
+        InMemoryLedger(),
+        {
+            "repo": "fastapi/fastapi",
+            "workflow": "test.yml",
+            "workflow_content": (FIXTURES / "fastapi" / "test.yml").read_text(),
+        },
+    )
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def test_profile_ci_accepts_explicit_ref_without_host_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    raw = fastapi_raw()
+    workflow_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    fetched: list[tuple[str, str, str | None]] = []
+
+    def fake_fetch_workflow(repo: str, workflow: str, *, ref: str | None = None) -> str:
+        fetched.append((repo, workflow, ref))
+        return workflow_text
+
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci",
+        InMemoryLedger(),
+        {"repo": "fastapi/fastapi", "workflow": "test.yml", "ref": "deadbeef"},
+    )
+    assert fetched == [("fastapi/fastapi", "test.yml", "deadbeef")]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
 def test_fetch_workflow_decodes_github_contents_response() -> None:
     yaml_text = "name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
     encoded = base64.encodebytes(yaml_text.encode("utf-8")).decode("ascii")

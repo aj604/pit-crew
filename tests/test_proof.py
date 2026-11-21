@@ -445,6 +445,18 @@ def test_plan_replays_merges_duplicate_commit_shas_across_bug_shas_and_commits(
         ({"mutations": [{"path": "", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": 123, "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
+        (
+            {"mutations": [{"path": ".github/workflows/ci.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
+        (
+            {"mutations": [{"path": ".github/actions/setup/action.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
+        (
+            {"mutations": [{"path": ".GITHUB/workflows/ci.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
         ({"mutations": [{"path": "a.py", "content": 123, "reason": "r"}]}, "whole mutated file"),
         (
             {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": None}]},

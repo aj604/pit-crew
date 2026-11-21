@@ -102,6 +102,12 @@ def check_workflow_change(ledger: Ledger, path: str, before: str, after: str) ->
                 "additionalProperties": {"type": "string"},
                 "description": "The same paths mapped to their original text; empty string for a new file",
             },
+            "base_sha": {
+                "type": "string",
+                "description": (
+                    "Resolved cycle commit SHA the candidate was built atop (defaults to hypothesis base_sha)"
+                ),
+            },
         },
         "required": ["hypothesis_id", "branch", "summary", "files", "original_files"],
     },
@@ -114,6 +120,7 @@ def report_candidate(  # noqa: PLR0913  arguments mirror the tool's JSON schema
     *,
     files: dict[str, str] | None = None,
     original_files: dict[str, str] | None = None,
+    base_sha: str | None = None,
 ) -> str:
     """Report your one change for a hypothesis. The host publishes the branch. Returns the candidate id.
 
@@ -130,7 +137,7 @@ def report_candidate(  # noqa: PLR0913  arguments mirror the tool's JSON schema
         branch,
         summary,
         repo=hypothesis.repo,
-        base_sha=hypothesis.base_sha,
+        base_sha=base_sha or hypothesis.base_sha,
         files=dict(files),
     )
     ledger.add(candidate)

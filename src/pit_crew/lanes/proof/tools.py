@@ -42,6 +42,11 @@ class InvalidReplayPlanError(ValueError):
         return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
 
     @classmethod
+    def disallowed_mutation_path(cls, path: str) -> "InvalidReplayPlanError":
+        """Build the error for a mutation targeting workflow or GitHub configuration files."""
+        return cls(f"mutations may not modify .github files, got path {path!r}")
+
+    @classmethod
     def bad_expected_checks(cls, value: object) -> "InvalidReplayPlanError":
         """Build the error for expected_checks that is not a non-empty list of check names."""
         return cls(f"expected_checks must be a non-empty list of check names, got {value!r}")
@@ -242,9 +247,12 @@ def _mutation_case(mutation: Mapping[str, object]) -> BugCase:
     raw_path, raw_content = mutation.get("path", ""), mutation.get("content", "")
     path = raw_path if isinstance(raw_path, str) else ""
     content = raw_content if isinstance(raw_content, str) else ""
+    parts = path.split("/")
     # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
-    if not content or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+    if not content or "\\" in path or any(part in {"", ".", ".."} for part in parts):
         raise InvalidReplayPlanError.bad_mutation(path)
+    if parts[0].lower() == ".github":
+        raise InvalidReplayPlanError.disallowed_mutation_path(path)
     raw_reason = mutation.get("reason")
     reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else "synthetic mutation"
     expected_checks = _parse_expected_checks(mutation["expected_checks"]) if "expected_checks" in mutation else ()

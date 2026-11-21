@@ -49,11 +49,15 @@ def workspace() -> Path:
     return host_workspace.active_workspace()
 
 
-def workflow_path(workflow: str) -> Path:
-    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+def _validate_workflow_name(workflow: str) -> None:
     if not _WORKFLOW_FILE.fullmatch(workflow) or workflow.startswith("."):
         msg = f"workflow must be a file name like ci.yml, got {workflow!r}"
         raise ValueError(msg)
+
+
+def workflow_path(workflow: str) -> Path:
+    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+    _validate_workflow_name(workflow)
     folder = (workspace() / ".github" / "workflows").resolve()
     path = (folder / workflow).resolve()
     if path.parent != folder:  # a symlink pointing out of the folder
@@ -62,22 +66,29 @@ def workflow_path(workflow: str) -> Path:
     return path
 
 
-def _load_workflow_and_history(
+def _load_workflow_and_history(  # noqa: PLR0913  mirrors profile_ci parameters
     repo: str,
     workflow: str,
     *,
     runs: int,
     branch: str | None,
+    workflow_content: str | None,
+    ref: str | None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Load workflow YAML and run history, falling back to a run's commit SHA if ``branch`` was deleted."""
+    if workflow_content is not None:
+        _validate_workflow_name(workflow)
+        return workflow_content, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+
     path = workflow_path(workflow)
     if path.is_file():
         return path.read_text(), history.fetch_history(repo, workflow, runs=runs, branch=branch)
 
+    fetch_ref = ref or branch
     try:
-        yaml_text = history.fetch_workflow(repo, workflow, ref=branch)
+        yaml_text = history.fetch_workflow(repo, workflow, ref=fetch_ref)
     except urllib.error.HTTPError as exc:
-        if branch is None or exc.code != _HTTP_NOT_FOUND:
+        if ref is not None or branch is None or exc.code != _HTTP_NOT_FOUND:
             raise
         raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
         return _fetch_workflow_from_runs(repo, workflow, branch, raw), raw
@@ -111,16 +122,27 @@ def _fetch_workflow_from_runs(
             "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
             "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
             "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
+            "workflow_content": {
+                "type": "string",
+                "description": "Full YAML text of .github/workflows/<workflow> from the sandbox (optional)",
+            },
+            "ref": {
+                "type": "string",
+                "description": "Git commit SHA or branch to read the workflow from when no local checkout exists",
+            },
         },
         "required": ["repo", "workflow"],
     },
 )
-def profile_ci(
+def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote sandbox profiling without a host checkout
     ledger: Ledger,  # noqa: ARG001  every tool takes the ledger first
     repo: str,
     workflow: str,
     runs: int = history.DEFAULT_RUNS,
     branch: str | None = None,
+    *,
+    workflow_content: str | None = None,
+    ref: str | None = None,
 ) -> dict[str, Any]:
     """Profile one workflow from its recent successful runs.
 
@@ -134,7 +156,14 @@ def profile_ci(
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    yaml_text, raw = _load_workflow_and_history(repo, workflow, runs=runs, branch=branch)
+    yaml_text, raw = _load_workflow_and_history(
+        repo,
+        workflow,
+        runs=runs,
+        branch=branch,
+        workflow_content=workflow_content,
+        ref=ref,
+    )
     return profile(parse_workflow(yaml_text), history.parse_runs(raw)).to_dict()
 
 

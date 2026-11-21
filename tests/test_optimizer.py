@@ -484,6 +484,23 @@ def test_report_candidate_records_files_and_coordinates(ledger: InMemoryLedger, 
     assert [(a["candidate_id"], a["reason"]) for a in attempts] == [(candidate_id, "speedup is within noise")]
 
 
+def test_report_candidate_accepts_explicit_base_sha(ledger: InMemoryLedger, hypothesis: Hypothesis) -> None:
+    after = BASE.replace("npm install", "npm ci")
+    explicit_id = tools.call(
+        "report_candidate",
+        ledger,
+        {
+            "hypothesis_id": hypothesis.id,
+            "branch": f"pc/{hypothesis.id}-dep-cache-2",
+            "summary": "use npm ci on newer base",
+            "files": {CI: after},
+            "original_files": {CI: BASE},
+            "base_sha": "def456",
+        },
+    )
+    assert ledger.get(Candidate, explicit_id).base_sha == "def456"
+
+
 @pytest.mark.parametrize(
     ("candidate", "expected"),
     [

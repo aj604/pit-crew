@@ -1,14 +1,16 @@
 import json
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
+from pathlib import Path
 from typing import Any, override
 
 import pytest
 
-from pit_crew import managed_agent
+from pit_crew import managed_agent, tools
 from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.dispatcher import (
     DISALLOWED_PATH_REASON,
+    NO_REPLAY_PLAN_REASON,
     Dispatcher,
     DispatcherConfig,
     LaneRunner,
@@ -17,6 +19,7 @@ from pit_crew.dispatcher import (
     next_lane,
 )
 from pit_crew.github import GitHubClient, WorkflowRunResult
+from pit_crew.lanes.analysis import history as analysis_history
 from pit_crew.ledger import InMemoryLedger, Ledger
 from pit_crew.rater import rate
 
@@ -24,13 +27,15 @@ from pit_crew.rater import rate
 class _FakeGitHubClient:
     """Offline fake implementing ``GitHubClient`` for Dispatcher unit tests."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         default_shas: dict[str, str],
         run_scripts: dict[int, list[WorkflowRunResult]] | None = None,
         *,
         fail_on: dict[str, Exception] | None = None,
         fail_on_call: dict[tuple[str, int], Exception] | None = None,
+        file_contents: dict[tuple[str, str, str], str] | None = None,
+        require_known_branch: bool = False,
     ) -> None:
         self._default_shas = dict(default_shas)
         self._run_scripts: dict[int, list[WorkflowRunResult]] = {
@@ -38,6 +43,8 @@ class _FakeGitHubClient:
         }
         self._fail_on: dict[str, Exception] = dict(fail_on or {})
         self._fail_on_call: dict[tuple[str, int], Exception] = dict(fail_on_call or {})
+        self._file_contents: dict[tuple[str, str, str], str] = dict(file_contents or {})
+        self._require_known_branch = require_known_branch
         self._method_calls: dict[str, int] = {}
         self.default_branch_lookups: list[str] = []
         self.dispatches: list[tuple[str, str, str]] = []
@@ -91,6 +98,9 @@ class _FakeGitHubClient:
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
         self.events.append(("dispatch_workflow", repo, workflow, ref))
         self._maybe_fail("dispatch_workflow")
+        if self._require_known_branch and (repo, ref) not in self.branches:
+            msg = f"Cannot dispatch workflow on unknown or non-branch ref {ref!r} in {repo!r}"
+            raise RuntimeError(msg)
         self.dispatches.append((repo, workflow, ref))
         return len(self.dispatches)
 
@@ -112,6 +122,9 @@ class _FakeGitHubClient:
             head_sha=self._default_shas[repo],
             head_branch="main",
         )
+
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        return self._file_contents.get((repo, ref, path))
 
     def open_pull_request(self, repo: str, *, title: str, body: str, head: str, base: str) -> str:
         url = f"https://github.com/{repo}/pull/{len(self.pull_requests) + 1}"
@@ -317,6 +330,7 @@ def test_run_cycle_returns_none_when_no_unattempted_hypotheses_exist() -> None:
     other_repo_h = Hypothesis(repo="other/repo", description="other", skill="dep-cache", expected_savings_seconds=999.0)
     ledger.add(attempted_h)
     ledger.add(attempted_c)
+    ledger.add(Verdict(candidate_id=attempted_c.id, keep=False, speedup=1.0, p_value=0.5, reason="noise"))
     ledger.add(other_repo_h)
 
     runner = _RecordingLaneRunner()
@@ -440,7 +454,7 @@ def test_run_cycle_selects_highest_impact_unattempted_hypothesis_and_runs_lane_h
     assert github.default_branch_lookups == []
     assert github.dispatches == [
         *[
-            ("org/repo", "tests.yml", "compounded-sha-1"),
+            ("org/repo", "tests.yml", f"pc/baseline-{cand.id}"),
             ("org/repo", "tests.yml", "pc/shard-tests"),
         ]
         * 5,
@@ -476,10 +490,10 @@ def test_run_cycle_uses_config_workflow_file_when_hypothesis_workflow_path_is_em
     verdict = dispatcher.run_cycle("org/repo")
 
     assert verdict is not None
-    assert dispatcher.evidence_calls == [(cand, plan, "base-sha-0", "custom.yml")]
+    assert dispatcher.evidence_calls == [(replace(cand, base_sha="base-sha-0"), plan, "base-sha-0", "custom.yml")]
     assert github.dispatches == [
         *[
-            ("org/repo", "custom.yml", "base-sha-0"),
+            ("org/repo", "custom.yml", f"pc/baseline-{cand.id}"),
             ("org/repo", "custom.yml", "pc/cache"),
         ]
         * 5,
@@ -655,11 +669,12 @@ def test_collect_evidence_interleaves_baseline_and_candidate_pairs_including_col
     assert (
         github.dispatches
         == [
-            ("org/repo", "ci.yml", "base-sha-1"),
+            ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
             ("org/repo", "ci.yml", "pc/cache"),
         ]
         * 5
     )
+    assert github.branches == {}
     assert evidence.candidate_id == cand.id
     assert evidence.baseline_seconds == baseline_durations
     assert evidence.candidate_seconds == candidate_durations
@@ -697,11 +712,12 @@ def test_collect_evidence_resolves_workflow_repo_and_head_sha_fallbacks() -> Non
     assert (
         github.dispatches
         == [
-            ("org/repo", "bench.yml", "base-sha"),
-            ("org/repo", "bench.yml", "cand-sha-99"),
+            ("org/repo", "bench.yml", f"pc/baseline-{cand_from_hyp.id}"),
+            ("org/repo", "bench.yml", f"pc/candidate-{cand_from_hyp.id}"),
         ]
         * 2
     )
+    assert github.branches == {}
 
     # Candidate without a ledger hypothesis falls back to config.workflow_file; explicit path normalizes to basename.
     github.dispatches.clear()
@@ -710,7 +726,7 @@ def test_collect_evidence_resolves_workflow_repo_and_head_sha_fallbacks() -> Non
     assert (
         github.dispatches
         == [
-            ("org/repo", "fallback.yml", "base-sha"),
+            ("org/repo", "fallback.yml", f"pc/baseline-{orphan.id}"),
             ("org/repo", "fallback.yml", "pc/orphan"),
         ]
         * 2
@@ -723,7 +739,7 @@ def test_collect_evidence_resolves_workflow_repo_and_head_sha_fallbacks() -> Non
     assert (
         github.dispatches
         == [
-            ("org/repo", "custom.yml", "base-sha"),
+            ("org/repo", "custom.yml", f"pc/baseline-{orphan.id}"),
             ("org/repo", "custom.yml", "pc/orphan"),
         ]
         * 2
@@ -819,13 +835,13 @@ def test_collect_evidence_aborts_candidate_on_non_success_and_rater_rejects(bad_
     evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
 
     assert github.dispatches == [
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
         ("org/repo", "ci.yml", "pc/broken"),
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
         ("org/repo", "ci.yml", "pc/broken"),
-        ("org/repo", "ci.yml", "base-sha"),
-        ("org/repo", "ci.yml", "base-sha"),
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
     ]
     assert evidence.baseline_seconds == (100.0, 101.0, 99.0, 102.0, 98.0)
     assert evidence.candidate_seconds == (40.0,)
@@ -861,9 +877,9 @@ def test_collect_evidence_aborts_baseline_on_non_success_and_stops_early_when_bo
     evidence = dispatcher.collect_evidence(cand, ReplayPlan(candidate_id=cand.id), "base-sha", workflow="ci.yml")
 
     assert github.dispatches == [
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
         ("org/repo", "ci.yml", "pc/fast"),
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
         ("org/repo", "ci.yml", "pc/fast"),
         ("org/repo", "ci.yml", "pc/fast"),
         ("org/repo", "ci.yml", "pc/fast"),
@@ -893,7 +909,7 @@ def test_collect_evidence_aborts_baseline_on_non_success_and_stops_early_when_bo
     both_ev = dispatcher_both.collect_evidence(cand, ReplayPlan(candidate_id=cand.id), "base-sha", workflow="ci.yml")
 
     assert github_both.dispatches == [
-        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", f"pc/baseline-{cand.id}"),
         ("org/repo", "ci.yml", "pc/fast"),
         ("org/repo", "ci.yml", "pc/fast"),
     ]
@@ -1080,8 +1096,14 @@ def test_collect_evidence_replays_single_commit_case_with_overlay_and_rater_keep
     evidence = dispatcher.collect_evidence(cand, plan, "base-sha-1", workflow="ci.yml")
 
     expected_branch = "pc/replay-cand123-0"
-    assert github.created_branches == [("org/repo", expected_branch, "deadbeef01")]
-    assert github.deleted_branches == [("org/repo", expected_branch)]
+    assert github.created_branches == [
+        ("org/repo", "pc/baseline-cand123", "base-sha-1"),
+        ("org/repo", expected_branch, "deadbeef01"),
+    ]
+    assert github.deleted_branches == [
+        ("org/repo", "pc/baseline-cand123"),
+        ("org/repo", expected_branch),
+    ]
     assert github.branches == {}
     assert len(github.commits) == 1
     assert github.commits[0]["repo"] == "org/repo"
@@ -1426,7 +1448,12 @@ def test_collect_evidence_replays_valid_caught_mutation_and_rater_keeps() -> Non
         _make_run(12, status="completed", conclusion="failure", duration_seconds=11.0),
     ]
 
-    github = _FakeGitHubClient({"org/repo": "base-sha-1"}, run_scripts=run_scripts)
+    base_pyproject = "[tool.ruff]\nline-length = 120\n\n[tool.pytest.ini_options]\naddopts = '-q'\n"
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha-1"},
+        run_scripts=run_scripts,
+        file_contents={("org/repo", "base-sha-1", "pyproject.toml"): base_pyproject},
+    )
     clock = _FakeClock()
     dispatcher = Dispatcher(
         ledger,
@@ -1438,11 +1465,11 @@ def test_collect_evidence_replays_valid_caught_mutation_and_rater_keeps() -> Non
     )
     cand_files = {
         ".github/workflows/ci.yml": "name: Fast CI\n",
-        "pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-n auto'\n",
+        "pyproject.toml": "[tool.ruff]\nline-length = 120\n\n[tool.pytest.ini_options]\naddopts = '-q -n auto'\n",
     }
     mutated_files = {
         "src/app.py": "def add(a, b): return a - b\n",
-        "pyproject.toml": "mutated-before-overlay",
+        "pyproject.toml": "[tool.ruff]\nline-length = 10\n\n[tool.pytest.ini_options]\naddopts = '-q'\n",
     }
     cand = Candidate(
         id="cand-mut",
@@ -1450,6 +1477,7 @@ def test_collect_evidence_replays_valid_caught_mutation_and_rater_keeps() -> Non
         branch="pc/fast-ci",
         summary="parallelize tests",
         repo="org/repo",
+        base_sha="base-sha-1",
         head_sha="cand-head-1",
         files=cand_files,
     )
@@ -1463,10 +1491,12 @@ def test_collect_evidence_replays_valid_caught_mutation_and_rater_keeps() -> Non
     base_branch = "pc/replay-cand-mut-0-base"
     cand_branch = "pc/replay-cand-mut-0-cand"
     assert github.created_branches == [
+        ("org/repo", "pc/baseline-cand-mut", "base-sha-1"),
         ("org/repo", base_branch, "base-sha-1"),
         ("org/repo", cand_branch, "base-sha-1"),
     ]
     assert github.deleted_branches == [
+        ("org/repo", "pc/baseline-cand-mut"),
         ("org/repo", base_branch),
         ("org/repo", cand_branch),
     ]
@@ -1481,9 +1511,11 @@ def test_collect_evidence_replays_valid_caught_mutation_and_rater_keeps() -> Non
     assert github.commits[1]["files"] == {
         "src/app.py": "def add(a, b): return a - b\n",
         ".github/workflows/ci.yml": "name: Fast CI\n",
-        "pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-n auto'\n",
+        "pyproject.toml": "[tool.ruff]\nline-length = 10\n\n[tool.pytest.ini_options]\naddopts = '-q -n auto'\n",
     }
-    assert mutated_files["pyproject.toml"] == "mutated-before-overlay"
+    assert mutated_files["pyproject.toml"] == (
+        "[tool.ruff]\nline-length = 10\n\n[tool.pytest.ini_options]\naddopts = '-q'\n"
+    )
     assert ".github/workflows/ci.yml" not in mutated_files
 
     assert github.events[-12:] == [
@@ -1625,6 +1657,7 @@ def test_collect_evidence_valid_uncaught_mutation_rejected_by_rater(uncaught_con
         "https://github.com/org/repo/actions/runs/12",
     )
     assert github.deleted_branches == [
+        ("org/repo", "pc/baseline-cand-miss-mut"),
         ("org/repo", "pc/replay-cand-miss-mut-0-base"),
         ("org/repo", "pc/replay-cand-miss-mut-0-cand"),
     ]
@@ -1671,11 +1704,13 @@ def test_collect_evidence_excludes_dud_mutation_without_running_candidate(dud_co
     evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
 
     assert github.created_branches == [
+        ("org/repo", "pc/baseline-cand-dud-mix", "base-sha"),
         ("org/repo", "pc/replay-cand-dud-mix-0-base", "base-sha"),
         ("org/repo", "pc/replay-cand-dud-mix-1-base", "base-sha"),
         ("org/repo", "pc/replay-cand-dud-mix-1-cand", "base-sha"),
     ]
     assert github.deleted_branches == [
+        ("org/repo", "pc/baseline-cand-dud-mix"),
         ("org/repo", "pc/replay-cand-dud-mix-0-base"),
         ("org/repo", "pc/replay-cand-dud-mix-1-base"),
         ("org/repo", "pc/replay-cand-dud-mix-1-cand"),
@@ -1744,10 +1779,12 @@ def test_collect_evidence_all_dud_mutations_rejected_by_rater() -> None:
     evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
 
     assert github.created_branches == [
+        ("org/repo", "pc/baseline-cand-all-duds", "base-sha"),
         ("org/repo", "pc/replay-cand-all-duds-0-base", "base-sha"),
         ("org/repo", "pc/replay-cand-all-duds-1-base", "base-sha"),
     ]
     assert github.deleted_branches == [
+        ("org/repo", "pc/baseline-cand-all-duds"),
         ("org/repo", "pc/replay-cand-all-duds-0-base"),
         ("org/repo", "pc/replay-cand-all-duds-1-base"),
     ]
@@ -2368,3 +2405,689 @@ def test_format_pr_title_and_body_edge_cases() -> None:
     )
     missed_body = format_pr_body(hyp, cand_no_summary, missed_evidence, verdict_no_p)
     assert r"| mutation | `pipe\|char next line` | Yes | No | - |" in missed_body
+
+    inconclusive_evidence = Evidence(
+        candidate_id=cand_no_summary.id,
+        baseline_seconds=(100.0,),
+        candidate_seconds=(55.0,),
+        bugs_total=0,
+        bugs_caught=0,
+        bug_outcomes=(
+            {
+                "kind": "commit",
+                "ref": "deadbeef",
+                "caught": False,
+                "baseline_failed": True,
+                "inconclusive": True,
+                "conflict_paths": [".github/workflows/ci.yml"],
+                "run_url": "",
+            },
+        ),
+    )
+    inconclusive_body = format_pr_body(hyp, cand_no_summary, inconclusive_evidence, verdict_no_p)
+    assert "| commit | `deadbeef` | Yes | Inconclusive (overlay conflict) | - |" in inconclusive_body
+
+
+@dataclass
+class _FakeToolStep:
+    type: str
+    id: str = ""
+    name: str = ""
+    arguments: dict[str, Any] | None = None
+
+
+@dataclass
+class _FakeInteractionOutcome:
+    id: str
+    status: str | None
+    steps: list[_FakeToolStep] | None = None
+    continuation_token: str | None = None
+    environment_id: str | None = None
+
+
+def test_default_runner_profiles_ci_and_records_hypothesis_without_host_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(managed_agent, "POLL_INTERVAL_SECONDS", 0.0)
+    workflow_yaml = (
+        "name: CI\non: [pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pytest\n"
+    )
+    sample_runs: list[dict[str, Any]] = [
+        {
+            "id": 1,
+            "path": ".github/workflows/tests.yml",
+            "event": "pull_request",
+            "head_branch": "main",
+            "head_sha": "a" * 40,
+            "conclusion": "success",
+            "run_attempt": 1,
+            "run_started_at": "2026-11-01T00:00:00Z",
+            "jobs": [
+                {
+                    "id": 10,
+                    "name": "test",
+                    "run_attempt": 1,
+                    "conclusion": "success",
+                    "created_at": "2026-11-01T00:00:00Z",
+                    "started_at": "2026-11-01T00:00:00Z",
+                    "completed_at": "2026-11-01T00:02:00Z",
+                    "labels": [],
+                    "steps": [
+                        {
+                            "number": 1,
+                            "name": "Run pytest",
+                            "conclusion": "success",
+                            "started_at": "2026-11-01T00:00:00Z",
+                            "completed_at": "2026-11-01T00:02:00Z",
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(analysis_history, "fetch_history", lambda *_a, **_kw: sample_runs)
+    monkeypatch.setattr(analysis_history, "fetch_workflow", lambda *_a, **_kw: workflow_yaml)
+
+    class _FakeInteractions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self._queue: list[_FakeInteractionOutcome] = [
+                # Analysis turn 1: profile_ci without host checkout (workflow_content + GitHub fallback).
+                _FakeInteractionOutcome(
+                    id="int-a1",
+                    status="requires_action",
+                    steps=[
+                        _FakeToolStep(
+                            type="function_call",
+                            id="call-p1",
+                            name="profile_ci",
+                            arguments={
+                                "repo": "org/widget",
+                                "workflow": "tests.yml",
+                                "workflow_content": workflow_yaml,
+                            },
+                        ),
+                        _FakeToolStep(
+                            type="function_call",
+                            id="call-p2",
+                            name="profile_ci",
+                            arguments={"repo": "org/widget", "workflow": "tests.yml", "ref": "base-sha-0"},
+                        ),
+                    ],
+                ),
+                # Analysis turn 2: records a hypothesis after profiling succeeds.
+                _FakeInteractionOutcome(
+                    id="int-a2",
+                    status="requires_action",
+                    steps=[
+                        _FakeToolStep(
+                            type="function_call",
+                            id="call-h1",
+                            name="record_hypothesis",
+                            arguments={
+                                "repo": "org/widget",
+                                "description": "Shard pytest suite",
+                                "skill": "shard-by-timing",
+                                "expected_savings_seconds": 60.0,
+                                "workflow_path": ".github/workflows/tests.yml",
+                                "job": "test",
+                                "base_sha": "base-sha-0",
+                            },
+                        )
+                    ],
+                ),
+                _FakeInteractionOutcome(id="int-a3", status="completed", steps=[]),
+                # Optimizer completes without writing a candidate (declines).
+                _FakeInteractionOutcome(id="int-o1", status="completed", steps=[]),
+            ]
+
+        def create(self, **kwargs: object) -> _FakeInteractionOutcome:
+            self.calls.append(kwargs)
+            return self._queue.pop(0)
+
+        def get(self, interaction_id: str, /) -> _FakeInteractionOutcome:
+            msg = f"Unexpected get({interaction_id!r})"
+            raise AssertionError(msg)
+
+    class _FakeGeminiClient:
+        def __init__(self) -> None:
+            self.interactions = _FakeInteractions()
+
+    fake_client = _FakeGeminiClient()
+    monkeypatch.setattr(managed_agent, "_gemini_client", lambda: fake_client)
+
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient({"org/widget": "base-sha-0"})
+    dispatcher = Dispatcher(ledger, github)
+
+    assert dispatcher.run_cycle("org/widget") is None
+
+    hyps = ledger.hypotheses_for_repo("org/widget")
+    assert len(hyps) == 1
+    assert hyps[0].skill == "shard-by-timing"
+    profile_replies = fake_client.interactions.calls[1]["input"]
+    assert isinstance(profile_replies, list)
+    assert all(not reply.get("is_error") for reply in profile_replies)
+
+
+def test_consecutive_cycles_skip_declined_hypothesis_but_retry_incomplete_optimizer() -> None:
+    ledger = InMemoryLedger()
+    h_top = Hypothesis(
+        id="h-top",
+        repo="org/repo",
+        description="Inapplicable test selection",
+        skill="affected-tests",
+        expected_savings_seconds=120.0,
+    )
+    h_next = Hypothesis(
+        id="h-next",
+        repo="org/repo",
+        description="Viable dependency cache",
+        skill="dep-cache",
+        expected_savings_seconds=60.0,
+    )
+    ledger.add(h_top)
+    ledger.add(h_next)
+
+    optimizer_outcomes: list[str | None] = ["failed", "completed", "completed"]
+    seen_optimizer_hyps: list[str] = []
+
+    class _ScriptedDeclineRunner:
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            del repo
+            assert ledger is not None
+            if lane == "analysis":
+                return _FakeInteractionOutcome(id="a", status="completed")
+            if lane == "optimizer":
+                ctx = _parse_task_context(task)
+                hyp_id = str(ctx["hypothesis"]["id"])
+                seen_optimizer_hyps.append(hyp_id)
+                status = optimizer_outcomes.pop(0)
+                if hyp_id == "h-next":
+                    ledger.add(
+                        Candidate(
+                            id="cand-next",
+                            hypothesis_id=hyp_id,
+                            branch="pc/next",
+                            summary="add cache",
+                            repo="org/repo",
+                            head_sha="head-next",
+                            changed_files=(".github/workflows/ci.yml",),
+                        )
+                    )
+                return _FakeInteractionOutcome(id="o", status=status)
+            if lane == "proof":
+                ctx = _parse_task_context(task)
+                ledger.add(ReplayPlan(candidate_id=str(ctx["candidate"]["id"]), bug_shas=("red-1",)))
+                return _FakeInteractionOutcome(id="p", status="completed")
+            return None
+
+    run_scripts = _timing_run_scripts()
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(ledger, github, lane_runner=_ScriptedDeclineRunner())
+
+    # Cycle 1: Optimizer fails -> returns None and does NOT mark h-top declined.
+    assert dispatcher.run_cycle("org/repo") is None
+    assert seen_optimizer_hyps == ["h-top"]
+
+    # Cycle 2: Optimizer retries h-top and definitively declines (completed without candidate).
+    assert dispatcher.run_cycle("org/repo") is None
+    assert seen_optimizer_hyps == ["h-top", "h-top"]
+
+    # Cycle 3: Selector moves past declined h-top and optimizes h-next!
+    verdict = dispatcher.run_cycle("org/repo")
+    assert verdict is not None
+    assert verdict.candidate_id == "cand-next"
+    assert verdict.keep is True
+    assert seen_optimizer_hyps == ["h-top", "h-top", "h-next"]
+
+
+def test_proof_no_replay_plan_records_unproven_verdict_and_incomplete_proof_resumes() -> None:
+    # Part A: Proof definitively completes without a ReplayPlan -> terminal unproven Verdict.
+    ledger = InMemoryLedger()
+    h1 = Hypothesis(id="h1", repo="org/repo", description="first", skill="dep-cache", expected_savings_seconds=100.0)
+    h2 = Hypothesis(id="h2", repo="org/repo", description="second", skill="dedupe-jobs", expected_savings_seconds=50.0)
+    ledger.add(h1)
+    ledger.add(h2)
+    c1 = Candidate(
+        id="c1",
+        hypothesis_id=h1.id,
+        branch="pc/c1",
+        summary="first opt",
+        repo="org/repo",
+        head_sha="head-c1",
+        changed_files=(".github/workflows/ci.yml",),
+    )
+    c2 = Candidate(
+        id="c2",
+        hypothesis_id=h2.id,
+        branch="pc/c2",
+        summary="second opt",
+        repo="org/repo",
+        head_sha="head-c2",
+        changed_files=(".github/workflows/ci.yml",),
+    )
+
+    class _ProofEmptyRunner:
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            del repo
+            assert ledger is not None
+            if lane == "optimizer":
+                hyp_id = str(_parse_task_context(task)["hypothesis"]["id"])
+                ledger.add(c1 if hyp_id == "h1" else c2)
+            elif lane == "proof":
+                cand_id = str(_parse_task_context(task)["candidate"]["id"])
+                if cand_id == "c2":
+                    ledger.add(ReplayPlan(candidate_id=cand_id, bug_shas=("red-1",)))
+            return _FakeInteractionOutcome(id=lane, status="completed")
+
+    run_scripts = _timing_run_scripts()
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(ledger, github, lane_runner=_ProofEmptyRunner())
+
+    v1 = dispatcher.run_cycle("org/repo")
+    assert v1 is not None
+    assert v1.candidate_id == "c1"
+    assert v1.keep is False
+    assert v1.reason == NO_REPLAY_PLAN_REASON
+    attempts = ledger.prior_attempts("org/repo")
+    assert next(a for a in attempts if a["candidate_id"] == "c1")["rated"] is True
+
+    # Cycle 2 moves cleanly to h2 -> c2.
+    v2 = dispatcher.run_cycle("org/repo")
+    assert v2 is not None
+    assert v2.candidate_id == "c2"
+    assert v2.keep is True
+
+    # Part B: Proof fails (incomplete) -> no verdict, candidate stays pending, next cycle resumes at Proof!
+    ledger_b = InMemoryLedger()
+    hb = Hypothesis(id="hb", repo="org/repo", description="cache", skill="dep-cache", expected_savings_seconds=80.0)
+    ledger_b.add(hb)
+    calls_b: list[str] = []
+    proof_attempts = 0
+
+    class _FlakyProofRunner:
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            nonlocal proof_attempts
+            del repo
+            assert ledger is not None
+            calls_b.append(lane)
+            if lane == "optimizer":
+                ledger.add(
+                    Candidate(
+                        id="cand-pending",
+                        hypothesis_id=hb.id,
+                        branch="pc/pending",
+                        summary="add cache",
+                        repo="org/repo",
+                        files={".github/workflows/ci.yml": "name: Cached\n"},
+                    )
+                )
+                return _FakeInteractionOutcome(id="o", status="completed")
+            if lane == "proof":
+                proof_attempts += 1
+                if proof_attempts == 1:
+                    return _FakeInteractionOutcome(id="p1", status="failed")
+                cand_id = str(_parse_task_context(task)["candidate"]["id"])
+                ledger.add(ReplayPlan(candidate_id=cand_id, bug_shas=("red-b",)))
+                return _FakeInteractionOutcome(id="p2", status="completed")
+            return _FakeInteractionOutcome(id="a", status="completed")
+
+    run_scripts_b = _timing_run_scripts()
+    run_scripts_b[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    github_b = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts_b, require_known_branch=True)
+    dispatcher_b = Dispatcher(ledger_b, github_b, lane_runner=_FlakyProofRunner())
+
+    assert dispatcher_b.run_cycle("org/repo") is None
+    assert calls_b == ["analysis", "optimizer", "proof"]
+    assert ledger_b.all(Verdict) == []
+    # Candidate branch was already published on Cycle 1.
+    assert ("org/repo", "pc/pending") in github_b.branches
+
+    # Cycle 2 resumes pending candidate directly at Proof without re-running analysis/optimizer or recreating branch!
+    resumed_verdict = dispatcher_b.run_cycle("org/repo")
+    assert resumed_verdict is not None
+    assert resumed_verdict.candidate_id == "cand-pending"
+    assert resumed_verdict.keep is True
+    assert calls_b == ["analysis", "optimizer", "proof", "proof"]
+
+
+def test_second_cycle_binds_candidate_base_sha_after_default_branch_advances() -> None:
+    managed_agent.build_request("optimizer", "")
+    ledger = InMemoryLedger()
+    h1 = Hypothesis(
+        id="h1",
+        repo="org/repo",
+        description="first",
+        skill="dep-cache",
+        expected_savings_seconds=100.0,
+        base_sha="sha-commit-A",
+    )
+    h2 = Hypothesis(
+        id="h2",
+        repo="org/repo",
+        description="second",
+        skill="dedupe-jobs",
+        expected_savings_seconds=60.0,
+        base_sha="sha-commit-A",
+    )
+    ledger.add(h1)
+    ledger.add(h2)
+
+    base_wf = (
+        "name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pytest\n"
+    )
+    opt_wf = (
+        "name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: pytest -q\n"
+    )
+    # Cycle 1 fails timing -> rejected so default branch is consulted again on Cycle 2.
+    # Cycle 2 succeeds after default branch moved from sha-commit-A to sha-commit-B.
+    run_scripts: dict[int, list[WorkflowRunResult]] = {
+        1: [_make_run(1, duration_seconds=100.0)],
+        2: [_make_run(2, conclusion="failure", duration_seconds=5.0)],
+        3: [_make_run(3, duration_seconds=100.0)],
+        4: [_make_run(4, duration_seconds=100.0)],
+        5: [_make_run(5, duration_seconds=100.0)],
+        6: [_make_run(6, duration_seconds=100.0)],
+        7: [_make_run(7, conclusion="failure", duration_seconds=10.0)],
+    }
+    for pair_idx in range(5):
+        run_scripts[8 + pair_idx * 2] = [_make_run(8 + pair_idx * 2, duration_seconds=100.0 + pair_idx)]
+        run_scripts[9 + pair_idx * 2] = [_make_run(9 + pair_idx * 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts[18] = [_make_run(18, conclusion="failure", duration_seconds=12.0)]
+
+    github = _FakeGitHubClient({"org/repo": "sha-commit-A"}, run_scripts=run_scripts, require_known_branch=True)
+
+    def on_optimizer(active_ledger: Ledger, task: str, _repo: str | None) -> None:
+        ctx = _parse_task_context(task)
+        hyp_id = str(ctx["hypothesis"]["id"])
+        # Simulate Optimizer calling report_candidate WITHOUT explicitly passing base_sha (stale hypothesis.base_sha).
+        tools.call(
+            "report_candidate",
+            active_ledger,
+            {
+                "hypothesis_id": hyp_id,
+                "branch": f"pc/{hyp_id}-opt",
+                "summary": f"optimize {hyp_id}",
+                "files": {".github/workflows/ci.yml": opt_wf},
+                "original_files": {".github/workflows/ci.yml": base_wf},
+            },
+        )
+
+    def on_proof(active_ledger: Ledger, task: str, _repo: str | None) -> None:
+        ctx = _parse_task_context(task)
+        active_ledger.add(ReplayPlan(candidate_id=str(ctx["candidate"]["id"]), bug_shas=("red-1",)))
+
+    runner = _RecordingLaneRunner({"optimizer": on_optimizer, "proof": on_proof})
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner)
+
+    v1 = dispatcher.run_cycle("org/repo")
+    assert v1 is not None
+    assert v1.keep is False
+
+    # Default branch advances to sha-commit-B before Cycle 2.
+    github._default_shas["org/repo"] = "sha-commit-B"  # noqa: SLF001
+
+    v2 = dispatcher.run_cycle("org/repo")
+    assert v2 is not None
+    assert v2.keep is True
+    c2 = ledger.get(Candidate, v2.candidate_id)
+    assert c2.hypothesis_id == "h2"
+    # Candidate is bound to the resolved cycle base B, NOT stale hypothesis.base_sha A!
+    assert c2.base_sha == "sha-commit-B"
+    assert c2.head_sha.startswith("commit-")
+    assert ("org/repo", "pc/h2-opt", "sha-commit-B") in github.created_branches
+    assert ("org/repo", f"pc/baseline-{c2.id}", "sha-commit-B") in github.created_branches
+
+
+def test_run_cycle_publishes_candidate_enforces_named_refs_and_compounds() -> None:
+    managed_agent.build_request("optimizer", "")
+    ledger = InMemoryLedger()
+    h1 = Hypothesis(id="h1", repo="org/repo", description="first", skill="dep-cache", expected_savings_seconds=100.0)
+    h2 = Hypothesis(id="h2", repo="org/repo", description="second", skill="dedupe-jobs", expected_savings_seconds=60.0)
+    ledger.add(h1)
+    ledger.add(h2)
+
+    base_wf = (
+        "name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pytest\n"
+    )
+    opt_wf_1 = base_wf.replace("pytest", "pytest -q")
+    opt_wf_2 = opt_wf_1.replace("pytest -q", "pytest -q -n auto")
+
+    # Cycle 1: 200s -> 100s (kept, SLA not met -> compounds). Cycle 2: 100s -> 45s (kept, SLA met).
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=200.0 + pair_idx)]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=100.0 + pair_idx)]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=15.0)]
+    for pair_idx in range(5):
+        run_scripts[12 + pair_idx * 2] = [_make_run(12 + pair_idx * 2, duration_seconds=100.0 + pair_idx)]
+        run_scripts[13 + pair_idx * 2] = [_make_run(13 + pair_idx * 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts[22] = [_make_run(22, conclusion="failure", duration_seconds=12.0)]
+
+    # Strict client: rejects ANY dispatch_workflow on a raw SHA or unpublished branch!
+    github = _FakeGitHubClient(
+        {"org/repo": "0" * 40},
+        run_scripts=run_scripts,
+        require_known_branch=True,
+    )
+
+    def on_optimizer(active_ledger: Ledger, task: str, _repo: str | None) -> None:
+        ctx = _parse_task_context(task)
+        hyp_id = str(ctx["hypothesis"]["id"])
+        before, after = (base_wf, opt_wf_1) if hyp_id == "h1" else (opt_wf_1, opt_wf_2)
+        tools.call(
+            "report_candidate",
+            active_ledger,
+            {
+                "hypothesis_id": hyp_id,
+                "branch": f"pc/{hyp_id}",
+                "summary": f"apply {hyp_id}",
+                "files": {".github/workflows/ci.yml": after},
+                "original_files": {".github/workflows/ci.yml": before},
+                "base_sha": str(ctx["base_sha"]),
+            },
+        )
+
+    def on_proof(active_ledger: Ledger, task: str, _repo: str | None) -> None:
+        ctx = _parse_task_context(task)
+        active_ledger.add(ReplayPlan(candidate_id=str(ctx["candidate"]["id"]), bug_shas=("1" * 40,)))
+
+    runner = _RecordingLaneRunner({"optimizer": on_optimizer, "proof": on_proof})
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner)
+
+    verdicts = dispatcher.run_until_sla("org/repo")
+
+    assert len(verdicts) == 2
+    assert [v.keep for v in verdicts] == [True, True]
+    assert [v.sla_met for v in verdicts] == [False, True]
+    c1 = ledger.get(Candidate, verdicts[0].candidate_id)
+    c2 = ledger.get(Candidate, verdicts[1].candidate_id)
+    assert c1.head_sha == "commit-1"
+    assert c2.base_sha == c1.head_sha
+    assert c2.head_sha == "commit-3"
+    # Temporary baseline and replay branches are all cleaned up; published candidate branches remain.
+    assert set(github.branches) == {("org/repo", "pc/h1"), ("org/repo", "pc/h2")}
+
+    # Verify cleanup when commit_files fails while publishing a candidate.
+    fail_ledger = InMemoryLedger()
+    fail_h = Hypothesis(repo="org/repo", description="fail", skill="dep-cache", expected_savings_seconds=50.0)
+    fail_ledger.add(fail_h)
+    fail_github = _FakeGitHubClient(
+        {"org/repo": "a" * 40},
+        fail_on={"commit_files": RuntimeError("commit exploded")},
+    )
+    fail_runner = _RecordingLaneRunner(
+        {
+            "optimizer": lambda active, _t, _r: active.add(
+                Candidate(
+                    hypothesis_id=fail_h.id,
+                    branch="pc/fail-pub",
+                    summary="x",
+                    repo="org/repo",
+                    files={".github/workflows/ci.yml": opt_wf_1},
+                )
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="commit exploded"):
+        Dispatcher(fail_ledger, fail_github, lane_runner=fail_runner).run_cycle("org/repo")
+    assert fail_github.branches == {}
+
+
+def test_baseline_timing_branch_is_cleaned_up_on_dispatch_error() -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "a" * 40},
+        fail_on={"dispatch_workflow": RuntimeError("actions unavailable")},
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=2),
+    )
+    cand = Candidate(id="cand-clean", hypothesis_id="h1", branch="pc/clean", summary="s", repo="org/repo")
+    with pytest.raises(RuntimeError, match="actions unavailable"):
+        dispatcher.collect_evidence(cand, ReplayPlan(candidate_id=cand.id), "a" * 40, workflow="ci.yml")
+    assert github.created_branches == [("org/repo", "pc/baseline-cand-clean", "a" * 40)]
+    assert github.deleted_branches == [("org/repo", "pc/baseline-cand-clean")]
+    assert github.branches == {}
+
+
+def test_three_way_overlay_preserves_separate_line_edits_and_marks_conflicts_inconclusive() -> None:
+    base_pyproject = "[tool.ruff]\nline-length = 120\n\n[tool.pytest.ini_options]\naddopts = '-q'\n"
+    cand_pyproject = "[tool.ruff]\nline-length = 120\n\n[tool.pytest.ini_options]\naddopts = '-q -n auto'\n"
+    hist_nonconflict = "[tool.ruff]\nline-length = 88\n\n[tool.pytest.ini_options]\naddopts = '-q'\n"
+    hist_conflict = "[tool.ruff]\nline-length = 120\n\n[tool.pytest.ini_options]\naddopts = '--strict-fail'\n"
+
+    # 1. Commit replays: one non-conflicting shared file + one conflicting shared file.
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={1: [_make_run(1, conclusion="failure", duration_seconds=12.0)]},
+        file_contents={
+            ("org/repo", "base-sha", "pyproject.toml"): base_pyproject,
+            ("org/repo", "commit-clean", "pyproject.toml"): hist_nonconflict,
+            ("org/repo", "commit-conflict", "pyproject.toml"): hist_conflict,
+        },
+    )
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand = Candidate(
+        id="cand-3way",
+        hypothesis_id="h1",
+        branch="pc/3way",
+        summary="add xdist",
+        repo="org/repo",
+        base_sha="base-sha",
+        files={"pyproject.toml": cand_pyproject},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            BugCase(kind="commit", commit_sha="commit-clean", reason="separate line bug"),
+            BugCase(kind="commit", commit_sha="commit-conflict", reason="same line bug"),
+        ),
+    )
+
+    ev = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert len(github.commits) == 1
+    assert github.commits[0]["files"] == {
+        "pyproject.toml": "[tool.ruff]\nline-length = 88\n\n[tool.pytest.ini_options]\naddopts = '-q -n auto'\n"
+    }
+    assert ev.bug_outcomes[1]["inconclusive"] is True
+    assert ev.bug_outcomes[1]["conflict_paths"] == ["pyproject.toml"]
+
+    # 2. Mutation replay with conflicting shared-file edit: baseline runs, candidate replay skipped & inconclusive.
+    github_mut = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={1: [_make_run(1, conclusion="failure", duration_seconds=11.0)]},
+        file_contents={("org/repo", "base-sha", "pyproject.toml"): base_pyproject},
+    )
+    dispatcher_mut = Dispatcher(
+        InMemoryLedger(),
+        github_mut,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    mut_plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="mutation", mutated_files={"pyproject.toml": hist_conflict}, reason="conflict mut"),),
+    )
+    mut_ev = dispatcher_mut.collect_evidence(cand, mut_plan, "base-sha", workflow="ci.yml")
+    assert mut_ev.bugs_total == 0
+    assert mut_ev.bugs_caught == 0
+    assert mut_ev.bug_outcomes[0]["inconclusive"] is True
+    assert mut_ev.bug_outcomes[0]["conflict_paths"] == ["pyproject.toml"]
+    assert github_mut.created_branches == [("org/repo", "pc/replay-cand-3way-0-base", "base-sha")]
+    assert rate(replace(mut_ev, baseline_seconds=(100.0,) * 5, candidate_seconds=(50.0,) * 5)).keep is False
+
+
+@pytest.mark.parametrize(
+    "bad_mutation_path",
+    [
+        ".github/workflows/ci.yml",
+        ".github/actions/setup/action.yml",
+        ".GITHUB/workflows/ci.yml",
+        "../escape.py",
+        "/etc/passwd",
+    ],
+)
+def test_collect_evidence_rejects_proof_mutation_targeting_disallowed_paths(bad_mutation_path: str) -> None:
+    github = _FakeGitHubClient({"org/repo": "base-sha"})
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand = Candidate(
+        id="cand-sec",
+        hypothesis_id="h1",
+        branch="pc/sec",
+        summary="safe",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="mutation", mutated_files={bad_mutation_path: "name: Pwned\n"}, reason="evil"),),
+    )
+
+    with pytest.raises(ValueError, match="Disallowed mutation path"):
+        dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == []
+    assert github.dispatches == []
