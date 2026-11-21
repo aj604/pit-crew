@@ -4,9 +4,12 @@ import asyncio
 import inspect
 import logging
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
@@ -14,6 +17,12 @@ from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_WEB_DIR = Path(__file__).resolve().parent / "web"
+"""Pit Wall shell assets (``index.html``, ``styles.css``, ``app.js``) shipped inside the package."""
+
+DEFAULT_BRAND_DIR = Path(__file__).resolve().parents[2] / "brand"
+"""Repository-root brand assets; absent when running from an installed wheel."""
 
 
 class DispatcherProtocol(Protocol):
@@ -97,13 +106,21 @@ def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str,
     }
 
 
-def create_app(
+def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing positional callers working
     ledger: Ledger,
     dispatcher: DispatcherProtocol | None = None,
     webhook_secret: str | None = None,
     run_tracker: RunTracker | None = None,
+    *,
+    brand_dir: Path | None = None,
+    web_dir: Path | None = None,
 ) -> FastAPI:
-    """Create and configure the Pit Crew FastAPI application."""
+    """Create and configure the Pit Crew FastAPI application.
+
+    The Pit Wall shell is served at ``/`` with its assets under ``/web``. Brand assets are mounted at
+    ``/brand`` only when ``brand_dir`` exists, so an installed wheel without the repository's
+    ``brand/`` directory still starts cleanly.
+    """
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
@@ -165,4 +182,21 @@ def create_app(
         """Return current cycle state, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos)
 
+    _mount_pit_wall(app, brand_dir=brand_dir or DEFAULT_BRAND_DIR, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app
+
+
+def _mount_pit_wall(app: FastAPI, *, brand_dir: Path, web_dir: Path) -> None:
+    """Serve the Pit Wall shell at ``/`` and mount its static asset directories."""
+    index_html = web_dir / "index.html"
+
+    @app.get("/", include_in_schema=False)
+    def pit_wall() -> FileResponse:
+        """Return the single-page Pit Wall shell."""
+        return FileResponse(index_html, media_type="text/html")
+
+    app.mount("/web", StaticFiles(directory=web_dir), name="web")
+    if brand_dir.is_dir():
+        app.mount("/brand", StaticFiles(directory=brand_dir), name="brand")
+    else:
+        logger.warning("Brand directory %s not found; /brand assets will not be served", brand_dir)
