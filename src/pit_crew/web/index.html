@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pit Crew · Pit Wall</title>
+    <link rel="icon" type="image/svg+xml" href="/brand/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Titillium+Web:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
+    />
+    <link rel="stylesheet" href="/brand/tokens.css" />
+    <link rel="stylesheet" href="/web/styles.css" />
+    <script type="module" src="/web/app.js"></script>
+  </head>
+  <body>
+    <header class="header-bar" id="header-bar">
+      <div class="header-bar__left">
+        <a class="header-bar__brand" href="/" aria-label="Pit Crew home">
+          <img class="header-bar__logo" src="/brand/logo-lockup-dark.svg" alt="Pit Crew" width="190" height="38" />
+        </a>
+        <label class="repo-selector">
+          <span class="visually-hidden">Repository (owner/name)</span>
+          <input
+            id="repo-input"
+            class="repo-selector__input"
+            type="text"
+            name="repo"
+            list="repo-options"
+            placeholder="owner/name"
+            pattern="[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <datalist id="repo-options"></datalist>
+        <span class="sha-chip" id="base-sha-chip" title="Current base SHA">
+          <span class="sha-chip__label">base</span>
+          <code class="sha-chip__value telemetry" id="base-sha-value">-------</code>
+        </span>
+      </div>
+
+      <div class="sla-meter" id="sla-meter" role="group" aria-label="SLA Target Meter">
+        <div class="sla-meter__readout">
+          <span class="sla-meter__label">median</span>
+          <span class="sla-meter__value telemetry"><span id="sla-median">--</span>s / 60s</span>
+        </div>
+        <div class="sla-meter__readout">
+          <span class="sla-meter__label">p95</span>
+          <span class="sla-meter__value telemetry"><span id="sla-p95">--</span>s / 120s</span>
+        </div>
+        <span class="sla-meter__badge" id="sla-badge" hidden>SLA MET</span>
+      </div>
+
+      <div class="header-bar__right">
+        <div class="mode-toggle" id="mode-toggle" role="group" aria-label="Data mode">
+          <button type="button" class="mode-toggle__option" data-mode="live" aria-pressed="false">Live</button>
+          <button type="button" class="mode-toggle__option" data-mode="demo" aria-pressed="true">Demo</button>
+        </div>
+        <button type="button" class="run-button" id="run-pit-stop" aria-label="Run Pit Stop">Run Pit Stop</button>
+      </div>
+    </header>
+
+    <main class="pit-wall" id="pit-wall">
+      <section id="demo-switcher" class="pit-wall__slot demo-switcher" aria-label="Demo scenarios"></section>
+      <section id="sector-pipeline" class="pit-wall__slot" aria-label="Sector pipeline"></section>
+      <section id="telemetry-center" class="pit-wall__slot pit-wall__grid" aria-label="Telemetry center"></section>
+      <section id="lap-history" class="pit-wall__slot" aria-label="Lap history"></section>
+    </main>
+  </body>
+</html>
