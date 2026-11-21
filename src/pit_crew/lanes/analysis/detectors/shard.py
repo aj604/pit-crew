@@ -38,6 +38,8 @@ _QUOTES = ("'", '"')
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
+_SHARD_FLAGS = frozenset({"--shard", "--splits", "--group", "--num-shards", "--shard-id", "--partition"})
+_SHARD_ENV_VARS = ("CI_NODE_INDEX", "CI_NODE_TOTAL", "SHARD_INDEX", "SPLIT_INDEX")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
 
@@ -102,6 +104,22 @@ def _is_non_test_command(segment: str) -> bool:
     )
 
 
+def _step_is_sharded(step: StepSpec) -> bool:
+    """Whether the step's own command already shards: a split flag, or a CI node/shard index variable.
+
+    `pytest -n` / `--numprocesses` (xdist) is parallel, not sharded, so it only counts next to a split flag,
+    which is already enough on its own.
+    """
+    text = f"{step.run or ''}\n{step.env}"
+    if any(var in text for var in _SHARD_ENV_VARS):
+        return True
+    for raw in (step.run or "").split():
+        flag = _unquote(raw).partition("=")[0]
+        if flag in _SHARD_FLAGS:
+            return True
+    return False
+
+
 def _runs_tests(step: StepSpec) -> bool:
     """Whether the step runs a test suite: judged by its command, or by its name when it has none (a `uses:` step).
 
@@ -130,7 +148,7 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
         for step, occurrence in zip(spec.steps, step_occurrences(spec.steps), strict=True):
             if is_setup_step(step.name):
                 continue
-            if not _runs_tests(step):
+            if not _runs_tests(step) or _step_is_sharded(step):
                 continue
             timing = step_profile(profile, job_id, step, occurrence)
             if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:

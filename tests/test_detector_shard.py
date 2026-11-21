@@ -242,6 +242,47 @@ def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str)
 @pytest.mark.parametrize(
     "command",
     [
+        "npx playwright test --shard=1/4",
+        "npx playwright test --shard 1/4",
+        "npx jest --shard=2/3",
+        "pytest --splits 4 --group 1",
+        "pytest --splits=4 --group=1",
+        "pytest --num-shards 4 --shard-id 0",
+        "pytest --num-shards=4",
+        "./run-tests --partition 1/3",
+        "pytest -n auto --splits 3 --group 2",
+        "pytest tests/ --shard-id=2",
+        'pytest "--group" 1',
+        "pytest -k $CI_NODE_INDEX",
+        "pytest --total $CI_NODE_TOTAL",
+        'pytest --part "${SHARD_INDEX}"',
+        "pytest --part $SPLIT_INDEX",
+    ],
+)
+def test_shard_skips_steps_whose_command_already_shards(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize("command", ["pytest -n auto", "pytest -n 4 tests/", "pytest --numprocesses=4"])
+def test_shard_still_flags_xdist_parallelism_alone(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
+
+
+@pytest.mark.parametrize("variable", ["CI_NODE_INDEX", "CI_NODE_TOTAL", "SHARD_INDEX", "SPLIT_INDEX"])
+def test_shard_skips_steps_that_take_the_shard_from_env(variable: str) -> None:
+    wf = parse_workflow(
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: x\n    steps:\n"
+        f"      - name: Run tests\n        run: pytest\n        env:\n          {variable}: ${{{{ matrix.i }}}}\n"
+    )
+    prof = profile(wf, parse_runs([raw_run(i, [("Run tests", 240.0)]) for i in range(1, 4)]))
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "tox -e py312",
         "./scripts/ci.sh",
         "uv run pytest tests/",
