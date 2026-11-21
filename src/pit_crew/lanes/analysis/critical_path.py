@@ -13,6 +13,7 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from statistics import median
 from typing import Any
@@ -36,12 +37,16 @@ class JobTiming:
 
 @dataclass(frozen=True)
 class CriticalPath:
+    """The longest `needs:` chain and its length in seconds."""
+
     seconds: float
     jobs: tuple[str, ...]  # job ids, first to last
 
 
 @dataclass(frozen=True)
 class JobProfile:
+    """One job id summarised across runs."""
+
     job_id: str
     median_seconds: float  # wall-clock span, queueing included
     p95_seconds: float
@@ -56,6 +61,8 @@ class JobProfile:
 
 @dataclass(frozen=True)
 class StepProfile:
+    """One step, by job id and name, summarised across runs and matrix instances."""
+
     job_id: str
     name: str
     median_seconds: float
@@ -65,6 +72,8 @@ class StepProfile:
 
 @dataclass(frozen=True)
 class CIProfile:
+    """Where one workflow's wall-clock time goes, across the runs profiled."""
+
     workflow: str
     runs_analyzed: int
     runs_excluded: dict[str, int]  # conclusion -> count, for runs left out of the timings
@@ -78,7 +87,7 @@ class CIProfile:
 
     def to_dict(self, max_steps: int = 15) -> dict[str, Any]:
         """JSON-ready summary for the agent, keeping only the slowest steps."""
-        data = json.loads(json.dumps(asdict(self)))  # tuples become lists, as the agent receives them
+        data: dict[str, Any] = json.loads(json.dumps(asdict(self)))  # tuples become lists, as the agent receives them
         data["steps"] = data["steps"][:max_steps]
         return data
 
@@ -111,7 +120,7 @@ def job_timings(run: WorkflowRun, workflow: Workflow) -> tuple[dict[str, JobTimi
     return timings, unmatched
 
 
-def critical_path(workflow: Workflow, seconds: dict[str, float]) -> CriticalPath:
+def critical_path(workflow: Workflow, seconds: Mapping[str, float]) -> CriticalPath:
     """The longest chain of `needs:` through the jobs. Jobs missing from `seconds` count as 0."""
     finish: dict[str, float] = {}
     previous: dict[str, str | None] = {}
@@ -132,7 +141,7 @@ def critical_path(workflow: Workflow, seconds: dict[str, float]) -> CriticalPath
     return CriticalPath(total, tuple(reversed(chain)))
 
 
-def max_saving(workflow: Workflow, seconds: dict[str, float], job_id: str) -> float:
+def max_saving(workflow: Workflow, seconds: Mapping[str, float], job_id: str) -> float:
     """Wall-clock seconds saved if `job_id` took no time: the most any fix to it can save."""
     full = critical_path(workflow, seconds).seconds
     return full - critical_path(workflow, {**seconds, job_id: 0.0}).seconds

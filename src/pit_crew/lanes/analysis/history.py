@@ -36,6 +36,8 @@ Getter = Callable[[str], tuple[Any, str | None]]
 
 @dataclass(frozen=True)
 class StepRun:
+    """One step of one job."""
+
     number: int
     name: str
     conclusion: str | None
@@ -44,6 +46,8 @@ class StepRun:
 
 @dataclass(frozen=True)
 class JobRun:
+    """One job instance in one attempt of a run; a matrix job has one per combination."""
+
     id: int
     name: str  # display name as GitHub shows it, e.g. "test (ubuntu-latest, 3.15)"
     run_attempt: int
@@ -67,6 +71,8 @@ class JobRun:
 
 @dataclass(frozen=True)
 class WorkflowRun:
+    """One run of a workflow, with the jobs of every attempt."""
+
     id: int
     path: str
     event: str
@@ -89,7 +95,7 @@ class WorkflowRun:
         return _span(self.run_started_at, max(ends)) if ends else 0.0
 
 
-def fetch_history(
+def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query parameters
     repo: str,
     workflow: str,
     *,
@@ -181,13 +187,18 @@ def _http_getter(token: str | None) -> Getter:
         headers["Authorization"] = f"Bearer {token}"
 
     def get(url: str) -> tuple[Any, str | None]:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-            return json.load(response), _next_link(response.headers.get("Link"))
+        if not url.startswith(f"{API}/"):  # the token must only ever go to the GitHub API
+            msg = f"refusing to fetch {url!r}: not under {API}"
+            raise ValueError(msg)
+        request = urllib.request.Request(url, headers=headers)  # noqa: S310  https-only, checked above
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            return json.load(response), next_link(response.headers.get("Link"))
 
     return get
 
 
-def _next_link(header: str | None) -> str | None:
+def next_link(header: str | None) -> str | None:
+    """The rel="next" URL from a GitHub Link header, or None on the last page."""
     match = re.search(r'<([^>]+)>;\s*rel="next"', header or "")
     return match.group(1) if match else None
 
@@ -209,4 +220,5 @@ def _span(start: datetime | None, end: datetime | None) -> float:
 
 if __name__ == "__main__":
     repo_arg, workflow_arg, *rest = sys.argv[1:]
-    print(json.dumps(fetch_history(repo_arg, workflow_arg, runs=int(rest[0]) if rest else 30), indent=1))
+    sys.stdout.write(json.dumps(fetch_history(repo_arg, workflow_arg, runs=int(rest[0]) if rest else 30), indent=1))
+    sys.stdout.write("\n")

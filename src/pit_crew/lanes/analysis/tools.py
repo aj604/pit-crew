@@ -28,11 +28,13 @@ def workspace() -> Path:
 def workflow_path(workflow: str) -> Path:
     """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
     if not _WORKFLOW_FILE.fullmatch(workflow) or workflow.startswith("."):
-        raise ValueError(f"workflow must be a file name like ci.yml, got {workflow!r}")
+        msg = f"workflow must be a file name like ci.yml, got {workflow!r}"
+        raise ValueError(msg)
     folder = (workspace() / ".github" / "workflows").resolve()
     path = (folder / workflow).resolve()
     if path.parent != folder:  # a symlink pointing out of the folder
-        raise ValueError(f"workflow {workflow!r} resolves outside .github/workflows")
+        msg = f"workflow {workflow!r} resolves outside .github/workflows"
+        raise ValueError(msg)
     return path
 
 
@@ -49,7 +51,7 @@ def workflow_path(workflow: str) -> Path:
         "required": ["repo", "workflow"],
     },
 )
-def profile_ci(ledger: Ledger, repo: str, workflow: str, runs: int = 30, branch: str | None = None) -> dict[str, Any]:
+def profile_ci(ledger: Ledger, repo: str, workflow: str, runs: int = 30, branch: str | None = None) -> dict[str, Any]:  # noqa: ARG001  every tool takes the ledger first
     """Profile one workflow from its recent successful runs.
 
     Returns the critical path (the chain of jobs that sets wall-clock time), and per job its
@@ -59,7 +61,8 @@ def profile_ci(ledger: Ledger, repo: str, workflow: str, runs: int = 30, branch:
     Also returns the slowest steps.
     """
     if not _REPO.fullmatch(repo) or ".." in repo:
-        raise ValueError(f"repo must be owner/name, got {repo!r}")
+        msg = f"repo must be owner/name, got {repo!r}"
+        raise ValueError(msg)
     spec = parse_workflow(workflow_path(workflow).read_text())
     raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
     return profile(spec, history.parse_runs(raw)).to_dict()

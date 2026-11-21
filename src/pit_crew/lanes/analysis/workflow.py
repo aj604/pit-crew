@@ -14,6 +14,8 @@ _EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 
 @dataclass(frozen=True)
 class JobSpec:
+    """One entry under `jobs:` in a workflow file."""
+
     id: str
     name: str  # the `name:` field, or the id when there is none; may contain ${{ }} expressions
     needs: tuple[str, ...]
@@ -23,6 +25,8 @@ class JobSpec:
 
 @dataclass(frozen=True)
 class Workflow:
+    """A workflow file's name and jobs, keyed by job id."""
+
     name: str
     jobs: dict[str, JobSpec]
 
@@ -38,10 +42,11 @@ class Workflow:
 
 
 def parse_workflow(text: str) -> Workflow:
+    """Parse workflow YAML. Raises ValueError when a job needs a job that does not exist."""
     doc = yaml.safe_load(text) or {}
     jobs = {}
-    for job_id, body in (doc.get("jobs") or {}).items():
-        body = body or {}
+    for job_id, raw_body in (doc.get("jobs") or {}).items():
+        body = raw_body or {}
         needs = body.get("needs") or ()
         jobs[job_id] = JobSpec(
             id=job_id,
@@ -53,7 +58,8 @@ def parse_workflow(text: str) -> Workflow:
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
         if unknown:
-            raise ValueError(f"job {job.id!r} needs unknown job(s) {unknown}")
+            msg = f"job {job.id!r} needs unknown job(s) {unknown}"
+            raise ValueError(msg)
     return Workflow(name=str(doc.get("name") or ""), jobs=jobs)
 
 
@@ -66,7 +72,8 @@ def topological_order(workflow: Workflow) -> list[str]:
         if state.get(job_id) == "done":
             return
         if state.get(job_id) == "visiting":
-            raise ValueError(f"needs cycle: {' -> '.join((*path, job_id))}")
+            msg = f"needs cycle: {' -> '.join((*path, job_id))}"
+            raise ValueError(msg)
         state[job_id] = "visiting"
         for dep in workflow.jobs[job_id].needs:
             visit(dep, (*path, job_id))
