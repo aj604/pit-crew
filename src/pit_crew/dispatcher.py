@@ -1394,7 +1394,12 @@ class Dispatcher:
             hypothesis=hypothesis,
             prior_attempts=self.ledger.prior_attempts(repo),
         )
-        result = self.lane_runner("optimizer", task, self.ledger, repo=work_repo)
+        try:
+            result = self.lane_runner("optimizer", task, self.ledger, repo=work_repo)
+        except RuntimeError as exc:
+            if type(exc).__name__ == "MaxTurnsExceededError":
+                return None, True
+            raise
         new_candidates = [
             cand
             for cand in self.ledger.all(Candidate)

@@ -105,6 +105,7 @@ class _FakeStep:
     id: str = ""
     name: str = ""
     arguments: dict[str, Any] | None = None
+    call_id: str = ""
 
 
 @dataclass
@@ -636,3 +637,44 @@ def test_tool_outputs_are_serialized_for_the_sdk(
 def test_repository_identifiers_are_normalized_to_urls(repo: str, expected: str) -> None:
     assert normalize_repository_url(repo) == expected
     assert repository_source(repo, "/src") == {"type": "repository", "source": expected, "target": "/src"}
+
+
+def test_run_lane_services_client_call_when_parallel_builtin_result_follows() -> None:
+    ledger = InMemoryLedger()
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                environment_id="env-1",
+                steps=[
+                    _FakeStep(type="function_call", id="call-builtin-1", name="view_file", arguments={}),
+                    _FakeStep(type="function_result", call_id="call-builtin-1", name="view_file"),
+                    _FakeStep(type="function_call", id="call-builtin-2", name="view_file", arguments={}),
+                    _FakeStep(
+                        type="function_call",
+                        id="call-client-1",
+                        name="record_hypothesis",
+                        arguments={
+                            "repo": "org/fork",
+                            "description": "parallelize jobs",
+                            "skill": "parallelize-dag",
+                            "expected_savings_seconds": 30.0,
+                        },
+                    ),
+                    _FakeStep(type="function_result", call_id="call-builtin-2", name="view_file"),
+                ],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-1"),
+        ]
+    )
+
+    final = run_lane("analysis", "analyze org/fork", ledger=ledger, client=fake_client)
+
+    assert final.status == "completed"
+    recorded = ledger.all(Hypothesis)
+    assert len(recorded) == 1
+    assert recorded[0].skill == "parallelize-dag"
+    follow_up_input = fake_client.interactions.calls[1]["input"]
+    assert isinstance(follow_up_input, list)
+    assert [entry["call_id"] for entry in follow_up_input] == ["call-client-1"]

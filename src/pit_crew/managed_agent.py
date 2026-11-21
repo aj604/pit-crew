@@ -197,7 +197,7 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
     interaction = active_client.interactions.create(**request)
     # Follow-up turns resume the same sandbox, so remember the first environment ID the API assigns.
     environment_id: str | None = None
-    for _ in range(MAX_TOOL_TURNS):
+    for turn in range(1, MAX_TOOL_TURNS + 1):
         environment_id = environment_id or _environment_id(interaction)
         while interaction.status in PENDING_STATUSES:
             time.sleep(POLL_INTERVAL_SECONDS)
@@ -226,9 +226,18 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
 
         call_steps = _pending_function_calls(interaction)
         if not call_steps:
+            logger.warning(
+                "Lane %s interaction %s requires_action with no unanswered function calls",
+                lane,
+                interaction.id,
+            )
             return interaction
 
+        logger.info("Lane %s turn %d executing tools: %s", lane, turn, [s.name for s in call_steps])
         results = [_execute_tool_step(lane, allowed_tool_names, active_ledger, step) for step in call_steps]
+        for res in results:
+            if res.get("is_error"):
+                logger.warning("Lane %s tool %s error: %s", lane, res.get("name"), str(res.get("result"))[:300])
         interaction = active_client.interactions.create(**follow_up, input=results)
 
     raise MaxTurnsExceededError(lane, MAX_TOOL_TURNS)
@@ -540,13 +549,27 @@ def _inline(target: str, path: Path) -> dict[str, str]:
 
 
 def _pending_function_calls(interaction: InteractionLike) -> list[InteractionStepLike]:
-    """Extract trailing function_call steps awaiting results on a `requires_action` interaction."""
+    """Extract function_call steps awaiting results on a `requires_action` interaction.
+
+    Matches calls against ``function_result`` steps by ``call_id`` so that server-executed
+    sandbox built-in results interleaved after parallel client tool calls do not mask
+    unanswered client function calls.
+    """
     steps = interaction.steps or ()
+    answered_ids = {
+        call_id
+        for step in steps
+        if step.type == "function_result" and isinstance(call_id := getattr(step, "call_id", None), str) and call_id
+    }
     calls: list[InteractionStepLike] = []
     for step in reversed(steps):
-        if step.type == "function_call":
-            calls.append(step)
-        elif step.type in {"function_result", "user_input"}:
+        if step.type == "user_input":
             break
+        if step.type == "function_result":
+            if getattr(step, "call_id", None):
+                continue
+            break
+        if step.type == "function_call" and step.id not in answered_ids:
+            calls.append(step)
     calls.reverse()
     return calls
