@@ -51,6 +51,17 @@ _SETUP_COMMAND = re.compile(
 _SETUP_ACTION = re.compile(r"(?:^actions/checkout$|setup|cache|^actions/download-artifact$)", re.IGNORECASE)
 _UPLOAD_ACTION = "actions/upload-artifact"
 _RETRY_ACTION = re.compile(r"retry", re.IGNORECASE)
+_BROWSER_TESTS = re.compile(r"\b(?:playwright|cypress|wdio|webdriverio|puppeteer)\b", re.IGNORECASE)
+# A package script that by its name runs browser tests: `npm run test:e2e`, `pnpm playwright`...
+_BROWSER_SCRIPT = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:.-]*(?:e2e|playwright|cypress|browser|wdio|puppeteer)[\w:.-]*",
+    re.IGNORECASE,
+)
+_RECORDING_PATH = re.compile(
+    r"test-results|playwright-report|cypress/(?:videos|screenshots)|screenshots|videos|traces?\b|\.(?:webm|mp4|zip)\b",
+    re.IGNORECASE,
+)
+_RUNS_ON_FAILURE = re.compile(r"\b(?:failure|always)\(\)|!\s*cancelled\(\)")
 _DISABLED_IF = re.compile(r"^\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*$", re.IGNORECASE)
 _SHELL_SEPARATOR = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "do", "done", "esac", "{", "}"})
@@ -162,6 +173,7 @@ def _compare_workflow(path: str, before: str, new: Workflow, report: GuardReport
         report.problems.append(f"{path}: {exc}")
         return
     report.warnings.extend(f"{path}: {note}" for note in _setup_changes(old, new))
+    report.warnings.extend(f"{path}: {note}" for note in _missing_recordings(new))
 
 
 def _load(path: str, text: str, report: GuardReport) -> Workflow | None:
@@ -588,3 +600,35 @@ _COMPARISONS: tuple[Callable[[Workflow, Workflow], list[str]], ...] = (
     _no_new_weakening,
     _timeouts_kept,
 )
+
+
+def _missing_recordings(workflow: Workflow) -> list[str]:
+    """Jobs that run browser tests without an upload that would carry their failure recordings."""
+    notes = []
+    for job_id, job in _jobs(workflow).items():
+        steps = _job_steps(job)
+        runs = [s["run"] for s in steps if isinstance(s.get("run"), str)]
+        if not any(_BROWSER_TESTS.search(run) or _BROWSER_SCRIPT.search(run) for run in runs):
+            continue
+        uploads = [s for s in steps if isinstance(s.get("uses"), str) and s["uses"].startswith(_UPLOAD_ACTION)]
+        if not uploads:
+            notes.append(
+                f"job `{job_id}` runs browser tests but uploads no failure recordings; "
+                "apply the artifact-capture companion playbook"
+            )
+        elif not any(_uploads_recordings_on_failure(step) for step in uploads):
+            notes.append(
+                f"job `{job_id}` runs browser tests, but no upload both runs on failure and includes "
+                "recording paths; check it, and apply the artifact-capture companion playbook if needed"
+            )
+    return notes
+
+
+def _uploads_recordings_on_failure(step: Workflow) -> bool:
+    """An upload that runs after a failed test (`failure()`, `always()`, `!cancelled()`) and carries recordings.
+
+    By default a step runs only on success, so a plain coverage upload proves nothing.
+    """
+    inputs = step.get("with")
+    path = _text(inputs.get("path")) if isinstance(inputs, dict) else ""
+    return bool(_RUNS_ON_FAILURE.search(_text(step.get("if")))) and bool(_RECORDING_PATH.search(path))
