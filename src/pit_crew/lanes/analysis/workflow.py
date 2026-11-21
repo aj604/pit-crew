@@ -7,6 +7,7 @@ to job ids ("test"). Analysis needs both sides joined to build the dependency gr
 import itertools
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 
 import yaml
@@ -141,7 +142,7 @@ def parse_workflow(text: str) -> Workflow:
         if unknown:
             msg = f"job {job.id!r} needs unknown job(s) {unknown}"
             raise ValueError(msg)
-    return Workflow(name=str(doc.get("name") or ""), jobs=jobs)
+    return Workflow(name=_text(doc.get("name")) or "", jobs=jobs)
 
 
 _NON_SCALAR = "<non-scalar>"  # stands in for a `with:` value that is a list or mapping
@@ -190,7 +191,7 @@ def _runs_on(raw: object) -> str:
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):
-        return ", ".join(str(r) for r in raw)
+        return ", ".join(r for r in raw if isinstance(r, str))
     return ""
 
 
@@ -226,6 +227,9 @@ _MAX_BODY_BYTES = 1_000_000
 _ENTRY_COST = 2  # rough serialized overhead per container entry and per key
 
 
+_SCALAR_TYPES = (str, int, float, bool, type(None), date, datetime, bytes)
+
+
 def _expanded_size_within(obj: object, limit: int) -> bool:
     """Whether `obj`, with every shared reference expanded, serializes to at most about `limit` characters.
 
@@ -244,11 +248,13 @@ def _expanded_size_within(obj: object, limit: int) -> bool:
             total += _ENTRY_COST * len(node)
             stack.extend(node.keys())
             stack.extend(node.values())
-        elif isinstance(node, list):
+        elif isinstance(node, list | tuple | set | frozenset):  # !!pairs, !!omap and !!set load as these
             total += _ENTRY_COST * len(node)
             stack.extend(node)
-        else:
+        elif isinstance(node, _SCALAR_TYPES):
             total += len(str(node))
+        else:
+            return False  # an unknown type: str() on it could expand every alias inside it
         if total > limit:
             return False
     return True
