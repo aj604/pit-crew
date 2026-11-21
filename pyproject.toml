@@ -175,6 +175,8 @@ source_modules = [
     "pit_crew.tools",
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
+    "pit_crew.proof_bridge",
     "pit_crew.lanes",
 ]
 forbidden_modules = ["google"]
