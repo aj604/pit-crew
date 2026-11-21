@@ -45,20 +45,27 @@ def workflow_path(workflow: str) -> Path:
         "properties": {
             "repo": {"type": "string", "description": "owner/name whose Actions history to read"},
             "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
-            "runs": {"type": "integer", "description": "How many recent completed runs to read (default 30)"},
+            "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
             "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
         },
         "required": ["repo", "workflow"],
     },
 )
-def profile_ci(ledger: Ledger, repo: str, workflow: str, runs: int = 30, branch: str | None = None) -> dict[str, Any]:  # noqa: ARG001  every tool takes the ledger first
+def profile_ci(
+    ledger: Ledger,  # noqa: ARG001  every tool takes the ledger first
+    repo: str,
+    workflow: str,
+    runs: int = history.DEFAULT_RUNS,
+    branch: str | None = None,
+) -> dict[str, Any]:
     """Profile one workflow from its recent successful runs.
 
-    Returns the critical path (the chain of jobs that sets wall-clock time), and per job its
-    median/p95 time split into runner time and queue time, how often it was on the critical
-    path, and max_saving_seconds: the most wall-clock time any change to that job can save.
-    Jobs with max_saving_seconds of 0 are off the critical path; speeding them up saves nothing.
-    Also returns the slowest steps.
+    Returns the critical path (the chain of jobs that sets wall-clock time) with its time split
+    into waiting (for a runner), setup (checkout, toolchain, installs, caches) and running (the
+    checks themselves) at p50/p95, and biggest_bucket / biggest_bucket_p95: the one to fix first. Per job it returns
+    the same split, how often the job was on the critical path, and max_saving_seconds: the most
+    wall-clock time any change to that job can save. Jobs with max_saving_seconds of 0 are off
+    the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"

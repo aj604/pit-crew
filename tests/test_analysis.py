@@ -9,8 +9,10 @@ import pytest
 
 from pit_crew import tools
 from pit_crew.lanes.analysis import history
-from pit_crew.lanes.analysis.critical_path import critical_path, job_timings, max_saving, percentile, profile
+from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, is_setup_step, job_buckets
+from pit_crew.lanes.analysis.critical_path import critical_path, job_timings, max_saving, profile
 from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, next_link, parse_runs
+from pit_crew.lanes.analysis.stats import percentile
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow, topological_order
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import build_request
@@ -229,6 +231,75 @@ def test_percentile_is_nearest_rank() -> None:
     assert percentile([float(v) for v in range(1, 21)], 50) == 10
 
 
+# buckets.py
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Set up job",
+        "Complete job",
+        "Post Run actions/checkout@v4",
+        "Run actions/checkout@v4",
+        "Check out the base revision",
+        "Setup uv",
+        "Set up Python",
+        "Run actions/setup-node@v4",
+        "Install Dependencies",
+        "Uninstall httpx2 to run tests with httpx",
+        "Run npm ci",
+        "Run uv sync --locked",
+        "Run actions/cache@v4",
+        "Restore build cache",
+        "Run go mod download",
+    ],
+)
+def test_setup_steps(name: str) -> None:
+    assert is_setup_step(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Test",
+        "Run uv run pytest",
+        "Run npm test",
+        "CodSpeed benchmarks",
+        "Run uv run ruff check",
+        "Store coverage files",
+    ],
+)
+def test_check_steps_are_running(name: str) -> None:
+    assert not is_setup_step(name)
+
+
+def test_job_buckets_count_queue_as_waiting_and_unstepped_runner_time_as_setup() -> None:
+    raw = run(
+        extra_jobs=[
+            job("lint", 0, 20, 120, steps=[("Run actions/checkout@v4", 10, "success"), ("Lint", 80, "success")])
+        ]
+    )
+    lint = next(j for j in parse_runs([raw])[0].jobs if j.started_at and j.queued_seconds == 20)
+    assert job_buckets(lint) == Buckets(waiting=20, setup=10 + 10, running=80)
+
+
+def test_bucket_stats_and_biggest_bucket() -> None:
+    stats = bucket_stats([Buckets(1, 10, 5), Buckets(3, 30, 5), Buckets(2, 20, 50)])
+    assert stats == BucketStats(2, 3, 20, 30, 5, 50)
+    assert stats.biggest(50) == "setup"
+    assert stats.biggest(95) == "running"
+    assert bucket_stats([]).biggest() == "waiting"  # all zero: ties go to the earlier bucket
+
+
+def test_profile_splits_the_critical_path_into_buckets(workflow: Workflow) -> None:
+    p = profile(workflow, parse_runs([run(1), run(2)]))
+    # build (setup: 70s install + 30s unstepped) -> test macos (50s queued, 250s unstepped) -> deploy (10s unstepped)
+    assert p.critical_path_buckets == BucketStats(50, 50, 360, 360, 0, 0)
+    assert p.biggest_bucket == "setup"
+    assert p.biggest_bucket_p95 == "setup"
+    assert {j.job_id: j.buckets.waiting_p95 for j in p.jobs}["test"] == 50
+
+
 # history.py
 
 
@@ -253,6 +324,7 @@ def test_fetch_follows_pages_trims_fields_and_reads_every_attempt() -> None:
 
     raw = fetch_history("o/r", "ci.yml", runs=3, branch="main", get=get)
     assert [r["id"] for r in raw] == [1, 2, 3]
+    assert [r["jobs"][0]["id"] for r in raw] == [10, 20, 30]  # job lists fetched in parallel stay with their run
     assert "secret" not in raw[0]
     assert set(raw[0]["jobs"][0]["steps"][0]) == {
         "number",
@@ -314,7 +386,33 @@ def test_fastapi_profile(fastapi: tuple[Workflow, list[WorkflowRun]]) -> None:
     assert by_id["benchmark"].max_saving_seconds == 0  # runs beside test, never on the critical path
     assert by_id["regression-test"].max_saving_seconds == 0
     # changes runs for seconds but waited ~20 minutes for a runner in the Nov 16 merge burst.
-    assert by_id["changes"].median_run_seconds < 30 < by_id["changes"].median_queued_seconds
+    changes = by_id["changes"].buckets
+    assert changes.setup_p50 + changes.running_p50 < 30 < changes.waiting_p50
+    # Across all runs the merge burst makes waiting the bucket to fix first.
+    assert p.biggest_bucket == "waiting"
+    assert p.biggest_bucket_p95 == "waiting"
+
+
+def test_fastapi_without_the_merge_burst_is_dominated_by_running(
+    fastapi: tuple[Workflow, list[WorkflowRun]],
+) -> None:
+    wf, runs = fastapi
+    calm = [r for r in runs if r.run_started_at and r.run_started_at.day != 16]
+    p = profile(wf, calm)
+    assert p.runs_analyzed == 4
+    assert p.biggest_bucket == "running"
+    assert p.biggest_bucket_p95 == "waiting"  # even calm runs sometimes queue for minutes
+    assert p.critical_path_buckets.setup_p50 > 60  # macOS test instances spend minutes on setup
+
+
+def test_fastapi_critical_path_buckets_add_up_to_wall_clock(fastapi: tuple[Workflow, list[WorkflowRun]]) -> None:
+    wf, runs = fastapi
+    for r in runs:
+        if r.conclusion == "success":
+            timings, _ = job_timings(r, wf)
+            path = critical_path(wf, {j: t.seconds for j, t in timings.items()})
+            total = sum((timings[j].buckets for j in path.jobs), Buckets(0, 0, 0))
+            assert abs(total.waiting + total.setup + total.running - r.wall_clock_seconds) < 10
 
 
 # tools.py
