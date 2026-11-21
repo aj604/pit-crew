@@ -7,6 +7,7 @@ Kept in its own module so ``cli.py`` can wire ``add_runtime_subcommands`` and
 import argparse
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -470,6 +471,8 @@ def _run_serve_command(
     github: GitHubClient | None = None,
     serve_runner: Callable[..., None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ledger = SqliteLedger(args.ledger)
     tracker = RunTracker()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()

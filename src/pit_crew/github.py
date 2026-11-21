@@ -34,7 +34,10 @@ API_VERSION = "2022-11-28"
 USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
+_HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
+_HTTP_CONFLICT = 409
+_HTTP_UNPROCESSABLE = 422
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECT_HOPS = 3
 _ARTIFACTS_PER_PAGE = "100"
@@ -42,6 +45,8 @@ _REPLAY_ARTIFACT_PREFIX = "pit-crew-replay-"
 _FALLBACK_RECORDING_PREFIX = "failure-recordings-"
 _REPLAY_META_FILENAME = "replay-meta.json"
 _MAX_META_BYTES = 64 * 1024
+_WORKFLOWS_PER_PAGE = "100"
+_WORKFLOWS_PREFIX = ".github/workflows/"
 _MATRIX_SUFFIX = re.compile(r"\s*\(.*\)$")
 _SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TRAILING_INDEX_RE = re.compile(r"-\d+$")
@@ -81,6 +86,16 @@ class WorkflowRunResult:
     html_url: str
     head_sha: str
     head_branch: str
+
+
+@dataclass(frozen=True)
+class RepoMetadata:
+    """Repository metadata used to auto-detect branch, fork status, and push permissions."""
+
+    full_name: str
+    default_branch: str
+    can_push: bool
+    parent_full_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +300,86 @@ class HttpxGitHubClient:
         """Close owned HTTP resources when leaving the context manager."""
         self.close()
 
+    def get_repo_metadata(self, repo: str) -> RepoMetadata:
+        """Return default branch, push permission, and fork parent metadata for ``repo``."""
+        repo_path = _repo_path(repo)
+        repo_data = self._request_json("GET", f"/repos/{repo_path}")
+        full_name = _optional_str(repo_data, "full_name") or repo
+        default_branch = _require_str(repo_data, "default_branch")
+        permissions = repo_data.get("permissions")
+        can_push = bool(permissions["push"]) if isinstance(permissions, dict) and "push" in permissions else True
+        parent = repo_data.get("parent")
+        parent_full_name = (
+            _optional_str(parent, "full_name") if bool(repo_data.get("fork")) and isinstance(parent, dict) else None
+        )
+        return RepoMetadata(
+            full_name=full_name,
+            default_branch=default_branch,
+            can_push=can_push,
+            parent_full_name=parent_full_name,
+        )
+
+    def list_workflow_files(self, repo: str) -> list[str]:
+        """Return active workflow filenames under ``.github/workflows/`` for ``repo``."""
+        repo_path = _repo_path(repo)
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/workflows",
+            params={"per_page": _WORKFLOWS_PER_PAGE},
+        )
+        raw_workflows = data.get("workflows", [])
+        if not isinstance(raw_workflows, list):
+            return []
+        found: list[str] = []
+        seen: set[str] = set()
+        for entry in raw_workflows:
+            if not isinstance(entry, dict) or _optional_str(entry, "state") != "active":
+                continue
+            path = _optional_str(entry, "path") or ""
+            if not path.startswith(_WORKFLOWS_PREFIX):
+                continue
+            name = path.removeprefix(_WORKFLOWS_PREFIX)
+            if not name or "/" in name or not name.lower().endswith((".yml", ".yaml")):
+                continue
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+        return found
+
+    def ensure_writable_fork(self, repo: str) -> str:
+        """Create or reuse the authenticated user's fork of ``repo`` and enable GitHub Actions."""
+        repo_path = _repo_path(repo)
+        fork_data = self._request_json("POST", f"/repos/{repo_path}/forks", json_body={})
+        fork_name = _require_str(fork_data, "full_name")
+        default_branch = _optional_str(fork_data, "default_branch") or "main"
+        fork_path = _repo_path(fork_name)
+        self._wait_for_branch(fork_name, fork_path, default_branch)
+        self._enable_actions_best_effort(fork_path)
+        return fork_name
+
+    def _wait_for_branch(self, repo: str, repo_path: str, branch: str) -> None:
+        ref_url = f"{self._base_url}/repos/{repo_path}/git/ref/heads/{_branch_path(branch)}"
+        for attempt in range(self._dispatch_poll.attempts):
+            response = self._client.request("GET", ref_url, headers=self._headers)
+            if response.status_code not in {_HTTP_NOT_FOUND, _HTTP_CONFLICT}:
+                response.raise_for_status()
+                return
+            if attempt + 1 < self._dispatch_poll.attempts:
+                self._dispatch_poll.sleep(self._dispatch_poll.interval_seconds)
+        msg = f"Fork {repo!r} branch {branch!r} did not become ready in time."
+        raise RuntimeError(msg)
+
+    def _enable_actions_best_effort(self, repo_path: str) -> None:
+        response = self._client.request(
+            "PUT",
+            f"{self._base_url}/repos/{repo_path}/actions/permissions",
+            headers=self._headers,
+            json={"enabled": True},
+        )
+        if response.status_code in {_HTTP_FORBIDDEN, _HTTP_NOT_FOUND, _HTTP_UNPROCESSABLE}:
+            return
+        response.raise_for_status()
+
     def get_default_branch_sha(self, repo: str) -> str:
         """Return the current HEAD commit SHA of ``repo``'s default branch."""
         repo_path = _repo_path(repo)
@@ -362,15 +457,26 @@ class HttpxGitHubClient:
         return {"path": path, "mode": "100644", "type": "blob", "content": content}
 
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
-        """Trigger ``workflow_dispatch`` for ``workflow`` on ``ref`` and return the ``run_id``."""
+        """Trigger ``workflow_dispatch`` (falling back to an empty-commit push on 422) and return ``run_id``."""
         repo_path = _repo_path(repo)
         workflow_path = _workflow_path(workflow)
         cutoff = _to_utc(self._dispatch_poll.clock()).replace(microsecond=0)
-        response = self._request(
+        response = self._client.request(
             "POST",
-            f"/repos/{repo_path}/actions/workflows/{workflow_path}/dispatches",
-            json_body={"ref": ref, "return_run_details": True},
+            f"{self._base_url}/repos/{repo_path}/actions/workflows/{workflow_path}/dispatches",
+            headers=self._headers,
+            json={"ref": ref, "return_run_details": True},
         )
+        if response.status_code == _HTTP_UNPROCESSABLE:
+            return self._dispatch_via_empty_commit(
+                repo=repo,
+                repo_path=repo_path,
+                workflow=workflow,
+                workflow_path=workflow_path,
+                ref=ref,
+                cutoff=cutoff,
+            )
+        response.raise_for_status()
         if response.status_code != _HTTP_NO_CONTENT and response.content:
             dispatch_data = _decode_json_object(response)
             if "workflow_run_id" in dispatch_data:
@@ -389,6 +495,32 @@ class HttpxGitHubClient:
             raise RuntimeError(msg)
         return polled_run_id
 
+    def _dispatch_via_empty_commit(  # noqa: PLR0913
+        self,
+        *,
+        repo: str,
+        repo_path: str,
+        workflow: str,
+        workflow_path: str,
+        ref: str,
+        cutoff: datetime,
+    ) -> int:
+        branch = ref.removeprefix("refs/heads/")
+        ref_data = self._request_json("GET", f"/repos/{repo_path}/git/ref/heads/{_branch_path(branch)}")
+        head_sha = _require_str(_require_dict(ref_data, "object"), "sha")
+        self.commit_files(repo, branch, head_sha, {}, "chore(pit-crew): trigger CI run")
+        polled_run_id = self._poll_dispatched_run_id(
+            repo_path=repo_path,
+            workflow_path=workflow_path,
+            branch=branch,
+            cutoff=cutoff,
+            event="push",
+        )
+        if polled_run_id is None:
+            msg = f"No push-triggered run found for {repo!r} workflow {workflow!r} on ref {ref!r}."
+            raise RuntimeError(msg)
+        return polled_run_id
+
     def _poll_dispatched_run_id(
         self,
         *,
@@ -396,11 +528,12 @@ class HttpxGitHubClient:
         workflow_path: str,
         branch: str,
         cutoff: datetime,
+        event: str = "workflow_dispatch",
     ) -> int | None:
         seen_run_ids = self._seen_dispatch_run_ids.setdefault(repo_path, set())
         params = {
             "branch": branch,
-            "event": "workflow_dispatch",
+            "event": event,
             "per_page": str(_DISPATCH_RUN_LOOKUP_LIMIT),
         }
         for attempt in range(self._dispatch_poll.attempts):
