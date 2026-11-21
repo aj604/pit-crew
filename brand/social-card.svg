@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" fill="none">
+  <defs>
+    <linearGradient id="sc-bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0B0B11"/>
+      <stop offset="55%" stop-color="#15151E"/>
+      <stop offset="100%" stop-color="#21102D"/>
+    </linearGradient>
+    <radialGradient id="sc-sphere" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1050 175) scale(360 320)">
+      <stop offset="0%" stop-color="#FF008C" stop-opacity="0.34"/>
+      <stop offset="55%" stop-color="#B84DFF" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#15151E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="sc-red" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(180 560) scale(460 280)">
+      <stop offset="0%" stop-color="#FF1E00" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#FF1E00" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sc-r" x1="6" y1="10" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF1E00"/>
+      <stop offset="100%" stop-color="#D90429"/>
+    </linearGradient>
+    <linearGradient id="sc-n" x1="12" y1="54" x2="58" y2="26" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#B84DFF"/>
+      <stop offset="55%" stop-color="#FF008C"/>
+      <stop offset="100%" stop-color="#FF1E00"/>
+    </linearGradient>
+    <pattern id="sc-grid" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M36 0L0 0 0 36" fill="none" stroke="#242436" stroke-width="1"/>
+    </pattern>
+    <pattern id="sc-kerb" width="64" height="10" patternUnits="userSpaceOnUse">
+      <rect width="32" height="10" fill="#FF1E00"/>
+      <rect x="32" width="32" height="10" fill="#F4F4F7"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#sc-bg)"/>
+  <rect width="1280" height="640" fill="url(#sc-grid)" opacity="0.48"/>
+  <rect width="1280" height="640" fill="url(#sc-sphere)"/>
+  <rect width="1280" height="640" fill="url(#sc-red)"/>
+
+  <!-- Top Strip Neon Bar -->
+  <rect x="0" y="0" width="440" height="5" fill="#FF1E00"/>
+  <rect x="440" y="0" width="420" height="5" fill="#FF008C"/>
+  <rect x="860" y="0" width="420" height="5" fill="#B84DFF"/>
+
+  <!-- Left Column: Identity -->
+  <g transform="translate(80, 66)">
+    <!-- 5-Light Gantry Pill -->
+    <rect width="340" height="36" rx="18" fill="#0E0E15" stroke="#2D2D44" stroke-width="1.5"/>
+    <circle cx="24" cy="18" r="5.5" fill="#FF1E00"/>
+    <circle cx="44" cy="18" r="5.5" fill="#FF1E00"/>
+    <circle cx="64" cy="18" r="5.5" fill="#FF1E00"/>
+    <circle cx="84" cy="18" r="5.5" fill="#FF1E00"/>
+    <circle cx="104" cy="18" r="5.5" fill="#00E676"/>
+    <text x="124" y="22" fill="#D4D4E2" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" letter-spacing="0.14em">LAS VEGAS NIGHT SPEC</text>
+  </g>
+
+  <!-- Brand Lockup -->
+  <g transform="translate(80, 148)">
+    <g transform="scale(1.85)">
+      <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="url(#sc-r)"/>
+      <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+      <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="url(#sc-n)"/>
+    </g>
+    <text x="136" y="84" fill="#F4F4F7" font-family="'Chakra Petch', 'Titillium Web', sans-serif" font-size="86" font-weight="700" font-style="italic" letter-spacing="0.06em">PIT CREW</text>
+  </g>
+
+  <!-- Headline & Subhead -->
+  <text x="84" y="330" fill="#F4F4F7" font-family="'Titillium Web', 'Inter', sans-serif" font-size="34" font-weight="700">Faster CI. Proven on every bug.</text>
+  <text x="84" y="376" fill="#9E9EB3" font-family="'Inter', sans-serif" font-size="24">Autonomous managed deep agent for CI optimization.</text>
+  <text x="84" y="410" fill="#9E9EB3" font-family="'Inter', sans-serif" font-size="24">The agent proposes. Deterministic code judges.</text>
+
+  <!-- Purple Sector Callout Strip -->
+  <g transform="translate(84, 462)">
+    <rect width="676" height="104" rx="14" fill="#0E0E15" fill-opacity="0.92" stroke="#36264F" stroke-width="1.5"/>
+    <rect x="0" y="0" width="6" height="104" rx="3" fill="#B84DFF"/>
+    <text x="28" y="34" fill="#B84DFF" font-family="'JetBrains Mono', monospace" font-size="12" font-weight="700" letter-spacing="0.16em">PURPLE SECTOR // LATEST VERDICT</text>
+    <text x="28" y="78" fill="#F4F4F7" font-family="'JetBrains Mono', monospace" font-size="34" font-weight="700">-42.8%</text>
+    <text x="192" y="78" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="28" font-weight="700">12/12 BUGS</text>
+    <text x="412" y="78" fill="#00F0FF" font-family="'JetBrains Mono', monospace" font-size="24" font-weight="600">p = 0.004</text>
+    <rect x="572" y="42" width="84" height="36" rx="8" fill="#00E676" fill-opacity="0.16" stroke="#00E676"/>
+    <text x="614" y="65" text-anchor="middle" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="14" font-weight="700">KEEP</text>
+  </g>
+
+  <!-- Right Column: F1 Broadcast Timing Tower -->
+  <g transform="translate(816, 66)">
+    <rect width="388" height="500" rx="16" fill="#0D0D14" fill-opacity="0.94" stroke="#2D2D44" stroke-width="1.5"/>
+    <!-- Tower Header -->
+    <rect width="388" height="52" rx="16" fill="#1A1A26"/>
+    <rect y="36" width="388" height="16" fill="#1A1A26"/>
+    <rect x="20" y="18" width="10" height="16" rx="2" fill="#FF1E00"/>
+    <text x="42" y="31" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="16" font-weight="700" letter-spacing="0.14em">PIT WALL TELEMETRY</text>
+    <text x="368" y="30" text-anchor="end" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">LAP 05/05</text>
+
+    <!-- Row 1: ANA -->
+    <g transform="translate(16, 68)">
+      <rect width="356" height="68" rx="10" fill="#15151E" stroke="#262638"/>
+      <rect x="0" y="0" width="5" height="68" rx="2.5" fill="#00F0FF"/>
+      <text x="20" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">01</text>
+      <text x="50" y="28" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700">ANA</text>
+      <text x="102" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="12">ANALYSIS</text>
+      <text x="338" y="28" text-anchor="end" fill="#00F0FF" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="700">HYPOTHESIS</text>
+      <text x="50" y="52" fill="#7D7D94" font-family="'JetBrains Mono', monospace" font-size="11">critical_path: pytest (312s)</text>
+    </g>
+
+    <!-- Row 2: OPT -->
+    <g transform="translate(16, 148)">
+      <rect width="356" height="68" rx="10" fill="#15151E" stroke="#3F265C"/>
+      <rect x="0" y="0" width="5" height="68" rx="2.5" fill="#B84DFF"/>
+      <text x="20" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">02</text>
+      <text x="50" y="28" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700">OPT</text>
+      <text x="102" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="12">OPTIMIZER</text>
+      <text x="338" y="28" text-anchor="end" fill="#B84DFF" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="700">-142.4s</text>
+      <text x="50" y="52" fill="#7D7D94" font-family="'JetBrains Mono', monospace" font-size="11">compound: shard-by-timing</text>
+    </g>
+
+    <!-- Row 3: PRF -->
+    <g transform="translate(16, 228)">
+      <rect width="356" height="68" rx="10" fill="#15151E" stroke="#4D3E16"/>
+      <rect x="0" y="0" width="5" height="68" rx="2.5" fill="#FFD000"/>
+      <text x="20" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">03</text>
+      <text x="50" y="28" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700">PRF</text>
+      <text x="102" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="12">PROOF</text>
+      <text x="338" y="28" text-anchor="end" fill="#FFD000" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="700">12 REPLAYS</text>
+      <text x="50" y="52" fill="#7D7D94" font-family="'JetBrains Mono', monospace" font-size="11">red_commits: 10 + 2 synth</text>
+    </g>
+
+    <!-- Trust Boundary Divider -->
+    <g transform="translate(16, 308)">
+      <line x1="0" y1="10" x2="96" y2="10" stroke="#FF1E00" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text x="178" y="14" text-anchor="middle" fill="#FF1E00" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700" letter-spacing="0.14em">CODE-ONLY TRUST WALL</text>
+      <line x1="260" y1="10" x2="356" y2="10" stroke="#FF1E00" stroke-width="1.5" stroke-dasharray="4 4"/>
+    </g>
+
+    <!-- Row 4: DSP -->
+    <g transform="translate(16, 334)">
+      <rect width="356" height="68" rx="10" fill="#15151E" stroke="#4D1A28"/>
+      <rect x="0" y="0" width="5" height="68" rx="2.5" fill="#FF008C"/>
+      <text x="20" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">04</text>
+      <text x="50" y="28" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700">DSP</text>
+      <text x="102" y="28" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="12">FORK CI</text>
+      <text x="338" y="28" text-anchor="end" fill="#FF008C" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="700">N=10 RUNS</text>
+      <text x="50" y="52" fill="#7D7D94" font-family="'JetBrains Mono', monospace" font-size="11">interleaved timings + replays</text>
+    </g>
+
+    <!-- Row 5: RAT -->
+    <g transform="translate(16, 414)">
+      <rect width="356" height="68" rx="10" fill="#11221B" stroke="#00E676" stroke-width="1.5"/>
+      <rect x="0" y="0" width="5" height="68" rx="2.5" fill="#00E676"/>
+      <text x="20" y="28" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">05</text>
+      <text x="50" y="28" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700">RAT</text>
+      <text x="102" y="28" fill="#9EE6C0" font-family="'JetBrains Mono', monospace" font-size="12">RATER</text>
+      <text x="338" y="28" text-anchor="end" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="700">VERDICT: KEEP</text>
+      <text x="50" y="52" fill="#8CD9B2" font-family="'JetBrains Mono', monospace" font-size="11">exact_perm_test: p=0.004 OK</text>
+    </g>
+  </g>
+
+  <!-- Bottom F1 Kerb -->
+  <rect x="0" y="630" width="1280" height="10" fill="url(#sc-kerb)"/>
+</svg>

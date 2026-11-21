@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" fill="none">
+  <defs>
+    <linearGradient id="rh-bg" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0C0C12"/>
+      <stop offset="55%" stop-color="#15151E"/>
+      <stop offset="100%" stop-color="#1E1028"/>
+    </linearGradient>
+    <radialGradient id="rh-sphere" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(960 155) scale(240 240)">
+      <stop offset="0%" stop-color="#FF008C" stop-opacity="0.34"/>
+      <stop offset="45%" stop-color="#B84DFF" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#15151E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="rh-redglow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(180 60) scale(360 220)">
+      <stop offset="0%" stop-color="#FF1E00" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#FF1E00" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rh-r" x1="6" y1="10" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF1E00"/>
+      <stop offset="100%" stop-color="#D90429"/>
+    </linearGradient>
+    <linearGradient id="rh-n" x1="12" y1="54" x2="58" y2="26" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#B84DFF"/>
+      <stop offset="55%" stop-color="#FF008C"/>
+      <stop offset="100%" stop-color="#FF1E00"/>
+    </linearGradient>
+    <pattern id="rh-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0L0 0 0 32" fill="none" stroke="#252538" stroke-width="1"/>
+    </pattern>
+    <pattern id="rh-kerb" width="48" height="8" patternUnits="userSpaceOnUse">
+      <rect width="24" height="8" fill="#FF1E00"/>
+      <rect x="24" width="24" height="8" fill="#F4F4F7"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="360" rx="18" fill="url(#rh-bg)"/>
+  <rect width="1200" height="360" rx="18" fill="url(#rh-grid)" opacity="0.45"/>
+  <rect width="1200" height="360" rx="18" fill="url(#rh-sphere)"/>
+  <rect width="1200" height="360" rx="18" fill="url(#rh-redglow)"/>
+
+  <!-- Top F1 Vegas strip neon trim -->
+  <rect x="0" y="0" width="440" height="4" fill="#FF1E00"/>
+  <rect x="440" y="0" width="420" height="4" fill="#FF008C"/>
+  <rect x="860" y="0" width="340" height="4" fill="#B84DFF"/>
+
+  <!-- Subtle Vegas Sphere wireframe arc + street circuit trace on right -->
+  <g opacity="0.55">
+    <circle cx="980" cy="170" r="118" stroke="#FF008C" stroke-opacity="0.35" stroke-width="1.5" stroke-dasharray="4 6"/>
+    <circle cx="980" cy="170" r="88" stroke="#B84DFF" stroke-opacity="0.45" stroke-width="1.5"/>
+    <!-- Las Vegas Strip inspired glowing track loop -->
+    <path d="M820 248 L885 248 L910 218 L995 218 C1038 218 1060 192 1060 158 C1060 124 1034 104 996 104 L942 104 L916 132 L855 132 L820 172 Z" stroke="#00F0FF" stroke-width="3.5" stroke-linejoin="round" fill="none"/>
+    <path d="M885 248 L910 218 L995 218 C1038 218 1060 192 1060 158" stroke="#B84DFF" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+    <path d="M1060 158 C1060 124 1034 104 996 104 L942 104" stroke="#FF008C" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+    <circle cx="820" cy="248" r="5" fill="#00E676"/>
+    <circle cx="995" cy="218" r="5" fill="#B84DFF"/>
+    <circle cx="942" cy="104" r="5" fill="#FFD000"/>
+    <text x="820" y="276" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="10" letter-spacing="0.16em">CIRCUIT // 3.85 KM NIGHT SPEC</text>
+  </g>
+
+  <!-- 5-Light F1 Starting Gantry -->
+  <g transform="translate(64, 44)">
+    <rect width="176" height="30" rx="15" fill="#0E0E15" stroke="#2D2D42" stroke-width="1.2"/>
+    <circle cx="24" cy="15" r="5.5" fill="#FF1E00"/>
+    <circle cx="48" cy="15" r="5.5" fill="#FF1E00"/>
+    <circle cx="72" cy="15" r="5.5" fill="#FF1E00"/>
+    <circle cx="96" cy="15" r="5.5" fill="#FF1E00"/>
+    <circle cx="120" cy="15" r="5.5" fill="#00E676"/>
+    <text x="138" y="19" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">GO</text>
+    <text x="192" y="19" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="600" letter-spacing="0.16em">LAS VEGAS NIGHT RACE EDITION // V2.0</text>
+  </g>
+
+  <!-- Main Lockup -->
+  <g transform="translate(64, 102)">
+    <g transform="scale(1.5)">
+      <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="url(#rh-r)"/>
+      <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+      <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="url(#rh-n)"/>
+    </g>
+    <text x="114" y="66" fill="#F4F4F7" font-family="'Chakra Petch', 'Titillium Web', sans-serif" font-size="72" font-weight="700" font-style="italic" letter-spacing="0.06em">PIT CREW</text>
+  </g>
+
+  <!-- Tagline -->
+  <text x="68" y="232" fill="#E4E4EE" font-family="'Titillium Web', 'Inter', sans-serif" font-size="22" font-weight="600">Faster CI. Proven on every bug.</text>
+  <text x="68" y="260" fill="#9494A8" font-family="'Inter', sans-serif" font-size="16">The managed agent proposes single-change optimizations. Deterministic code judges the stopwatch and replays.</text>
+
+  <!-- Bottom telemetry micro-bar -->
+  <g transform="translate(68, 288)">
+    <rect width="166" height="32" rx="6" fill="#0E0E15" stroke="#2D2D42"/>
+    <rect x="8" y="8" width="4" height="16" rx="2" fill="#00F0FF"/>
+    <text x="20" y="20" fill="#D4D4E2" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="600">S1 // ANALYSIS</text>
+
+    <rect x="178" width="174" height="32" rx="6" fill="#0E0E15" stroke="#452862"/>
+    <rect x="186" y="8" width="4" height="16" rx="2" fill="#B84DFF"/>
+    <text x="198" y="20" fill="#D9A3FF" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">S2 // -42.8% CI</text>
+
+    <rect x="364" width="168" height="32" rx="6" fill="#0E0E15" stroke="#4E4014"/>
+    <rect x="372" y="8" width="4" height="16" rx="2" fill="#FFD000"/>
+    <text x="384" y="20" fill="#FFE680" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="600">S3 // 12/12 BUGS</text>
+
+    <rect x="544" width="176" height="32" rx="6" fill="#0E0E15" stroke="#154D32"/>
+    <rect x="552" y="8" width="4" height="16" rx="2" fill="#00E676"/>
+    <text x="564" y="20" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">VERDICT // KEEP</text>
+  </g>
+
+  <!-- F1 Red/White Kerb bottom accent -->
+  <rect x="0" y="352" width="1200" height="8" fill="url(#rh-kerb)" opacity="0.9"/>
+</svg>
