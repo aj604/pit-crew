@@ -13,6 +13,7 @@ from pit_crew.managed_agent import (
     MaxTurnsExceededError,
     build_request,
     inline_bytes_source,
+    repository_source,
     run_lane,
 )
 
@@ -215,3 +216,31 @@ def test_run_lane_raises_when_exceeding_max_turns(monkeypatch: pytest.MonkeyPatc
     )
     with pytest.raises(MaxTurnsExceededError, match="exceeded 1"):
         run_lane("analysis", "loop forever", client=fake_client)
+
+
+def test_run_lane_forwards_repo_to_interaction_request() -> None:
+    fake_client = _FakeClient(responses=[_FakeInteraction(id="int-1", status="completed", steps=[])])
+
+    final = run_lane("optimizer", "add dep cache", repo="https://github.com/org/fork", client=fake_client)
+    assert final.status == "completed"
+    assert len(fake_client.interactions.calls) == 1
+
+    environment = fake_client.interactions.calls[0]["environment"]
+    assert isinstance(environment, dict)
+    sources = environment["sources"]
+    assert isinstance(sources, list)
+    assert repository_source("https://github.com/org/fork") in sources
+
+
+def test_run_lane_omits_repository_source_when_repo_is_omitted() -> None:
+    fake_client = _FakeClient(responses=[_FakeInteraction(id="int-1", status="completed", steps=[])])
+
+    final = run_lane("optimizer", "add dep cache", client=fake_client)
+    assert final.status == "completed"
+    assert len(fake_client.interactions.calls) == 1
+
+    environment = fake_client.interactions.calls[0]["environment"]
+    assert isinstance(environment, dict)
+    sources = environment["sources"]
+    assert isinstance(sources, list)
+    assert not any(source.get("type") == "repository" for source in sources)
