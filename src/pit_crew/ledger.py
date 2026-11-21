@@ -38,6 +38,10 @@ class Ledger(Protocol):
         """Return the most recent kept ``Candidate`` for ``repo``, if any."""
         ...
 
+    def records_for_repo(self, repo: str) -> dict[str, list[dict[str, Any]]]:
+        """Return all ledger records scoped to ``repo`` grouped by record type."""
+        ...
+
 
 class _QueryMixin:
     """Shared read queries built on ``all()`` so every Ledger backend behaves identically."""
@@ -78,6 +82,23 @@ class _QueryMixin:
             if cand.id in kept_ids and (cand.hypothesis_id in hypotheses or cand.repo == repo):
                 latest = cand
         return latest
+
+    def records_for_repo(self, repo: str) -> dict[str, list[dict[str, Any]]]:
+        """Return all ledger records scoped to ``repo`` grouped by record type."""
+        hypotheses = self.hypotheses_for_repo(repo)
+        hypothesis_ids = {h.id for h in hypotheses}
+        candidates = [c for c in self.all(Candidate) if c.hypothesis_id in hypothesis_ids or c.repo == repo]
+        candidate_ids = {c.id for c in candidates}
+        replay_plans = [p for p in self.all(ReplayPlan) if p.candidate_id in candidate_ids]
+        evidence = [e for e in self.all(Evidence) if e.candidate_id in candidate_ids]
+        verdicts = [v for v in self.all(Verdict) if v.candidate_id in candidate_ids]
+        return {
+            "hypotheses": [asdict(h) for h in hypotheses],
+            "candidates": [asdict(c) for c in candidates],
+            "replay_plans": [asdict(p) for p in replay_plans],
+            "evidence": [asdict(e) for e in evidence],
+            "verdicts": [asdict(v) for v in verdicts],
+        }
 
 
 def _attempt_dict(hyp: Hypothesis | None, cand: Candidate, verdict: Verdict | None) -> dict[str, Any]:

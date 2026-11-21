@@ -33,4 +33,9 @@ def create_app(
         """Return prior optimization attempts for a repository."""
         return ledger.prior_attempts(f"{owner}/{name}")
 
+    @app.get("/api/repos/{owner}/{name}/records")
+    def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
+        """Return structured ledger records for a repository."""
+        return ledger.records_for_repo(f"{owner}/{name}")
+
     return app
