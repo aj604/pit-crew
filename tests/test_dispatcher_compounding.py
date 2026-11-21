@@ -16,6 +16,7 @@ class _FakeGitHubClient:
     def __init__(self, default_shas: dict[str, str]) -> None:
         self._default_shas = dict(default_shas)
         self.default_branch_lookups: list[str] = []
+        self.pull_requests: list[dict[str, str]] = []
 
     def get_default_branch_sha(self, repo: str) -> str:
         self.default_branch_lookups.append(repo)
@@ -55,8 +56,9 @@ class _FakeGitHubClient:
         )
 
     def open_pull_request(self, repo: str, *, title: str, body: str, head: str, base: str) -> str:
-        del title, body, head, base
-        return f"https://github.com/{repo}/pull/1"
+        url = f"https://github.com/{repo}/pull/{len(self.pull_requests) + 1}"
+        self.pull_requests.append({"repo": repo, "title": title, "body": body, "head": head, "base": base})
+        return url
 
 
 @dataclass(frozen=True)
@@ -241,6 +243,7 @@ def test_run_until_sla_compounds_across_kept_and_rejected_cycles_then_stops_on_s
     latest_kept = ledger.latest_kept_candidate(repo)
     assert latest_kept is not None
     assert latest_kept.head_sha == "head-h3"
+    assert [pr["head"] for pr in github.pull_requests] == ["pit-crew/h1", "pit-crew/h3"]
 
 
 def test_run_until_sla_advances_base_sha_across_consecutive_kept_cycles_with_sqlite(tmp_path: Path) -> None:

@@ -50,6 +50,7 @@ class DispatcherConfig:
     run_timeout_seconds: float = 900.0
     poll_interval_seconds: float = 5.0
     auto_open_pr: bool = True
+    base_branch: str = "main"
 
 
 @runtime_checkable
@@ -137,6 +138,82 @@ def _build_proof_task(*, repo: str, base_sha: str, candidate: Candidate) -> str:
         f"Select historical bug commits or mutations for candidate {candidate.id} on {repo} "
         f"and record a replay plan.\n"
         f"Context:\n{json.dumps(payload, indent=2, sort_keys=True)}"
+    )
+
+
+def _escape_md_cell(value: object) -> str:
+    return " ".join(str(value).splitlines()).replace("|", r"\|")
+
+
+def _format_bug_outcome_row(outcome: dict[str, Any]) -> str:
+    kind = _escape_md_cell(outcome.get("kind", ""))
+    ref = _escape_md_cell(outcome.get("ref", ""))
+    baseline_failed = bool(outcome.get("baseline_failed", False))
+    baseline_label = "Yes" if baseline_failed else "No"
+    if not baseline_failed:
+        caught_label = "Excluded (dud)"
+    elif bool(outcome.get("caught", False)):
+        caught_label = "Yes"
+    else:
+        caught_label = "No"
+    run_url = str(outcome.get("run_url") or "")
+    run_cell = f"[View run]({run_url})" if run_url else "-"
+    return f"| {kind} | `{ref}` | {baseline_label} | {caught_label} | {run_cell} |"
+
+
+def _format_bug_replay_table(bug_outcomes: tuple[dict[str, Any], ...]) -> str:
+    if not bug_outcomes:
+        return "_No bug replay outcomes recorded._"
+    lines = [
+        "| Kind | Ref | Baseline Failed | Caught | Run |",
+        "| --- | --- | --- | --- | --- |",
+        *(_format_bug_outcome_row(outcome) for outcome in bug_outcomes),
+    ]
+    return "\n".join(lines)
+
+
+def format_pr_title(hypothesis: Hypothesis, candidate: Candidate, verdict: Verdict) -> str:
+    """Build a concise pull request title for a kept optimization candidate."""
+    raw_summary = candidate.summary.strip() or hypothesis.description.strip()
+    headline = raw_summary.splitlines()[0].strip() if raw_summary else hypothesis.skill
+    return f"perf(ci): [{hypothesis.skill}] {headline} ({verdict.speedup:.2f}x faster)"
+
+
+def format_pr_body(
+    hypothesis: Hypothesis,
+    candidate: Candidate,
+    evidence: Evidence,
+    verdict: Verdict,
+) -> str:
+    """Build a Markdown pull request body summarizing verdict metrics and bug-replay outcomes."""
+    p_value_str = f"{verdict.p_value:.4f}" if verdict.p_value is not None else "N/A"
+    sla_status = "Met" if verdict.sla_met else "Not met"
+    replay_table = _format_bug_replay_table(evidence.bug_outcomes)
+    return "\n".join(
+        [
+            "## Pit Crew CI Optimization",
+            "",
+            f"- **Hypothesis:** `{hypothesis.skill}` — {hypothesis.description}",
+            f"- **Candidate:** `{candidate.id}` (`{candidate.branch}`)",
+            f"- **Summary:** {candidate.summary}",
+            f"- **Verdict:** {verdict.reason}",
+            "",
+            "### Verdict Summary",
+            "",
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| Speedup | {verdict.speedup:.2f}x |",
+            f"| p-value | {p_value_str} |",
+            f"| Median duration | {verdict.median_seconds:.1f}s |",
+            f"| p95 duration | {verdict.p95_seconds:.1f}s |",
+            f"| SLA status | {sla_status} |",
+            f"| Bugs caught | {evidence.bugs_caught}/{evidence.bugs_total} |",
+            "",
+            "### Bug Replay Summary",
+            "",
+            replay_table,
+            "",
+        ]
     )
 
 
@@ -485,7 +562,13 @@ class Dispatcher:
         return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=tuple(run_urls))
 
     def run_cycle(self, repo: str, base_sha: str | None = None) -> Verdict | None:
-        """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any."""
+        """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any.
+
+        Persists collected ``Evidence`` and the ``Verdict`` to the ledger. When
+        ``verdict.keep`` and ``config.auto_open_pr`` are both ``True``, opens a pull
+        request for ``candidate.branch`` targeting ``config.base_branch`` with a
+        Markdown summary of the verdict metrics and bug-replay outcomes.
+        """
         resolved_base_sha = self.resolve_base_sha(repo, base_sha)
 
         analysis_task = _build_analysis_task(
@@ -524,6 +607,14 @@ class Dispatcher:
         self.ledger.add(evidence)
         verdict = rate(evidence)
         self.ledger.add(verdict)
+        if verdict.keep and self.config.auto_open_pr:
+            self.github.open_pull_request(
+                repo,
+                title=format_pr_title(hypothesis, candidate, verdict),
+                body=format_pr_body(hypothesis, candidate, evidence, verdict),
+                head=candidate.branch,
+                base=self.config.base_branch,
+            )
         return verdict
 
     def _run_optimizer(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> Candidate | None:

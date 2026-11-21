@@ -7,7 +7,15 @@ import pytest
 
 from pit_crew import managed_agent
 from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
-from pit_crew.dispatcher import DISALLOWED_PATH_REASON, Dispatcher, DispatcherConfig, LaneRunner, next_lane
+from pit_crew.dispatcher import (
+    DISALLOWED_PATH_REASON,
+    Dispatcher,
+    DispatcherConfig,
+    LaneRunner,
+    format_pr_body,
+    format_pr_title,
+    next_lane,
+)
 from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.ledger import InMemoryLedger, Ledger
 from pit_crew.rater import rate
@@ -230,6 +238,7 @@ def test_dispatcher_config_exposes_spec_defaults_and_is_frozen() -> None:
         "run_timeout_seconds",
         "poll_interval_seconds",
         "auto_open_pr",
+        "base_branch",
     ]
     assert cfg.timing_pairs == 5
     assert cfg.max_compounding_cycles == 5
@@ -237,6 +246,7 @@ def test_dispatcher_config_exposes_spec_defaults_and_is_frozen() -> None:
     assert cfg.run_timeout_seconds == 900.0
     assert cfg.poll_interval_seconds == 5.0
     assert cfg.auto_open_pr is True
+    assert cfg.base_branch == "main"
 
     with pytest.raises(FrozenInstanceError):
         cfg.timing_pairs = 10  # type: ignore[misc]
@@ -2016,3 +2026,345 @@ def test_collect_evidence_raises_value_error_for_malformed_mutation_and_unknown_
 
     assert github.created_branches == []
     assert github.deleted_branches == []
+
+
+def test_run_cycle_opens_pr_with_verdict_and_replay_summary_for_kept_candidate() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="Cache uv virtualenv across CI runs",
+        skill="dep-cache",
+        expected_savings_seconds=50.0,
+        workflow_path=".github/workflows/ci.yml",
+    )
+    cand = Candidate(
+        id="cand-pr-ok",
+        hypothesis_id=hyp.id,
+        branch="pc/uv-cache",
+        summary="Enable uv cache in CI workflow",
+        repo="org/repo",
+        base_sha="base-sha-0",
+        head_sha="cand-sha-0",
+        files={".github/workflows/ci.yml": "name: Cached CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            BugCase(kind="commit", commit_sha="deadbeef01", reason="regression commit"),
+            BugCase(kind="mutation", mutated_files={"src/dead.py": "# noop\n"}, reason="dud mutant"),
+            BugCase(kind="mutation", mutated_files={"src/auth.py": "return True\n"}, reason="auth bypass mutant"),
+        ),
+    )
+
+    baseline_durations = (100.0, 98.0, 102.0, 99.0, 101.0)
+    candidate_durations = (50.0, 49.0, 51.0, 48.0, 52.0)
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=baseline_durations[pair_idx])]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=candidate_durations[pair_idx])]
+    # Run 11: commit replay fails -> caught.
+    # Run 12: dud mutation baseline succeeds -> excluded (dud).
+    # Run 13 & 14: valid mutation baseline fails, candidate fails -> caught.
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=18.0)]
+    run_scripts[12] = [_make_run(12, conclusion="success", duration_seconds=12.0)]
+    run_scripts[13] = [_make_run(13, conclusion="failure", duration_seconds=15.0)]
+    run_scripts[14] = [_make_run(14, conclusion="failure", duration_seconds=11.0)]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner, config=DispatcherConfig(timing_pairs=5))
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is True
+    assert verdict.sla_met is True
+    assert verdict.p_value is not None
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert len(github.pull_requests) == 1
+
+    pr = github.pull_requests[0]
+    assert pr["repo"] == "org/repo"
+    assert pr["head"] == "pc/uv-cache"
+    assert pr["base"] == "main"
+    assert pr["title"] == "perf(ci): [dep-cache] Enable uv cache in CI workflow (2.00x faster)"
+
+    body = pr["body"]
+    assert f"| Speedup | {verdict.speedup:.2f}x |" in body
+    assert f"| p-value | {verdict.p_value:.4f} |" in body
+    assert "| Median duration | 50.0s |" in body
+    assert "| p95 duration | 51.8s |" in body
+    assert "| SLA status | Met |" in body
+    assert "| Bugs caught | 2/2 |" in body
+    assert "| Kind | Ref | Baseline Failed | Caught | Run |" in body
+    assert "| commit | `deadbeef01` | Yes | Yes | [View run](https://github.com/org/repo/actions/runs/11) |" in body
+    assert (
+        "| mutation | `dud mutant` | No | Excluded (dud) | [View run](https://github.com/org/repo/actions/runs/12) |"
+        in body
+    )
+    assert (
+        "| mutation | `auth bypass mutant` | Yes | Yes | [View run](https://github.com/org/repo/actions/runs/14) |"
+        in body
+    )
+
+
+def test_run_cycle_opens_pr_with_sla_not_met_and_custom_base_branch() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="Parallelize lint and unit tests",
+        skill="parallelize-dag",
+        expected_savings_seconds=100.0,
+    )
+    cand = Candidate(
+        id="cand-pr-sla-miss",
+        hypothesis_id=hyp.id,
+        branch="pc/parallel-dag",
+        summary="Run lint and tests in parallel",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: Parallel CI\n"},
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-commit-1",))
+
+    # 200s -> 100s is 2.00x faster (kept), but median 100s > 60s -> SLA Not met.
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=200.0 + pair_idx)]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=100.0 + pair_idx)]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=20.0)]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=runner,
+        config=DispatcherConfig(timing_pairs=5, base_branch="develop"),
+    )
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is True
+    assert verdict.sla_met is False
+    assert len(github.pull_requests) == 1
+    pr = github.pull_requests[0]
+    assert pr["repo"] == "org/repo"
+    assert pr["head"] == "pc/parallel-dag"
+    assert pr["base"] == "develop"
+    assert "| SLA status | Not met |" in pr["body"]
+    assert "| Median duration | 102.0s |" in pr["body"]
+
+
+def test_run_cycle_does_not_open_pr_when_auto_open_pr_is_false() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="Cache deps", skill="dep-cache", expected_savings_seconds=50.0)
+    cand = Candidate(
+        id="cand-no-pr",
+        hypothesis_id=hyp.id,
+        branch="pc/no-pr",
+        summary="Cache deps",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: Cached CI\n"},
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-1",))
+
+    run_scripts = _timing_run_scripts()
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=15.0)]
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=runner,
+        config=DispatcherConfig(timing_pairs=5, auto_open_pr=False),
+    )
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is True
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert len(ledger.all(Evidence)) == 1
+    assert github.pull_requests == []
+
+
+def test_run_cycle_does_not_open_pr_when_bug_replay_fails() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="Shard tests", skill="shard-by-timing", expected_savings_seconds=60.0)
+    cand = Candidate(
+        id="cand-missed-bug",
+        hypothesis_id=hyp.id,
+        branch="pc/missed-bug",
+        summary="Drop flaky test shard",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: Sharded CI\n"},
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-1",))
+
+    run_scripts = _timing_run_scripts()
+    # Replay concludes success -> bug was NOT caught.
+    run_scripts[11] = [_make_run(11, conclusion="success", duration_seconds=15.0)]
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner, config=DispatcherConfig(timing_pairs=5))
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.reason == "caught 0/1 bugs"
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert github.pull_requests == []
+
+
+def test_run_cycle_does_not_open_pr_when_timings_are_noisy() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="Dedupe job", skill="dedupe-jobs", expected_savings_seconds=10.0)
+    cand = Candidate(
+        id="cand-noisy",
+        hypothesis_id=hyp.id,
+        branch="pc/noisy",
+        summary="Minor job tweak",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: CI\n"},
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-1",))
+
+    noisy_base = (100.0, 95.0, 105.0, 98.0, 102.0)
+    noisy_cand = (99.0, 104.0, 96.0, 101.0, 97.0)
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=noisy_base[pair_idx])]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=noisy_cand[pair_idx])]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=15.0)]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner, config=DispatcherConfig(timing_pairs=5))
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.reason == "speedup is within noise"
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert github.pull_requests == []
+
+
+def test_run_cycle_does_not_open_pr_for_disallowed_candidate_path() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="Skip tests", skill="affected-tests", expected_savings_seconds=80.0)
+    cand = Candidate(
+        id="cand-bad-path",
+        hypothesis_id=hyp.id,
+        branch="pc/bad-path",
+        summary="Modify application code",
+        repo="org/repo",
+        changed_files=("src/app.py",),
+    )
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"})
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner, config=DispatcherConfig(auto_open_pr=True))
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.reason == DISALLOWED_PATH_REASON
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert github.pull_requests == []
+
+
+def test_format_pr_title_and_body_edge_cases() -> None:
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="First line description\nSecond line detail",
+        skill="dep-cache",
+        expected_savings_seconds=45.0,
+    )
+    cand_no_summary = Candidate(id="c1", hypothesis_id=hyp.id, branch="pc/c1", summary="   ", repo="org/repo")
+    verdict_no_p = Verdict(
+        candidate_id=cand_no_summary.id,
+        keep=True,
+        speedup=1.75,
+        p_value=None,
+        reason="1.75x faster",
+        median_seconds=55.0,
+        p95_seconds=70.0,
+        sla_met=True,
+    )
+    assert format_pr_title(hyp, cand_no_summary, verdict_no_p) == (
+        "perf(ci): [dep-cache] First line description (1.75x faster)"
+    )
+
+    hyp_empty_desc = Hypothesis(repo="org/repo", description="  ", skill="dedupe-jobs", expected_savings_seconds=30.0)
+    assert format_pr_title(hyp_empty_desc, cand_no_summary, verdict_no_p) == (
+        "perf(ci): [dedupe-jobs] dedupe-jobs (1.75x faster)"
+    )
+
+    empty_evidence = Evidence(
+        candidate_id=cand_no_summary.id,
+        baseline_seconds=(100.0,),
+        candidate_seconds=(55.0,),
+        bugs_total=0,
+        bugs_caught=0,
+        bug_outcomes=(),
+    )
+    empty_body = format_pr_body(hyp, cand_no_summary, empty_evidence, verdict_no_p)
+    assert "| p-value | N/A |" in empty_body
+    assert "_No bug replay outcomes recorded._" in empty_body
+
+    missed_evidence = Evidence(
+        candidate_id=cand_no_summary.id,
+        baseline_seconds=(100.0,),
+        candidate_seconds=(55.0,),
+        bugs_total=1,
+        bugs_caught=0,
+        bug_outcomes=(
+            {
+                "kind": "mutation",
+                "ref": "pipe|char\nnext line",
+                "caught": False,
+                "baseline_failed": True,
+                "run_url": "",
+            },
+        ),
+    )
+    missed_body = format_pr_body(hyp, cand_no_summary, missed_evidence, verdict_no_p)
+    assert r"| mutation | `pipe\|char next line` | Yes | No | - |" in missed_body
