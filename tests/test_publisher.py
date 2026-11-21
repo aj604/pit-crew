@@ -54,6 +54,10 @@ class FakeGitHub:
         self.calls.append(("list_workflow_job_runs", repo))
         return ()
 
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        self.calls.append(("get_run_failure_output", repo, run_id))
+        return b""
+
 
 @pytest.fixture
 def gh() -> FakeGitHub:
