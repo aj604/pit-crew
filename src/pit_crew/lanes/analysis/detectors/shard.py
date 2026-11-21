@@ -27,6 +27,36 @@ _WRAPPERS = frozenset(
     {"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"}  # runners
     | {"sudo", "env", "time", "nice", "nohup", "xargs"}  # prefixes that run the command that follows
 )
+_WRAPPER_VALUE_FLAGS = frozenset(
+    {
+        "--group",
+        "--only-group",
+        "--no-group",
+        "--extra",
+        "--python",
+        "-p",
+        "--with",
+        "--with-requirements",
+        "--directory",
+        "--project",
+        "-C",
+        "--dir",
+        "--filter",
+        "--package",
+        "--env-file",
+        "--config-file",
+        "--cache-dir",
+        "-u",
+        "--user",
+        "-g",
+        "-n",
+        "--adjustment",
+        "-P",
+        "-I",
+        "-L",
+        "-d",
+    }
+)
 _STATIC_TOOLS = frozenset(
     {"mypy", "ruff", "pyright", "tsc", "eslint", "flake8", "black", "isort", "pylint", "prettier", "biome"}
 )  # linters and type checkers take `tests/` as a path to read, not a suite to run
@@ -35,12 +65,16 @@ _NON_TEST_COMMANDS = _STATIC_TOOLS | frozenset(
 )  # `gh` downloads artifacts and cuts releases; it never runs a suite
 _UPLOAD_COMMANDS = frozenset({"codecov", "coveralls"})
 _UPLOAD_PREFIXES = ("upload", "publish")  # `upload-results.sh`, `publish.sh`: they ship results, not run tests
-_UPLOAD_PARTS = ("-upload", "_upload", "-publish", "_publish")  # `junit-upload`, `ci_publish`
+_UPLOAD_WORDS = frozenset({"upload", "uploader", "publish", "publisher"})
+_TEST_WORDS = frozenset({"test", "tests", "pytest", "jest", "vitest", "mocha", "rspec", "phpunit", "nextest", "ctest"})
+_NAME_PARTS = re.compile(r"[^a-z0-9]+")
 _QUOTES = ("'", '"')
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
-_SHARD_FLAGS = frozenset({"--shard", "--splits", "--group", "--num-shards", "--shard-id", "--partition"})
+# Ambiguous flags such as `--group` (used by `uv run --group` and tag selectors) are excluded;
+# pytest-split is recognized via `--splits`.
+_SHARD_FLAGS = frozenset({"--shard", "--splits", "--num-shards", "--shard-id", "--partition"})
 _SHARD_ENV_VARS = ("CI_NODE_INDEX", "CI_NODE_TOTAL", "SHARD_INDEX", "SPLIT_INDEX")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
@@ -67,17 +101,36 @@ def _unquote(token: str) -> str:
     return token
 
 
-def _first_token(segment: str) -> str:
-    """The command token of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
+def _split_command(segment: str) -> tuple[str, list[str]]:
+    """Split a shell segment into `(command_token, args)`, past wrappers, wrapper flags and `KEY=VALUE` assignments.
 
     A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
     """
-    for raw in segment.split():
-        token = _unquote(raw)
-        if token in _WRAPPERS or token.startswith("-") or _is_assignment(token):
+    tokens = [_unquote(raw) for raw in segment.split()]
+    i = 0
+    seen_wrapper = False
+    while i < len(tokens):
+        arg = tokens[i]
+        if _is_assignment(arg):
+            i += 1
             continue
-        return token
-    return ""
+        if arg == "--" and seen_wrapper:
+            i += 1
+            return (tokens[i], tokens[i + 1 :]) if i < len(tokens) else ("", [])
+        if arg in _WRAPPERS:
+            seen_wrapper = True
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 2 if seen_wrapper and "=" not in arg and arg in _WRAPPER_VALUE_FLAGS else 1
+            continue
+        return arg, tokens[i + 1 :]
+    return "", []
+
+
+def _first_token(segment: str) -> str:
+    """The command token of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none."""
+    return _split_command(segment)[0]
 
 
 def _word(token: str) -> str:
@@ -100,14 +153,24 @@ def _is_upload_tool(token: str) -> bool:
     """Whether the command token's basename (past the last `/`) is itself an upload/publish tool.
 
     Only the basename counts, so `python tests/test_upload.py` and `./scripts/test-publish.sh`, which are
-    tests living in a path with the word, stay tests. A basename starting with `test` is such a test too.
+    tests living in a path with the word, stay tests. Scripts whose basename identifies a test runner
+    (e.g. `./scripts/run-upload-tests.sh`) are not excluded solely because an internal upload/publish word matches.
     """
     base = token.rpartition("/")[2].lower()
     if _word(base) in _UPLOAD_COMMANDS:
         return True
-    if base.startswith("test"):
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    parts = [p for p in _NAME_PARTS.split(stem) if p]
+    if not parts or parts[0].startswith("test") or parts[-1] in _TEST_WORDS:
         return False
-    return base.startswith(_UPLOAD_PREFIXES) or any(part in base for part in _UPLOAD_PARTS)
+    has_upload = parts[0].startswith(_UPLOAD_PREFIXES) or any(p in _UPLOAD_WORDS for p in parts)
+    if not has_upload:
+        return False
+    return (
+        parts[0].startswith(_UPLOAD_PREFIXES)
+        or parts[-1].startswith(_UPLOAD_PREFIXES)
+        or not any(p in _TEST_WORDS for p in parts)
+    )
 
 
 def _is_non_test_command(segment: str) -> bool:
@@ -115,20 +178,36 @@ def _is_non_test_command(segment: str) -> bool:
     return _first_command(segment) in _NON_TEST_COMMANDS or _is_upload_tool(_first_token(segment))
 
 
+def _test_segments(step: StepSpec) -> list[str]:
+    """The shell segments of `step.run` that run tests."""
+    if step.run is None:
+        return []
+    segments = [seg.strip() for seg in _SEGMENTS.split(step.run) if seg.strip()]
+    explicit = [seg for seg in segments if TEST_STEP.search(seg) and not _is_non_test_command(seg)]
+    if explicit:
+        return explicit
+    if TEST_STEP.search(step.name) is not None and not any(_is_non_test_command(seg) for seg in segments):
+        return segments
+    return []
+
+
+def _segment_is_sharded(segment: str) -> bool:
+    """Whether the segment's test command itself passes a sharding flag."""
+    _, args = _split_command(segment)
+    return any(arg.partition("=")[0] in _SHARD_FLAGS for arg in args)
+
+
 def _step_is_sharded(step: StepSpec) -> bool:
-    """Whether the step's own command already shards: a split flag, or a CI node/shard index variable.
+    """Whether the step's test command already shards: a split flag on the test command, or a CI shard env var.
 
     `pytest -n` / `--numprocesses` (xdist) is parallel, not sharded, so it only counts next to a split flag,
-    which is already enough on its own.
+    which is already enough on its own. Ambiguous flags like `--group` (used by `uv run --group`) do not
+    count in isolation; `pytest-split` is recognised via `--splits`.
     """
     text = f"{step.run or ''}\n{step.env}"
     if any(var in text for var in _SHARD_ENV_VARS):
         return True
-    for raw in (step.run or "").split():
-        flag = _unquote(raw).partition("=")[0]
-        if flag in _SHARD_FLAGS:
-            return True
-    return False
+    return any(_segment_is_sharded(seg) for seg in _test_segments(step))
 
 
 def _runs_tests(step: StepSpec) -> bool:
@@ -138,10 +217,7 @@ def _runs_tests(step: StepSpec) -> bool:
     commands is a known non-test one (a wrapper script such as `./scripts/ci.sh`).
     """
     if step.run is not None:
-        segments = [seg.strip() for seg in _SEGMENTS.split(step.run)]
-        if any(TEST_STEP.search(seg) and not _is_non_test_command(seg) for seg in segments):
-            return True
-        return TEST_STEP.search(step.name) is not None and not any(_is_non_test_command(seg) for seg in segments)
+        return bool(_test_segments(step))
     if (step.uses or "").startswith(NO_COMMAND_ACTIONS):
         return False  # moving files around, however the step is named
     return TEST_STEP.search(step.name) is not None

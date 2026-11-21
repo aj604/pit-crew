@@ -343,11 +343,91 @@ def test_the_window_is_filled_per_trusted_event_so_pull_request_runs_cannot_crow
 
     result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 3})
 
-    # Push first, then each call asks only for what is missing; pull_request is never requested.
-    assert run_requests == [("push", 3), ("merge_group", 1), ("workflow_dispatch", 1), ("schedule", 1)]
-    assert sorted(jobs_requested) == [1, 2, 3]  # jobs only for the three kept runs
+    # Each trusted event lists up to `runs` metadata entries; pull_request is never requested.
+    # Globally newest 3 are push #2 (day 5) and schedule #4, #3 (day 3); older push #1 (day 1) never fetches jobs.
+    assert run_requests == [("push", 3), ("merge_group", 3), ("workflow_dispatch", 3), ("schedule", 3)]
+    assert sorted(jobs_requested) == [2, 3, 4]  # jobs only for the three newest kept runs
     assert result["runs_analyzed"] == 3
     assert result["runs_excluded_event"] == 0
+
+
+@pytest.mark.usefixtures("checkout")
+def test_newer_dispatch_is_not_displaced_when_older_pushes_fill_the_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    other = history.workflow_blob_sha(OTHER)
+    by_event = {
+        "push": [make_run(2, OTHER_NEWEST, 2, 200), make_run(1, OTHER_NEWEST, 1, 200)],
+        "workflow_dispatch": [with_event(make_run(3, MATCH_NEW, 5, 100), "workflow_dispatch")],
+    }
+    every = {r["id"]: r for runs in by_event.values() for r in runs}
+    run_requests: list[tuple[str, int]] = []
+    jobs_requested: list[int] = []
+
+    def get(url: str) -> tuple[Any, str | None]:
+        if "/jobs" in url:
+            run_id = int(url.split("/runs/")[1].split("/", maxsplit=1)[0])
+            jobs_requested.append(run_id)
+            return {"jobs": every[run_id]["jobs"]}, None
+        query = parse_qs(urlparse(url).query)
+        event, per_page = query["event"][0], int(query["per_page"][0])
+        run_requests.append((event, per_page))
+        page = [{k: v for k, v in r.items() if k != "jobs"} for r in by_event.get(event, [])[:per_page]]
+        return {"workflow_runs": page}, None
+
+    real_fetch = history.fetch_history
+    monkeypatch.setattr(history, "fetch_history", lambda *a, **k: real_fetch(*a, **k, get=get))
+    blobs = {MATCH_NEW: local, OTHER_NEWEST: other}
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: {r: blobs[r] for r in refs})
+
+    ci = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 2})
+    found = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 2})
+
+    # Older push #1 (day 1) is displaced by newer workflow_dispatch #3 (day 5) before jobs are fetched.
+    assert run_requests[:4] == [("push", 2), ("merge_group", 2), ("workflow_dispatch", 2), ("schedule", 2)]
+    assert sorted(jobs_requested[:2]) == [2, 3]
+    assert ci["runs_analyzed"] == 1
+    assert ci["runs_excluded_revision"] == 1
+    assert ci["steps"][0]["median_seconds"] == pytest.approx(100)
+    assert found["profile_summary"]["runs_analyzed"] == 1
+    assert found["profile_summary"]["base_sha"] == MATCH_NEW
+    assert len(found["findings"]) == 1
+
+
+@pytest.mark.usefixtures("checkout")
+def test_duplicate_run_ids_across_events_fetch_jobs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    shared = make_run(7, MATCH_NEW, 5, 100)
+    by_event = {
+        "push": [shared],
+        "workflow_dispatch": [shared],
+    }
+    jobs_requested: list[int] = []
+
+    def get(url: str) -> tuple[Any, str | None]:
+        if "/jobs" in url:
+            run_id = int(url.split("/runs/")[1].split("/", maxsplit=1)[0])
+            jobs_requested.append(run_id)
+            return {"jobs": shared["jobs"]}, None
+        query = parse_qs(urlparse(url).query)
+        event, per_page = query["event"][0], int(query["per_page"][0])
+        page = [{k: v for k, v in r.items() if k != "jobs"} for r in by_event.get(event, [])[:per_page]]
+        return {"workflow_runs": page}, None
+
+    real_fetch = history.fetch_history
+    monkeypatch.setattr(history, "fetch_history", lambda *a, **k: real_fetch(*a, **k, get=get))
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, local))
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 3})
+
+    assert jobs_requested == [7]
+    assert result["runs_analyzed"] == 1
+
+
+def test_fetch_history_rejects_passing_both_event_and_events() -> None:
+    with pytest.raises(ValueError, match="either event or events"):
+        history.fetch_history(
+            REPO, "ci.yml", event="push", events=("push",), get=lambda _u: pytest.fail("must not fetch")
+        )
 
 
 @pytest.mark.usefixtures("checkout")
