@@ -63,6 +63,8 @@ class FakeGitHubClient:
     visible_after: int = 0
     complete_after: int = 1
     writes: list[tuple[str, ...]] = field(default_factory=list)
+    filter_runs: bool = True
+    """When false, ``list_workflow_runs`` ignores its filters, like a sloppy API page would."""
     _next_run: int = 1000
     _hidden: list[tuple[str, FakeRun, int]] = field(default_factory=list)
 
@@ -171,7 +173,8 @@ class FakeGitHubClient:
         return [
             r.info()
             for r in reversed(state.runs)
-            if r.path.split("@", 1)[0] == path and r.head_branch == branch and r.event == event
+            if not self.filter_runs
+            or (r.path.split("@", 1)[0] == path and r.head_branch == branch and r.event == event)
         ]
 
     # --- internals --------------------------------------------------------------------------

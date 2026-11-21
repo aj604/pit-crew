@@ -202,7 +202,7 @@ def test_seed_does_not_touch_github_dir_after_c0() -> None:
 
 
 def test_only_frozen_green_dispatch_runs_on_main_count() -> None:
-    gh = FakeGitHubClient()
+    gh = FakeGitHubClient(filter_runs=False)  # the seeder must filter on its own
     c0 = _c0(gh)
     stale = gh.add_repo("other/x")  # a SHA the target repo does not know (e.g. from before a reset)
     gh.add_run(REPO, c0, event="push")
@@ -214,6 +214,16 @@ def test_only_frozen_green_dispatch_runs_on_main_count() -> None:
     report = _seed(gh, baseline_runs=2)
     assert counted.id in report.green_runs
     assert report.dispatched == 1
+
+
+def test_green_runs_on_an_older_workflow_do_not_count_after_reset() -> None:
+    gh = FakeGitHubClient()
+    old = gh.add_repo(REPO, {bs.WORKFLOW_PATH: b"on: workflow_dispatch\n"})
+    stale = {gh.add_run(REPO, old).id for _ in range(5)}
+    report = _seed(gh, baseline_runs=3)
+    assert report.provisioning == "reset"
+    assert report.dispatched == 3
+    assert not stale.intersection(report.green_runs)
 
 
 def test_runs_listed_with_versioned_path_still_count() -> None:
