@@ -179,9 +179,12 @@ def test_workflow_run_result_allows_none_conclusion_for_active_runs() -> None:
 
 def test_fake_github_client_conforms_to_protocol_and_exercises_all_methods() -> None:
     fake = FakeGitHubClient({"org/repo": "base-sha-000"})
-    assert isinstance(fake, GitHubClient)
+    # Assign to the Protocol type before isinstance() so mypy checks structural
+    # subtyping without narrowing `fake` to an intersection type first.
+    client: GitHubClient = fake
 
-    head_sha, run_result, pr_url = _exercise_github_client(fake, "org/repo")
+    head_sha, run_result, pr_url = _exercise_github_client(client, "org/repo")
+    assert isinstance(fake, GitHubClient)
 
     assert head_sha == "commit-0001"
     assert run_result == WorkflowRunResult(
