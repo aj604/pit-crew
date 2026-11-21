@@ -677,3 +677,61 @@ def test_run_until_sla_advances_past_optimizer_max_turns_exceeded() -> None:
     assert verdicts[0].sla_met is True
     optimizer_hyp_ids = [c.context["hypothesis"]["id"] for c in runner.calls if c.lane == "optimizer"]
     assert optimizer_hyp_ids == ["h-stuck", "h-viable"]
+
+
+def test_run_until_sla_reuses_fresh_hypotheses_instead_of_rerunning_analysis() -> None:
+    @dataclass(frozen=True)
+    class _Completed:
+        status: str = "completed"
+
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+
+    def seed_at_base(lane_ledger: Ledger, context: dict[str, Any]) -> None:
+        for hyp_id, savings in (("h-decline", 120.0), ("h-viable", 60.0)):
+            lane_ledger.add(
+                Hypothesis(
+                    id=hyp_id,
+                    repo=repo,
+                    description=f"Optimization {hyp_id}",
+                    skill="parallelize-dag",
+                    expected_savings_seconds=savings,
+                    base_sha=str(context["base_sha"]),
+                )
+            )
+
+    class _DecliningRunner(_ScriptedLaneRunner):
+        @override
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            context = _parse_task_context(task)
+            if lane == "optimizer" and context["hypothesis"]["id"] == "h-decline":
+                self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
+                return _Completed()
+            super().__call__(lane, task, ledger, repo=repo)
+            return _Completed()
+
+    runner = _DecliningRunner(on_analysis=seed_at_base)
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=_FakeGitHubClient({repo: "sha-default"}),
+        lane_runner=runner,
+        evidence_by_candidate={
+            "cand-h-viable": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+        },
+        config=DispatcherConfig(max_compounding_cycles=5),
+    )
+
+    verdicts = dispatcher.run_until_sla(repo)
+
+    assert [v.candidate_id for v in verdicts] == ["cand-h-viable"]
+    assert [c.lane for c in runner.calls].count("analysis") == 1

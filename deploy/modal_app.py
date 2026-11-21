@@ -65,6 +65,11 @@ _secrets = [modal.Secret.from_name(_secret_name)] if _secret_name else []
 @modal.asgi_app()
 def web() -> Any:  # noqa: ANN401
     """Build and return the Pit Crew FastAPI ASGI application."""
+    import logging  # noqa: PLC0415
+
+    # Without a root handler, lane turns and cycle progress (INFO) never reach `modal app logs`.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     from pit_crew import managed_agent  # noqa: PLC0415
     from pit_crew.dispatcher import Dispatcher, DispatcherConfig  # noqa: PLC0415
     from pit_crew.github import HttpxGitHubClient  # noqa: PLC0415
