@@ -3,6 +3,7 @@
 
 import { DEMO_SCENARIO_IDS, DEMO_SCENARIOS, DEMO_STAGE_LABELS } from "./demo_scenarios.js";
 import { createLapHistory } from "./lap_history.js";
+import { createLivePoller } from "./live_poller.js";
 import { createSectorPipeline } from "./pipeline.js";
 import { createPitWallStore, resolveInitialBoot } from "./store.js";
 import { createTelemetryCenter } from "./telemetry.js";
@@ -229,7 +230,7 @@ export function bindHeaderToStore(header, modeToggle, store) {
 }
 
 /** Boot the Pit Wall against `root`, choosing Demo or Live Mode from the URL query string. */
-export function bootPitWall(root, search) {
+export function bootPitWall(root, search, options = {}) {
   const header = createHeaderBar(root);
   const store = createPitWallStore(resolveInitialBoot(search));
   bindHeaderToStore(header, root.getElementById("mode-toggle"), store);
@@ -238,7 +239,8 @@ export function bootPitWall(root, search) {
   const pipeline = pipelineSlot ? createSectorPipeline(root, pipelineSlot, store) : null;
   const telemetry = createTelemetryCenter(root, root.getElementById("telemetry-center"), store);
   const lapHistory = createLapHistory(root, root.getElementById("lap-history"), store);
-  return { header, store, switcher, pipeline, telemetry, lapHistory };
+  const livePoller = createLivePoller(root, header, store, options.live);
+  return { header, store, switcher, pipeline, telemetry, lapHistory, livePoller };
 }
 
 if (typeof document !== "undefined") {
