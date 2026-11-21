@@ -1,10 +1,13 @@
 """Synthetic bugs for checks with no recorded failures.
 
 Each mutant flips one operator on one line: a comparison, a boolean, or a logical join.
-Operators inside strings and comments are left alone, and binary operators must have
-whitespace on both sides, which keeps TypeScript generics (`Array<T>`) and arrows (`=>`)
-out. A mutant is a bug only if the baseline CI catches it; the dispatcher replays it
-against the baseline first and drops any the baseline misses.
+Only operators the file's language has are flipped. In shell, `<` and `>` are redirects
+(it compares numbers with -lt and -gt) and `and` is an ordinary word, so flipping them
+would break the script rather than plant a bug in it. Operators inside strings and
+comments are left alone, and binary operators must have whitespace on both sides, which
+keeps TypeScript generics (`Array<T>`) and arrows (`=>`) out. A mutant is a bug only if
+the baseline CI catches it; the dispatcher replays it against the baseline first and
+drops any the baseline misses.
 """
 
 import re
@@ -12,8 +15,17 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 _C_LIKE = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".kt", ".swift", ".c", ".cc", ".cpp"}
-_HASH = {".py", ".rb", ".sh"}
-_WORD_OPERATORS = {"and", "or"}  # operators only in Python, Ruby and shell
+_HASH = {".py", ".rb", ".sh"}  # languages whose comments start with #
+
+_ORDER = frozenset({"<=", ">=", "<", ">"})
+_C_OPERATORS = frozenset({"===", "!==", "==", "!=", *_ORDER, "&&", "||", "true", "false"})
+# The operators a mutant may flip, by file extension.
+_OPERATORS = {
+    **dict.fromkeys(_C_LIKE, _C_OPERATORS),
+    ".py": frozenset({"==", "!=", *_ORDER, "and", "or", "True", "False"}),
+    ".rb": frozenset({"==", "!=", *_ORDER, "&&", "||", "and", "or", "true", "false"}),
+    ".sh": frozenset({"==", "!=", "&&", "||", "true", "false"}),
+}
 
 # Longest first, so "===" is never read as "==".
 _BINARY = {
@@ -58,15 +70,14 @@ class StaleMutantError(ValueError):
 def mutants(path: str, source: str, limit: int = 50) -> list[Mutant]:
     """Return one-operator mutants of a source file, spread evenly across it, at most `limit`."""
     suffix = PurePosixPath(path).suffix
-    if limit < 1 or suffix not in _C_LIKE | _HASH:
+    allowed = _OPERATORS.get(suffix)
+    if limit < 1 or allowed is None:
         return []
-    hash_comments = suffix in _HASH
-    code = _mask(source, hash_comments=hash_comments)
+    code = _mask(source, hash_comments=suffix in _HASH)
     found = []
     for number, (line, masked) in enumerate(zip(source.split("\n"), code.split("\n"), strict=True), start=1):
-        operators = [m for m in _BINARY_RE.finditer(masked) if hash_comments or m.group(1) not in _WORD_OPERATORS]
-        operators += _WORD_RE.finditer(masked)
-        found += [_mutant(path, number, line, m.start(), m.group(1)) for m in operators]
+        operators = [*_BINARY_RE.finditer(masked), *_WORD_RE.finditer(masked)]
+        found += [_mutant(path, number, line, m.start(), m.group(1)) for m in operators if m.group(1) in allowed]
     if len(found) <= limit:
         return found
     step = len(found) / limit

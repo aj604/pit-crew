@@ -217,6 +217,18 @@ def test_and_or_are_words_outside_python() -> None:
     assert mutants("note.js", "const s = a and b;\n") == []
 
 
+def test_shell_redirects_and_words_are_not_mutated() -> None:
+    source = 'echo ok > out.txt\nsort < in.txt > sorted.txt\necho cats and dogs\n[[ "$a" == "$b" ]] && true\n'
+    ops = [(m.line, m.operator) for m in mutants("ci.sh", source)]
+    assert ops == [(4, "== -> !="), (4, "&& -> ||"), (4, "true -> false")]
+
+
+def test_booleans_flip_only_where_the_language_spells_them_that_way() -> None:
+    assert mutants("a.ts", "const t = True;\n") == []
+    assert mutants("a.py", "x = true\n") == []
+    assert [m.operator for m in mutants("a.rb", "x = true\n")] == ["true -> false"]
+
+
 def test_unterminated_strings_and_comments_are_masked_to_the_end() -> None:
     assert mutants("x.ts", "/* a == b") == []
     assert mutants("x.py", '"""a == b') == []

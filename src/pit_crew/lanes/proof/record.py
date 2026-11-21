@@ -4,11 +4,13 @@ A replay job wraps its check:
 
     python record.py --cast replay.cast --video replay.mp4 -- bun test
 
-The check runs in a pseudo-terminal, so it prints exactly what it prints in CI, colours
-included. Output still streams to the job log, and the wrapper exits with the check's own
-exit code, so recording never changes whether the job passes. The video is rendered with
-`agg` (cast to GIF) and `ffmpeg` (GIF to MP4); if either is missing the job keeps its
-result and the replay is left unverified.
+The check's output goes to a pseudo-terminal, so it prints exactly what it prints in CI,
+colours included. Its stdin stays the job's own: a terminal there would never send input
+or end of file, so a check that reads stdin would hang until the job timed out, and a
+tool that saw one might stop to prompt. Output still streams to the job log, and the
+wrapper exits with the check's own exit code, so recording never changes whether the job
+passes. The video is rendered with `agg` (cast to GIF) and `ffmpeg` (GIF to MP4); if
+either is missing the job keeps its result and the replay is left unverified.
 
 Standard library only, so a replay job can run this file without installing pit-crew.
 """
@@ -102,7 +104,7 @@ def _start(argv: list[str], slave: int, env: dict[str, str]) -> "subprocess.Pope
     try:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", HEIGHT, WIDTH, 0, 0))
         return subprocess.Popen(  # noqa: S603  running the check it is given is this tool's job
-            argv, stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True
+            argv, stdout=slave, stderr=slave, env=env, start_new_session=True
         )
     finally:
         os.close(slave)  # the check has its own copy; ours would hold the terminal open after it exits
