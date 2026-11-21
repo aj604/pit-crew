@@ -1,0 +1,25 @@
+[
+  {"sha": "a1a1a1a", "branch": "main", "created_at": "2026-11-01T09:00:00Z", "workflow": "CI", "job": "lint", "attempt": 1, "conclusion": "success"},
+  {"sha": "a1a1a1a", "branch": "main", "created_at": "2026-11-01T09:00:00Z", "workflow": "CI", "job": "Unit tests (1/2)", "attempt": 1, "conclusion": "success"},
+
+  {"sha": "b2b2b2b", "branch": "feat", "created_at": "2026-11-02T09:00:00Z", "workflow": "CI", "job": "lint", "attempt": 1, "conclusion": "success"},
+  {"sha": "b2b2b2b", "branch": "feat", "created_at": "2026-11-02T09:00:00Z", "workflow": "CI", "job": "Unit tests (1/2)", "attempt": 1, "conclusion": "failure"},
+  {"sha": "b2b2b2b", "branch": "feat", "created_at": "2026-11-02T09:00:00Z", "workflow": "CI", "job": "Unit tests (2/2)", "attempt": 1, "conclusion": "success"},
+
+  {"sha": "c3c3c3c", "branch": "feat", "created_at": "2026-11-02T11:00:00Z", "workflow": "CI", "job": "Unit tests (1/2)", "attempt": 1, "conclusion": "success"},
+
+  {"sha": "d4d4d4d", "branch": "main", "created_at": "2026-11-03T09:00:00Z", "workflow": "CI", "job": "lint", "attempt": 1, "conclusion": "failure"},
+  {"sha": "d4d4d4d", "branch": "main", "created_at": "2026-11-03T09:00:00Z", "workflow": "CI", "job": "lint", "attempt": 2, "conclusion": "failure"},
+
+  {"sha": "e5e5e5e", "branch": "main", "created_at": "2026-11-03T12:00:00Z", "workflow": "CI", "job": "lint", "attempt": 1, "conclusion": "success"},
+
+  {"sha": "f6f6f6f", "branch": "flaky", "created_at": "2026-11-04T09:00:00Z", "workflow": "CI", "job": "Unit tests (2/2)", "attempt": 1, "conclusion": "failure"},
+  {"sha": "f6f6f6f", "branch": "flaky", "created_at": "2026-11-04T09:00:00Z", "workflow": "CI", "job": "Unit tests (2/2)", "attempt": 2, "conclusion": "success"},
+
+  {"sha": "0707070", "branch": "cancelled", "created_at": "2026-11-05T09:00:00Z", "workflow": "CI", "job": "typecheck", "attempt": 1, "conclusion": "cancelled"},
+
+  {"sha": "1818181", "branch": "abandoned", "created_at": "2026-11-06T09:00:00Z", "workflow": "CI", "job": "Unit tests (2/2)", "attempt": 1, "conclusion": "failure"},
+  {"sha": "1818181", "branch": "abandoned", "created_at": "2026-11-06T09:00:00Z", "workflow": "CI", "job": "Unit tests (2/2)", "attempt": 2, "conclusion": "failure"},
+
+  {"sha": "2929292", "branch": "slow", "created_at": "2026-11-07T09:00:00Z", "workflow": "CI", "job": "build", "attempt": 1, "conclusion": "timed_out"}
+]

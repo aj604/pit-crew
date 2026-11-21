@@ -48,10 +48,19 @@ def test_candidate_for_unknown_hypothesis_is_refused():
         tools.call("report_candidate", InMemoryLedger(), {"hypothesis_id": "nope", "branch": "b", "summary": "s"})
 
 
+LANE_TOOLS = {
+    "analysis": {"record_hypothesis"},
+    "optimizer": {"report_candidate"},
+    "proof": {"propose_mutants", "plan_replays"},
+}
+
+
 @pytest.mark.parametrize("lane", ["analysis", "optimizer", "proof"])
 def test_request_carries_only_the_lanes_own_skill_and_tools(lane):
+    for other in LANE_TOOLS:
+        build_request(other, "")  # register every lane's tools, so a leak would show
     request = build_request(lane, "do the thing")
     targets = [source["target"] for source in request["environment"]["sources"]]
     assert targets == [".agents/AGENTS.md", f".agents/skills/{lane}/SKILL.md"]
-    assert len(request["tools"]) == 1
+    assert {t["name"] for t in request["tools"]} == LANE_TOOLS[lane]
     assert request["input"].startswith(f"Lane: {lane}")
