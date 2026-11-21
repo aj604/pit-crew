@@ -2,7 +2,7 @@
 
 import pytest
 
-from pit_crew.lanes.optimizer.validate import check_change
+from pit_crew.lanes.optimizer.validate import check_change, split_shell
 
 CI = ".github/workflows/ci.yml"
 
@@ -88,3 +88,62 @@ def test_rows_that_gain_a_shard_key_still_count() -> None:
     )
     after = MATRIX_HEAD + shard + MATRIX_STEPS.replace("- run: pytest", "- run: pytest --shard=${{ matrix.shard }}/2")
     assert _problems(after, before) == []
+
+
+# --- quieter feedback: lines that decide nothing are not checks ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'echo "No test files; nothing to do"',
+        'echo "PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache" >> $GITHUB_ENV',
+        "export CI=1",
+        'VERSION="$(pnpm ls --json | jq -r .version)"',
+        "cd packages/app",
+        "mkdir -p coverage",
+        "ls -la coverage",
+        "git clone https://github.com/hyperium/hyper.git",
+        "pnpm playwright install chromium",
+        "set -x",
+        'done > "$RUNNER_TEMP/changed"',
+    ],
+)
+def test_lines_that_decide_nothing_can_be_removed(line: str) -> None:
+    head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: pytest\n"
+    assert _problems(head, head + f"      - run: {line}\n") == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "git diff --exit-code",
+        "test -f dist/index.js",
+        "exit 1",
+        "pytest",
+        "pnpm runtime set node 22 -g",
+        "DISABLE_CEXT=1 uv pip install --no-binary sqlalchemy sqlalchemy",
+        'echo "found=true" >> "$GITHUB_OUTPUT"',
+        "set -o pipefail",
+        "set -e",
+    ],
+)
+def test_lines_that_decide_pass_or_fail_stay_checks(line: str) -> None:
+    head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: make\n"
+    assert _problems(head, head + f"      - run: {line}\n")
+
+
+def test_dropping_rust_toolchain_action_is_rejected() -> None:
+    head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n"
+    toolchain = "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.75.0\n"
+    after = head + "      - run: cargo test\n"
+    before = head + toolchain + "      - run: cargo test\n"
+    assert _problems(after, before)
+
+
+def test_semicolons_inside_quotes_do_not_split_commands() -> None:
+    assert split_shell('echo "a; b" && pytest -q; ruff check') == (
+        ['echo "a; b"', "pytest -q", "ruff check"],
+        ["&&", ";"],
+    )
+    assert split_shell("echo 'x || y'") == (["echo 'x || y'"], [])

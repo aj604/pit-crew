@@ -578,6 +578,59 @@ def test_validate_candidate_paths_also_inspects_files_dict_bypass() -> None:
     assert github.dispatches == []
 
 
+BASE_CI = "on: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pytest\n"
+
+
+def test_candidate_that_checks_less_than_the_real_base_is_rejected_before_publishing() -> None:
+    # The agent may claim any `original_files`; the dispatcher re-checks against GitHub's copy at the base.
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha-0"}, file_contents={("org/repo", "base-sha-0", ".github/workflows/ci.yml"): BASE_CI}
+    )
+    hyp = Hypothesis(repo="org/repo", description="speedup", skill="dep-cache", expected_savings_seconds=80.0)
+    weaker = Candidate(
+        hypothesis_id=hyp.id,
+        branch="pc/weaker",
+        summary="faster, by ignoring test failures",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": BASE_CI.replace("run: pytest", "run: pytest || true")},
+    )
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(weaker),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner)
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.reason.startswith("candidate checks less than its base: ")
+    assert "ignores the exit code" in verdict.reason
+    assert [call.lane for call in runner.calls] == ["analysis", "optimizer"]
+    assert github.dispatches == []
+
+
+def test_guard_candidate_passes_safe_changes_and_new_files() -> None:
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha-0"}, file_contents={("org/repo", "base-sha-0", ".github/workflows/ci.yml"): BASE_CI}
+    )
+    dispatcher = Dispatcher(InMemoryLedger(), github, lane_runner=_RecordingLaneRunner())
+    safe = Candidate(
+        hypothesis_id="h",
+        branch="pc/safe",
+        summary="shard",
+        repo="org/repo",
+        files={
+            ".github/workflows/ci.yml": BASE_CI.replace("run: pytest", "run: pytest -n auto"),
+            ".github/workflows/new.yml": "name: brand new\n",  # not at the base: nothing to compare
+        },
+    )
+    assert dispatcher.guard_candidate("org/repo", "base-sha-0", safe) == []
+
+
 def test_run_cycle_returns_none_when_optimizer_or_proof_produces_no_record() -> None:
     # Optimizer bails out without writing a Candidate.
     ledger = InMemoryLedger()
