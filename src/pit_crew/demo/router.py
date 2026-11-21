@@ -59,8 +59,13 @@ def create_demo_router(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @router.post("/api/demo/step")
-    def step_demo() -> dict[str, Any]:
+    async def step_demo() -> dict[str, Any]:
         """Advance playback by one event in step mode."""
+        if engine.mode == "auto":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Manual step is not allowed during automatic playback",
+            )
         event = engine.step()
         return {"status": "completed" if event is None else "ok", "event": event}
 

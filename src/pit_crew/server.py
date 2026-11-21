@@ -157,7 +157,7 @@ def create_app(
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
     tracker = run_tracker if run_tracker is not None else RunTracker()
-    engine = DemoEngine(ledger=ledger)
+    engine = DemoEngine()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret

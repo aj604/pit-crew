@@ -2,14 +2,16 @@
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from pit_crew import rater
+from pit_crew.contracts import Hypothesis
 from pit_crew.demo import SCENARIOS, DemoEngine, create_demo_router, get_scenario
-from pit_crew.ledger import InMemoryLedger
+from pit_crew.ledger import InMemoryLedger, Ledger, SqliteLedger
 from pit_crew.server import create_app
 
 
@@ -164,3 +166,47 @@ def test_sse_stream_endpoint_formats_events() -> None:
         assert payload["stage"] == "analysis"
 
     asyncio.run(_run())
+
+
+def test_step_demo_rejected_during_auto_mode() -> None:
+    app = create_app(ledger=InMemoryLedger())
+    client = TestClient(app)
+
+    started = client.post(
+        "/api/demo/start",
+        json={"scenario_id": "kept-dep-cache", "mode": "auto", "delay_seconds": 10.0},
+    )
+    assert started.status_code == 200
+
+    step_res = client.post("/api/demo/step")
+    assert step_res.status_code == 409
+
+    reset_res = client.post("/api/demo/reset")
+    assert reset_res.status_code == 200
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_demo_playback_does_not_corrupt_server_ledger(backend: str, tmp_path: Path) -> None:
+    ledger: Ledger = InMemoryLedger() if backend == "memory" else SqliteLedger(tmp_path / "ledger.db")
+    real_hyp = Hypothesis(
+        id="real-hyp-1",
+        repo="acme/widget",
+        description="Real optimization",
+        skill="dep-cache",
+        expected_savings_seconds=30.0,
+    )
+    ledger.add(real_hyp)
+
+    app = create_app(ledger=ledger)
+    client = TestClient(app)
+
+    started = client.post("/api/demo/start", json={"scenario_id": "kept-dep-cache", "mode": "step"})
+    assert started.status_code == 200
+    for _ in range(started.json()["total_events"]):
+        assert client.post("/api/demo/step").status_code == 200
+    assert client.post("/api/demo/reset").status_code == 200
+
+    # Real repository ledger must still contain only the original real hypothesis
+    assert [h.id for h in ledger.all(Hypothesis)] == ["real-hyp-1"]
+    assert client.get("/api/repos/acme/checkout-service/records").json()["hypotheses"] == []
+    assert len(client.get("/api/repos/acme/widget/records").json()["hypotheses"]) == 1
