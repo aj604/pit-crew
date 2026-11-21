@@ -3,11 +3,12 @@
 import asyncio
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, status
 
+from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
 from pit_crew.webhooks import create_github_webhook_router
 
@@ -54,6 +55,45 @@ async def _run_cycle_task(
         logger.exception("Cycle failed for %s", repo)
     finally:
         active_repos.discard(repo)
+
+
+def _current_base_sha(
+    latest_kept: Candidate | None,
+    candidates: list[Candidate],
+    hypotheses: list[Hypothesis],
+) -> str | None:
+    """Resolve the current base SHA for a repository from its ledger records."""
+    if latest_kept is not None:
+        return latest_kept.head_sha or latest_kept.base_sha or None
+    for cand in reversed(candidates):
+        if cand.base_sha:
+            return cand.base_sha
+    for hyp in reversed(hypotheses):
+        if hyp.base_sha:
+            return hyp.base_sha
+    return None
+
+
+def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str, Any]:
+    """Build the Pit Wall status payload for ``repo``."""
+    hypotheses = ledger.hypotheses_for_repo(repo)
+    hypothesis_ids = {h.id for h in hypotheses}
+    repo_candidates = [c for c in ledger.all(Candidate) if c.hypothesis_id in hypothesis_ids or c.repo == repo]
+    candidate_ids = {c.id for c in repo_candidates}
+
+    latest_verdict: Verdict | None = None
+    for verdict in ledger.all(Verdict):
+        if verdict.candidate_id in candidate_ids:
+            latest_verdict = verdict
+
+    base_sha = _current_base_sha(ledger.latest_kept_candidate(repo), repo_candidates, hypotheses)
+    return {
+        "repo": repo,
+        "active": repo in active_repos,
+        "base_sha": base_sha,
+        "latest_verdict": asdict(latest_verdict) if latest_verdict is not None else None,
+        "sla_met": latest_verdict.sla_met if latest_verdict is not None else False,
+    }
 
 
 def create_app(
@@ -115,5 +155,10 @@ def create_app(
     def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
         """Return structured ledger records for a repository."""
         return ledger.records_for_repo(f"{owner}/{name}")
+
+    @app.get("/api/repos/{owner}/{name}/status")
+    def repo_status(owner: str, name: str) -> dict[str, Any]:
+        """Return current cycle state, base SHA, latest verdict, and SLA status."""
+        return _repo_status(ledger, f"{owner}/{name}", active_repos)
 
     return app

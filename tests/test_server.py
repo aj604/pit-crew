@@ -351,3 +351,180 @@ def test_repo_records_scoped_to_repo(backend: str, tmp_path: Path) -> None:
     assert body["evidence"][0]["bugs_caught"] == 1
     assert [v["id"] for v in body["verdicts"]] == ["v1"]
     assert body["verdicts"][0]["keep"] is True
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_repo_status_idle_empty(backend: str, tmp_path: Path) -> None:
+    ledger = _make_ledger(backend, tmp_path)
+    app = create_app(ledger=ledger)
+    with TestClient(app) as client:
+        response = client.get("/api/repos/acme/widget/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "repo": "acme/widget",
+        "active": False,
+        "base_sha": None,
+        "latest_verdict": None,
+        "sla_met": False,
+    }
+
+
+def test_repo_status_reflects_active_and_idle_cycle() -> None:
+    dispatcher = _StubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        idle_before = client.get("/api/repos/acme/widget/status")
+        assert idle_before.status_code == 200
+        assert idle_before.json()["active"] is False
+
+        trigger = client.post("/triggers/cycle", json={"repo": "acme/widget"})
+        assert trigger.status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+
+        active = client.get("/api/repos/acme/widget/status")
+        assert active.status_code == 200
+        assert active.json()["active"] is True
+
+        other = client.get("/api/repos/other/repo/status")
+        assert other.status_code == 200
+        assert other.json()["active"] is False
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        while "acme/widget" in app.state.active_repos:
+            client.get("/health")
+
+        idle_after = client.get("/api/repos/acme/widget/status")
+        assert idle_after.status_code == 200
+        assert idle_after.json()["active"] is False
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_repo_status_post_verdict_and_base_sha_progression(backend: str, tmp_path: Path) -> None:
+    ledger = _make_ledger(backend, tmp_path)
+    app = create_app(ledger=ledger)
+
+    # 1. Hypothesis only: base_sha falls back to hypothesis.base_sha, no verdict yet.
+    hyp1 = Hypothesis(
+        id="h1",
+        repo="acme/widget",
+        description="Cache pip dependencies",
+        skill="dep-cache",
+        expected_savings_seconds=30.0,
+        base_sha="sha-base-1",
+    )
+    ledger.add(hyp1)
+    with TestClient(app) as client:
+        resp_hyp = client.get("/api/repos/acme/widget/status")
+    assert resp_hyp.status_code == 200
+    assert resp_hyp.json()["base_sha"] == "sha-base-1"
+    assert resp_hyp.json()["latest_verdict"] is None
+    assert resp_hyp.json()["sla_met"] is False
+
+    # 2. Rejected candidate: base_sha stays at candidate.base_sha, latest_verdict populated, sla_met=False.
+    cand1 = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/dep-cache",
+        base_sha="sha-base-1",
+        head_sha="sha-rejected",
+        summary="Tried cache",
+    )
+    verdict1 = Verdict(
+        id="v1",
+        candidate_id="c1",
+        keep=False,
+        speedup=1.02,
+        p_value=0.3,
+        median_seconds=95.0,
+        p95_seconds=140.0,
+        sla_met=False,
+        reason="speedup is within noise",
+    )
+    ledger.add(cand1)
+    ledger.add(verdict1)
+    with TestClient(app) as client:
+        resp_rejected = client.get("/api/repos/acme/widget/status")
+    assert resp_rejected.status_code == 200
+    body_rejected = resp_rejected.json()
+    assert body_rejected["base_sha"] == "sha-base-1"
+    assert body_rejected["sla_met"] is False
+    assert body_rejected["latest_verdict"]["id"] == "v1"
+    assert body_rejected["latest_verdict"]["keep"] is False
+
+    # 3. Kept candidate meeting 60s/120s SLA: base_sha advances to head_sha, sla_met=True.
+    #    Also add an unrelated repo's verdict to verify isolation.
+    hyp2 = Hypothesis(
+        id="h2",
+        repo="acme/widget",
+        description="Shard slow test suite",
+        skill="shard-by-timing",
+        expected_savings_seconds=50.0,
+        base_sha="sha-base-1",
+    )
+    cand2 = Candidate(
+        id="c2",
+        hypothesis_id="h2",
+        repo="acme/widget",
+        branch="pit-crew/shard",
+        base_sha="sha-base-1",
+        head_sha="sha-kept-2",
+        summary="Sharded tests",
+    )
+    verdict2 = Verdict(
+        id="v2",
+        candidate_id="c2",
+        keep=True,
+        speedup=2.1,
+        p_value=0.004,
+        median_seconds=45.0,
+        p95_seconds=80.0,
+        sla_met=True,
+        reason="2.10x faster, caught 3/3 bugs (SLA met)",
+    )
+    other_cand = Candidate(
+        id="c-other",
+        hypothesis_id="h-other",
+        repo="other/repo",
+        branch="pit-crew/other",
+        base_sha="other-base",
+        head_sha="other-head",
+        summary="Other repo",
+    )
+    other_verdict = Verdict(
+        id="v-other",
+        candidate_id="c-other",
+        keep=False,
+        speedup=1.0,
+        p_value=0.5,
+        median_seconds=200.0,
+        p95_seconds=300.0,
+        sla_met=False,
+        reason="noise",
+    )
+    for rec in (hyp2, cand2, verdict2, other_cand, other_verdict):
+        ledger.add(rec)
+
+    with TestClient(app) as client:
+        resp_kept = client.get("/api/repos/acme/widget/status")
+    assert resp_kept.status_code == 200
+    assert resp_kept.json() == {
+        "repo": "acme/widget",
+        "active": False,
+        "base_sha": "sha-kept-2",
+        "latest_verdict": {
+            "id": "v2",
+            "candidate_id": "c2",
+            "keep": True,
+            "speedup": 2.1,
+            "p_value": 0.004,
+            "reason": "2.10x faster, caught 3/3 bugs (SLA met)",
+            "median_seconds": 45.0,
+            "p95_seconds": 80.0,
+            "sla_met": True,
+        },
+        "sla_met": True,
+    }
