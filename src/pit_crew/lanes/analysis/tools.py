@@ -176,24 +176,21 @@ _HEAD_SHA_EVENT_ORDER = ("push", "merge_group", "workflow_dispatch", "schedule")
 _HEAD_SHA_EVENTS = frozenset(_HEAD_SHA_EVENT_ORDER)
 
 
-def _newest_first(run: dict[str, Any]) -> tuple[str, int]:
-    raw_id = run.get("id")
-    return str(run.get("run_started_at") or run.get("created_at") or ""), raw_id if isinstance(raw_id, int) else 0
-
-
 def _fetch_trusted_history(repo: str, workflow: str, runs: int, branch: str | None) -> list[dict[str, Any]]:
     """The newest `runs` runs among the trusted events, newest first.
 
-    One request per event (at most four), each asking only for what is still missing, so pull-request runs
-    never use up the window and no jobs are fetched for runs that would be dropped. Runs are de-duplicated by id.
+    Lists up to `runs` metadata entries per trusted event, merges and de-duplicates them by id, sorts by recency,
+    and fetches jobs only for the global top `runs`, so pull-request runs never use up the window and older
+    runs of an earlier event never displace newer runs of another trusted event.
     """
-    collected: dict[object, dict[str, Any]] = {}
-    for event in _HEAD_SHA_EVENT_ORDER:
-        if len(collected) >= runs:
-            break
-        for run in history.fetch_history(repo, workflow, runs=runs - len(collected), branch=branch, event=event):
-            collected.setdefault(run.get("id"), run)
-    return sorted(collected.values(), key=_newest_first, reverse=True)[: max(runs, 0)]
+    if runs <= 0:
+        return []
+    fetched = history.fetch_history(repo, workflow, runs=runs, branch=branch, events=_HEAD_SHA_EVENT_ORDER)
+    deduped: dict[object, dict[str, Any]] = {}
+    for idx, run in enumerate(fetched):
+        key: object = ("id", run["id"]) if run.get("id") is not None else ("pos", idx)
+        deduped.setdefault(key, run)
+    return sorted(deduped.values(), key=history.newest_first_key, reverse=True)[:runs]
 
 
 def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters

@@ -237,12 +237,16 @@ def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
         ("Run tests", "gh run download && ./publish.sh"),
         ("Run tests", "gh release upload v1 dist/*"),
         ("Upload test report", "npx junit-upload report.xml"),
+        ("Upload test report", "./scripts/upload-test-results.sh"),
+        ("Upload test report", "./scripts/publish-test-report.sh"),
+        ("Upload test report", "./scripts/ci_publish.sh"),
         ("Upload test report", "codecov --file coverage.xml"),
         ("Upload test report", "./codecov --file coverage.xml"),
         ("Run tests", "./upload-results.sh"),
         ("Upload test report", "xargs coveralls"),
         ("Lint tests", '"ruff" check tests/'),
         ("Typecheck tests", "'mypy' tests/"),
+        ("Typecheck tests", "uv run --group dev mypy tests/"),
     ],
 )
 def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str) -> None:
@@ -250,10 +254,20 @@ def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str)
     assert detect_shard_by_timing(prof, wf, PATH) == []
 
 
-@pytest.mark.parametrize("command", ["python tests/test_upload.py", "./scripts/test-publish.sh", "pytest tests/upload"])
-def test_shard_keeps_tests_whose_path_merely_mentions_upload_or_publish(command: str) -> None:
-    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
-    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        ("Run tests", "python tests/test_upload.py"),
+        ("Run tests", "./scripts/test-publish.sh"),
+        ("Run tests", "pytest tests/upload"),
+        ("Run upload tests", "./scripts/run-upload-tests.sh"),
+        ("Run publish tests", "./scripts/run-publish-tests.sh"),
+        ("Run tests", "python tests/upload_test.py"),
+    ],
+)
+def test_shard_keeps_tests_whose_path_merely_mentions_upload_or_publish(name: str, command: str) -> None:
+    prof, wf = build([(name, 240.0)], runs={name: f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == [name]
 
 
 @pytest.mark.parametrize(
@@ -264,12 +278,13 @@ def test_shard_keeps_tests_whose_path_merely_mentions_upload_or_publish(command:
         "npx jest --shard=2/3",
         "pytest --splits 4 --group 1",
         "pytest --splits=4 --group=1",
+        "uv run --group tests pytest --splits 4 --group 1",
         "pytest --num-shards 4 --shard-id 0",
         "pytest --num-shards=4",
         "./run-tests --partition 1/3",
         "pytest -n auto --splits 3 --group 2",
         "pytest tests/ --shard-id=2",
-        'pytest "--group" 1',
+        'pytest "--splits" 4 "--group" 1',
         "pytest -k $CI_NODE_INDEX",
         "pytest --total $CI_NODE_TOTAL",
         'pytest --part "${SHARD_INDEX}"',
@@ -281,8 +296,20 @@ def test_shard_skips_steps_whose_command_already_shards(command: str) -> None:
     assert detect_shard_by_timing(prof, wf, PATH) == []
 
 
-@pytest.mark.parametrize("command", ["pytest -n auto", "pytest -n 4 tests/", "pytest --numprocesses=4"])
-def test_shard_still_flags_xdist_parallelism_alone(command: str) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest -n auto",
+        "pytest -n 4 tests/",
+        "pytest --numprocesses=4",
+        "uv run --group tests pytest",
+        "uv run --group=tests pytest",
+        "uv sync --group tests && pytest",
+        "phpunit --group integration",
+        "setup-disk --partition 1 && pytest",
+    ],
+)
+def test_shard_still_flags_non_sharding_flags_and_wrapper_groups(command: str) -> None:
     prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
     assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
 
