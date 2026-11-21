@@ -229,6 +229,8 @@ def test_only_runs_that_execute_the_workflow_at_head_sha_are_profiled(monkeypatc
     assert ci["runs_excluded_revision"] == 0
     assert found["profile_summary"]["runs_excluded_event"] == 2
     assert set(asked) == {MATCH_NEW, MATCH_OLD}  # no blob fetch for the pull-request runs
+    assert found["profile_summary"]["base_sha"] == MATCH_OLD  # newest trusted run (day 3), not the newer PR run
+    assert found["uncovered"] == []  # a mix of trusted and pull-request runs is analysed normally
 
 
 @pytest.mark.usefixtures("checkout")
@@ -270,3 +272,39 @@ def test_events_that_execute_the_workflow_at_head_sha_are_trusted(monkeypatch: p
 
     assert result["runs_analyzed"] == 1
     assert result["runs_excluded_event"] == 0
+
+
+@pytest.mark.usefixtures("checkout")
+def test_empty_history_says_neither_the_event_nor_the_revision_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_history(monkeypatch, [], {})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["base_sha"] == ""
+    assert result["profile_summary"]["runs_excluded_event"] == 0
+    assert result["profile_summary"]["runs_excluded_revision"] == 0
+    assert result["uncovered"] == ["No runs analyzed (all excluded or none fetched); nothing was measured."]
+
+
+@pytest.mark.usefixtures("checkout")
+def test_event_exclusion_alongside_a_revision_mismatch_gives_only_the_revision_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every trusted run is of another revision, and the rest are pull-request runs: the trusted runs
+    # are what matter, so the note is the revision one, not a contradictory "only pull-request runs".
+    other = history.workflow_blob_sha(OTHER)
+    raw = [
+        make_run(1, OTHER_NEWEST, 1, 200),
+        with_event(make_run(2, MATCH_NEW, 2, 100), "pull_request"),
+    ]
+    patch_history(monkeypatch, raw, {OTHER_NEWEST: other})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["runs_excluded_event"] == 1
+    assert result["profile_summary"]["runs_excluded_revision"] == 1
+    assert len(result["uncovered"]) == 1
+    assert "exact workflow file" in result["uncovered"][0]
+    assert "pull-request" not in result["uncovered"][0]
