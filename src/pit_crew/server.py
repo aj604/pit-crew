@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, status
 
@@ -102,5 +102,10 @@ def create_app(
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
         return {"status": "started", "repo": payload.repo}
+
+    @app.get("/api/repos/{owner}/{name}/attempts")
+    def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
+        """Return prior optimization attempts for a repository."""
+        return ledger.prior_attempts(f"{owner}/{name}")
 
     return app
