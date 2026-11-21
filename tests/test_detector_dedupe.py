@@ -58,12 +58,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: First name
-        run: pytest   -q
+        run: |
+          pytest -q
+          coverage report
   test-b:
     runs-on: ubuntu-latest
     steps:
       - name: Other name
-        run: pytest -q
+        run: |
+                pytest -q
+                coverage report
 """
     p, wf = profiled(text, {"test-a": 100, "test-b": 200})
     findings = detect_dedupe_jobs(p, wf, PATH)
@@ -238,4 +242,12 @@ def test_dedupe_drops_savings_under_ten_seconds() -> None:
 
 def test_dedupe_drops_zero_savings() -> None:
     p, wf = profiled(TWINS, {"test-a": 30.0, "test-b": 30.0})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_scripts_that_differ_in_internal_whitespace() -> None:
+    p, wf = profiled(
+        _pair(step_a="- run: grep -F 'a  b' f", step_b="- run: grep -F 'a b' f"),
+        {"a": 100, "b": 200},
+    )
     assert detect_dedupe_jobs(p, wf, PATH) == []

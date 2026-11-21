@@ -10,9 +10,14 @@ StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
 Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...], str]
 
 
+def _script(run: str | None) -> str:
+    """The script with each line's leading and trailing whitespace stripped: YAML indentation is not shell meaning."""
+    return "\n".join(line.strip() for line in (run or "").strip().splitlines())
+
+
 def _signature(job: JobSpec) -> Signature:
     """What a job does and where: runner, matrix values, and each step's command and inputs. Step names are ignored."""
-    steps = tuple((s.uses or "", " ".join((s.run or "").split()), tuple(sorted(s.with_.items()))) for s in job.steps)
+    steps = tuple((s.uses or "", _script(s.run), tuple(sorted(s.with_.items()))) for s in job.steps)
     matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
     return (job.runs_on, job.matrix_keys, matrix, steps, job.matrix_definition)
 
