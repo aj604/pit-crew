@@ -1234,10 +1234,14 @@ class Dispatcher:
 
             resolved_base_sha = self.resolve_base_sha(repo, base_sha)
             logger.info("Starting cycle for %s at base_sha=%s", repo, resolved_base_sha[:12])
-            self._report_progress("analysis", 0, 0)
-            self._run_analysis(repo, resolved_base_sha)
-
             hypothesis = self.select_next_hypothesis(repo)
+            if hypothesis is None or hypothesis.base_sha != resolved_base_sha:
+                self._report_progress("analysis", 0, 0)
+                self._run_analysis(repo, resolved_base_sha)
+                hypothesis = self.select_next_hypothesis(repo)
+            else:
+                logger.info("Reusing hypotheses analyzed at base_sha=%s; skipping analysis", resolved_base_sha[:12])
+
             if hypothesis is None:
                 logger.info("No unattempted hypotheses remain for %s", repo)
                 return None
