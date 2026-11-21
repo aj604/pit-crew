@@ -91,6 +91,11 @@ def main(args: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a CI check and record it as a terminal video.")
     parser.add_argument("--cast", required=True, help="asciicast v2 recording to write")
     parser.add_argument("--video", help="MP4 to render from the recording (needs agg and ffmpeg)")
+    parser.add_argument(
+        "--video-on-failure",
+        action="store_true",
+        help="only render --video when the check exits non-zero",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="the check, after --")
     parsed = parser.parse_args(args)
     command: list[str] = parsed.command[1:] if parsed.command[:1] == ["--"] else parsed.command
@@ -98,7 +103,7 @@ def main(args: list[str] | None = None) -> int:
         parser.error("give the check to run after --")
 
     code = record(command, parsed.cast)
-    if parsed.video:
+    if parsed.video and (code != 0 or not parsed.video_on_failure):
         try:
             render_video(parsed.cast, parsed.video)
         except (OSError, subprocess.CalledProcessError) as error:

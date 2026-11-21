@@ -1025,3 +1025,64 @@ def test_httpx_get_file_content_decodes_base64_plain_and_handles_missing_and_err
                 client.get_file_content("org/repo", bad_path, "abc123")
 
     assert seen[0] == (b"/repos/org/repo/contents/.github/workflows/ci.yml?ref=abc123", {"ref": "abc123"})
+
+
+def test_httpx_get_run_failure_output_downloads_replay_artifact_and_strips_auth_on_redirect() -> None:
+    blob_requests: list[httpx.Request] = []
+    routes: dict[str, httpx.Response] = {
+        "/repos/org/repo/actions/runs/501/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 10, "name": "coverage-report", "expired": False},
+                    {"id": 11, "name": "pit-crew-replay-test-0", "expired": True},
+                    {"id": 12, "name": "failure-recordings-e2e-0", "expired": False},
+                    {"id": 13, "name": "pit-crew-replay-test-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/13/zip": httpx.Response(
+            302,
+            headers={"Location": "https://blobs.example.test/download/13.zip"},
+        ),
+        "/repos/org/repo/actions/runs/502/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 22, "name": "failure-recordings-e2e-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/22/zip": httpx.Response(200, content=b"direct-zip-bytes"),
+        "/repos/org/repo/actions/runs/503/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 30, "name": "other", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/runs/504/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 40, "name": "pit-crew-replay-test-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/40/zip": httpx.Response(302),
+        "/repos/org/repo/actions/runs/505/artifacts": httpx.Response(200, json={"artifacts": "not-a-list"}),
+        "/repos/org/repo/actions/runs/506/artifacts": httpx.Response(
+            200,
+            json={"artifacts": ["bad", {"id": True, "name": "pit-crew-replay-x", "expired": False}]},
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "blobs.example.test":
+            blob_requests.append(request)
+            assert "authorization" not in {k.lower() for k in request.headers}
+            return httpx.Response(200, content=b"PK\x03\x04zip-payload")
+        _assert_github_headers(request)
+        return routes.get(request.url.path, httpx.Response(404))
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        assert client.get_run_failure_output("org/repo", "501") == b"PK\x03\x04zip-payload"
+        assert len(blob_requests) == 1
+        assert client.get_run_failure_output("org/repo", "502") == b"direct-zip-bytes"
+
+        for missing_run in ("503", "505", "506"):
+            with pytest.raises(FileNotFoundError, match="No replay recording artifact"):
+                client.get_run_failure_output("org/repo", missing_run)
+        with pytest.raises(ValueError, match="missing Location header"):
+            client.get_run_failure_output("org/repo", "504")
+        with pytest.raises(ValueError, match="run_id must not be empty"):
+            client.get_run_failure_output("org/repo", "   ")

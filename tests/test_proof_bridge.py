@@ -1,4 +1,6 @@
+import io
 import json
+import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -13,6 +15,7 @@ from pit_crew.lanes.proof.verify import Replay
 from pit_crew.ledger import InMemoryLedger, Ledger
 from pit_crew.proof_bridge import (
     PROOF_CARD_PATH,
+    MultimodalReplayVerifier,
     ProofBridge,
     ProofBridgeError,
     ProofPRConfig,
@@ -691,3 +694,78 @@ def test_open_kept_pr_errors_on_missing_repo_or_pr_client() -> None:
             replays,
             config=ProofPRConfig(auto_open_pr=True),
         )
+
+
+def _zip_bytes(files: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_multimodal_replay_verifier_extracts_mp4_from_artifact_zip_and_fails_closed_without_mp4() -> None:
+    repo = "acme/demo"
+    base_zip = _zip_bytes({"step-2.cast": b'{"version":2}\n', "step-2.mp4": b"base-mp4-video"})
+    cand_zip = _zip_bytes({"step-2.cast": b'{"version":2}\n', "step-2.mp4": b"cand-mp4-video"})
+    cast_only_zip = _zip_bytes({"step-2.cast": b'{"version":2}\n'})
+
+    github = FakeProofGitHub(
+        run_outputs={
+            (repo, "101"): base_zip,
+            (repo, "102"): cand_zip,
+            (repo, "103"): cast_only_zip,
+        }
+    )
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError: expected 3, got 2",
+                "candidate_failure": "AssertionError: expected 3, got 2",
+                "reason": "Identical assertion failure.",
+            }
+        )
+    )
+    verifier = MultimodalReplayVerifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+
+    matched = verifier.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="101",
+                candidate_run_id="102",
+            )
+        ],
+    )
+    assert matched.bugs_total == 1
+    assert matched.bugs_caught == 1
+    assert matched.replays[0].status == "caught"
+    # Verify extracted MP4 bytes (not raw ZIP bytes) were passed to Gemini.
+    contents = fake_client.models.calls[0]["contents"]
+    assert isinstance(contents, list)
+    media_bytes = [part.inline_data.data for part in contents if getattr(part, "inline_data", None) is not None]
+    assert media_bytes == [b"base-mp4-video", b"cand-mp4-video"]
+
+    # Missing MP4 inside ZIP (e.g. agg/ffmpeg unavailable) fails closed as unverified.
+    unverified = verifier.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="101",
+                candidate_run_id="103",
+            )
+        ],
+    )
+    assert unverified.bugs_total == 1
+    assert unverified.bugs_caught == 0
+    assert unverified.replays[0].status == "unverified"
+    assert "ReplayArtifactError" in str(unverified.bug_outcomes[0]["seen"])

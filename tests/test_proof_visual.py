@@ -218,6 +218,21 @@ def test_record_cli_renders_the_video_after_the_check(monkeypatch: pytest.Monkey
     assert [command[0] for command in ran] == ["agg", "ffmpeg"]
 
 
+def test_record_cli_video_on_failure_skips_passing_steps_and_renders_failing_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ran: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", lambda command, **_: ran.append(command))
+
+    monkeypatch.setattr(record, "record", lambda *_: 0)
+    assert record.main(["--cast", "r.cast", "--video", "r.mp4", "--video-on-failure", "--", "true"]) == 0
+    assert ran == []
+
+    monkeypatch.setattr(record, "record", lambda *_: 2)
+    assert record.main(["--cast", "r.cast", "--video", "r.mp4", "--video-on-failure", "--", "false"]) == 2
+    assert [command[0] for command in ran] == ["agg", "ffmpeg"]
+
+
 def test_a_missing_video_tool_keeps_the_result_and_says_why(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

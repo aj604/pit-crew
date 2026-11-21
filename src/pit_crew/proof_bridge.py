@@ -9,16 +9,48 @@ them into the Proof lane task prompt.
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pit_crew.contracts import Candidate, Evidence, Verdict
 from pit_crew.github import PullRequestClient
 from pit_crew.lanes.proof.card import pr_body, render_card
 from pit_crew.lanes.proof.checks import Check, FileChange, touched_checks
 from pit_crew.lanes.proof.miner import JobRun, RedCommit, flaky_checks, red_commits
+from pit_crew.lanes.proof.replay_workflow import (
+    RECORD_SCRIPT_PATH,
+    REPLAY_ARTIFACT_PREFIX,
+    REPLAY_RECORD_ENV,
+    ReplayArtifactError,
+    build_replay_overlay,
+    extract_replay_video,
+    instrument_workflow,
+)
 from pit_crew.lanes.proof.tools import MAX_REPLAYS, pick_replays, uncovered_checks
 from pit_crew.lanes.proof.verify import AskModel, Replay, compare_failures, tally, verify_replays
 from pit_crew.ledger import Ledger
+
+__all__ = [
+    "PROOF_CARD_PATH",
+    "RECORD_SCRIPT_PATH",
+    "REPLAY_ARTIFACT_PREFIX",
+    "REPLAY_RECORD_ENV",
+    "LaneRunner",
+    "MultimodalReplayVerifier",
+    "OpenedPullRequest",
+    "ProofBridge",
+    "ProofBridgeError",
+    "ProofContext",
+    "ProofHistoryClient",
+    "ProofPRConfig",
+    "ReplayArtifactError",
+    "ReplayFailureOutputClient",
+    "ReplayRunPair",
+    "ReplayVerification",
+    "build_replay_overlay",
+    "extract_replay_video",
+    "instrument_workflow",
+    "verify_replay_run_pairs",
+]
 
 PROOF_CARD_PATH = ".github/pit-crew/proof-card.svg"
 
@@ -47,7 +79,16 @@ class ProofBridgeError(ValueError):
         return cls("ProofBridge.open_kept_pr() requires a PullRequestClient (github or pr_client)")
 
 
-class ProofHistoryClient(Protocol):
+@runtime_checkable
+class ReplayFailureOutputClient(Protocol):
+    """Loads recorded replay failure output bytes for a GitHub Actions workflow run."""
+
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        """Return failed job logs or recorded artifact bytes for workflow run ``run_id`` in ``repo``."""
+        ...
+
+
+class ProofHistoryClient(ReplayFailureOutputClient, Protocol):
     """Reads base files and recent workflow job runs for Proof pre-pass mining."""
 
     def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
@@ -56,10 +97,6 @@ class ProofHistoryClient(Protocol):
 
     def list_workflow_job_runs(self, repo: str) -> Sequence[JobRun]:
         """Return recent GitHub Actions job run attempts for ``repo``."""
-        ...
-
-    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
-        """Return failed job logs or recorded artifact bytes for workflow run ``run_id`` in ``repo``."""
         ...
 
 
@@ -145,6 +182,66 @@ class ProofContext:
     flaky_checks: tuple[tuple[str, str], ...]
     required_replays: tuple[str, ...]
     uncovered_checks: frozenset[Check]
+
+
+def verify_replay_run_pairs(
+    github: ReplayFailureOutputClient,
+    repo: str,
+    runs: Iterable[ReplayRunPair],
+    *,
+    ask: AskModel,
+) -> ReplayVerification:
+    """Verify replay pairs via ``verify_replays``, ``tally``, and ``Replay.as_outcome``.
+
+    Downloads each failing run's recorded failure output (raw MP4 bytes or a GitHub Actions
+    artifact ZIP from ``record.py``), extracts the MP4 safely, and delegates multimodal
+    equivalence checking to ``compare_failures(..., ask=ask)``. Any mismatch, missing video,
+    corrupt archive, or model error fails closed and does not increment ``bugs_caught``.
+    """
+    raw_replays = [
+        Replay(
+            sha=pair.sha,
+            check=pair.check,
+            baseline_failed=pair.baseline_conclusion == "failure",
+            candidate_failed=pair.candidate_conclusion == "failure",
+            baseline_video=pair.baseline_run_id,
+            candidate_video=pair.candidate_run_id,
+        )
+        for pair in runs
+    ]
+    verified = tuple(
+        verify_replays(
+            raw_replays,
+            load=lambda run_id: extract_replay_video(github.get_run_failure_output(repo, run_id)),
+            compare=partial(compare_failures, ask=ask),
+        )
+    )
+    bugs_total, bugs_caught = tally(verified)
+    return ReplayVerification(
+        replays=verified,
+        bugs_total=bugs_total,
+        bugs_caught=bugs_caught,
+        bug_outcomes=tuple(replay.as_outcome() for replay in verified),
+    )
+
+
+class MultimodalReplayVerifier:
+    """Standalone replay verifier wiring ``ReplayFailureOutputClient`` and multimodal ``ask``."""
+
+    def __init__(self, github: ReplayFailureOutputClient, ask: AskModel) -> None:
+        """Create a verifier backed by ``github`` artifact loading and ``ask`` multimodal calls."""
+        self._github = github
+        self._ask = ask
+
+    def verify_replay_runs(
+        self,
+        repo: str,
+        runs: Iterable[ReplayRunPair],
+        *,
+        ask: AskModel | None = None,
+    ) -> ReplayVerification:
+        """Verify replay pairs and return ``ReplayVerification`` ready for ``Evidence``."""
+        return verify_replay_run_pairs(self._github, repo, runs, ask=ask if ask is not None else self._ask)
 
 
 class ProofBridge:
@@ -278,32 +375,7 @@ class ProofBridge:
         verifier = ask if ask is not None else self._ask
         if verifier is None:
             raise ProofBridgeError.missing_verifier()
-
-        raw_replays = [
-            Replay(
-                sha=pair.sha,
-                check=pair.check,
-                baseline_failed=pair.baseline_conclusion == "failure",
-                candidate_failed=pair.candidate_conclusion == "failure",
-                baseline_video=pair.baseline_run_id,
-                candidate_video=pair.candidate_run_id,
-            )
-            for pair in runs
-        ]
-        verified = tuple(
-            verify_replays(
-                raw_replays,
-                load=lambda run_id: self._github.get_run_failure_output(repo, run_id),
-                compare=partial(compare_failures, ask=verifier),
-            )
-        )
-        bugs_total, bugs_caught = tally(verified)
-        return ReplayVerification(
-            replays=verified,
-            bugs_total=bugs_total,
-            bugs_caught=bugs_caught,
-            bug_outcomes=tuple(replay.as_outcome() for replay in verified),
-        )
+        return verify_replay_run_pairs(self._github, repo, runs, ask=verifier)
 
     def open_kept_pr(
         self,

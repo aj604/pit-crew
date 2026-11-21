@@ -29,6 +29,9 @@ USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
 _HTTP_NOT_FOUND = 404
+_HTTP_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_REPLAY_ARTIFACT_PREFIX = "pit-crew-replay-"
+_FALLBACK_RECORDING_PREFIX = "failure-recordings-"
 
 
 def _utc_now() -> datetime:
@@ -400,6 +403,45 @@ class HttpxGitHubClient:
         )
         return _require_str(pr_data, "html_url")
 
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        """Download the replay recording artifact ZIP for workflow run ``run_id`` in ``repo``.
+
+        Selects the newest non-expired ``pit-crew-replay-*`` artifact (falling back to
+        ``failure-recordings-*``) and strips the ``Authorization`` header when following
+        GitHub's 302 redirect to external blob storage. Raises ``FileNotFoundError`` when
+        no non-expired recording artifact exists so replay verification fails closed.
+        """
+        repo_path = _repo_path(repo)
+        normalized_run_id = quote(run_id.strip(), safe="")
+        if not normalized_run_id:
+            msg = "Workflow run_id must not be empty."
+            raise ValueError(msg)
+        artifacts_data = self._request_json("GET", f"/repos/{repo_path}/actions/runs/{normalized_run_id}/artifacts")
+        artifact_id = _select_replay_artifact_id(artifacts_data)
+        if artifact_id is None:
+            msg = f"No replay recording artifact found for {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+        return self._download_artifact_zip(repo_path, artifact_id)
+
+    def _download_artifact_zip(self, repo_path: str, artifact_id: int) -> bytes:
+        response = self._client.request(
+            "GET",
+            f"{self._base_url}/repos/{repo_path}/actions/artifacts/{artifact_id}/zip",
+            headers=self._headers,
+            follow_redirects=False,
+        )
+        if response.status_code in _HTTP_REDIRECT_CODES:
+            location = response.headers.get("location") or response.headers.get("Location")
+            if not location:
+                msg = f"GitHub artifact {artifact_id} redirect is missing Location header."
+                raise ValueError(msg)
+            blob_headers = {k: v for k, v in self._headers.items() if k.lower() != "authorization"}
+            blob_response = self._client.request("GET", location, headers=blob_headers, follow_redirects=True)
+            blob_response.raise_for_status()
+            return blob_response.content
+        response.raise_for_status()
+        return response.content
+
     def _request(
         self,
         method: str,
@@ -528,6 +570,29 @@ def _require_int(data: Mapping[str, object], key: str) -> int:
 
 def _parse_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _select_replay_artifact_id(artifacts_data: Mapping[str, object]) -> int | None:
+    """Return the preferred non-expired replay recording artifact ID, or ``None``."""
+    raw_artifacts = artifacts_data.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return None
+    primary: list[int] = []
+    fallback: list[int] = []
+    for item in raw_artifacts:
+        if not isinstance(item, dict) or item.get("expired") is True:
+            continue
+        name = _optional_str(item, "name") or ""
+        artifact_id = item.get("id")
+        if not isinstance(artifact_id, int) or isinstance(artifact_id, bool):
+            continue
+        if name.startswith(_REPLAY_ARTIFACT_PREFIX):
+            primary.append(artifact_id)
+        elif name.startswith(_FALLBACK_RECORDING_PREFIX):
+            fallback.append(artifact_id)
+    if primary:
+        return primary[-1]
+    return fallback[-1] if fallback else None
 
 
 def _compute_duration_seconds(data: Mapping[str, object], status: str) -> float:
