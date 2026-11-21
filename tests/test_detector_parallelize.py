@@ -286,3 +286,39 @@ jobs:
     p, wf = profiled(wf_yaml, {"test": (0, 100), "coverage-combine": (100, 150), "gate": (150, 160)})
     assert wf.jobs["gate"].needs_refs == {"coverage-combine"}
     assert [f for f in detect_parallelize_dag(p, wf, PATH) if f.job == "gate"] == []
+
+
+TRANSITIVE = """
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+  lint:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: ruff check
+  test:
+    needs: {test_needs}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: pytest
+"""
+TRANSITIVE_SPANS = {"build": (0, 100), "lint": (100, 110), "test": (110, 135)}
+
+
+def test_parallelize_keeps_transitive_artifact_handoff() -> None:
+    p, wf = profiled(TRANSITIVE.format(test_needs="lint"), TRANSITIVE_SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []  # cutting test<-lint or lint<-build strands test's artifact
+
+
+def test_parallelize_allows_cut_when_uploader_stays_an_ancestor() -> None:
+    p, wf = profiled(TRANSITIVE.format(test_needs="[lint, build]"), TRANSITIVE_SPANS)
+    by_edge = {(f.job, f.evidence["removed_need"]): f for f in detect_parallelize_dag(p, wf, PATH)}
+    assert ("test", "lint") in by_edge  # build is still a direct need of test
+    assert ("test", "build") not in by_edge  # the direct upload/download edge stays
+    assert by_edge["test", "lint"].expected_savings_seconds == 10.0

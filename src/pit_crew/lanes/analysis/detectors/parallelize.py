@@ -39,6 +39,38 @@ def _removable(dep: JobSpec, job: JobSpec) -> bool:
     return not (_uses(dep, _UPLOAD) and _uses(job, _DOWNLOAD))
 
 
+def _ancestors(jobs: dict[str, JobSpec], start: str, cut: tuple[str, str]) -> set[str]:
+    """Every job `start` transitively needs, ignoring the one edge `cut` (job, dependency). Linear BFS."""
+    seen: set[str] = set()
+    queue = [start]
+    while queue:
+        current = queue.pop()
+        for need in jobs[current].needs:
+            if (current, need) != cut and need not in seen:
+                seen.add(need)
+                queue.append(need)
+    return seen
+
+
+def _loses_artifact_handoff(workflow: Workflow, dep_id: str, job_id: str) -> bool:
+    """True when cutting `job.needs: dep` strands a downloading job (job or a descendant) from an uploader."""
+    jobs = workflow.jobs
+    uploaders = {i for i, j in jobs.items() if _uses(j, _UPLOAD)}
+    if not uploaders:
+        return False
+    no_cut = ("", "")
+    for downloader_id, downloader in jobs.items():
+        if not _uses(downloader, _DOWNLOAD):
+            continue
+        before = _ancestors(jobs, downloader_id, no_cut)
+        if downloader_id != job_id and job_id not in before:
+            continue  # the cut sits upstream of neither this job nor anything it needs
+        after = _ancestors(jobs, downloader_id, (job_id, dep_id))
+        if (before - after) & uploaders:
+            return True
+    return False
+
+
 def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
     """Flag critical-path `needs:` edges that carry no data, so removing them lets both jobs run at once."""
     seconds = {j.job_id: j.median_seconds for j in profile.jobs}
@@ -50,6 +82,8 @@ def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path
         for dep_id in job.needs:
             dep = workflow.jobs.get(dep_id)
             if dep is None or dep_id not in on_path or not _removable(dep, job):
+                continue
+            if _loses_artifact_handoff(workflow, dep_id, job_id):
                 continue
             trimmed = replace(job, needs=tuple(n for n in job.needs if n != dep_id))
             after = critical_path(replace(workflow, jobs={**workflow.jobs, job_id: trimmed}), seconds).seconds
