@@ -5,6 +5,7 @@ from typing import Protocol
 from fastapi import FastAPI
 
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.webhooks import create_github_webhook_router
 
 
 class DispatcherProtocol(Protocol):
@@ -27,5 +28,7 @@ def create_app(
         """Return service health and active ledger backend."""
         ledger_kind = "sqlite" if isinstance(ledger, SqliteLedger) else "memory"
         return {"status": "ok", "ledger": ledger_kind}
+
+    app.include_router(create_github_webhook_router(webhook_secret=webhook_secret))
 
     return app
