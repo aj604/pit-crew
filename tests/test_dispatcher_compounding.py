@@ -1,4 +1,5 @@
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -735,3 +736,59 @@ def test_run_until_sla_reuses_fresh_hypotheses_instead_of_rerunning_analysis() -
 
     assert [v.candidate_id for v in verdicts] == ["cand-h-viable"]
     assert [c.lane for c in runner.calls].count("analysis") == 1
+
+
+def test_run_cycle_fans_out_optimizer_so_a_stuck_hypothesis_does_not_block_a_fast_one() -> None:
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    _seed_hypotheses(ledger, repo, [("h-stuck", 120.0), ("h-fast", 60.0), ("h-third", 30.0)])
+    release_stuck = threading.Event()
+    stuck_started = threading.Semaphore(0)
+
+    class _StuckRunner(_ScriptedLaneRunner):
+        @override
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            context = _parse_task_context(task)
+            if lane == "optimizer" and context["hypothesis"]["id"] != "h-fast":
+                self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
+                stuck_started.release()
+                release_stuck.wait(timeout=5)
+                return None
+            return super().__call__(lane, task, ledger, repo=repo)
+
+    runner = _StuckRunner()
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=_FakeGitHubClient({repo: "sha-default"}),
+        lane_runner=runner,
+        evidence_by_candidate={
+            "cand-h-fast": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+        },
+        config=DispatcherConfig(optimizer_fanout=3),
+    )
+
+    try:
+        verdict = dispatcher.run_cycle(repo)
+        stuck_still_running = not release_stuck.is_set()
+        both_stuck_started = all(stuck_started.acquire(timeout=5) for _ in range(2))
+        optimized = sorted(c.context["hypothesis"]["id"] for c in runner.calls if c.lane == "optimizer")
+        next_hypothesis = dispatcher.select_next_hypothesis(repo)
+    finally:
+        release_stuck.set()
+
+    assert verdict is not None
+    assert verdict.candidate_id == "cand-h-fast"
+    assert stuck_still_running
+    assert both_stuck_started
+    assert optimized == ["h-fast", "h-stuck", "h-third"]
+    assert next_hypothesis is None  # in-flight hypotheses are not handed out again

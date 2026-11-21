@@ -93,7 +93,7 @@ def web() -> Any:  # noqa: ANN401
         dispatcher = Dispatcher(
             ledger,
             gh,
-            config=DispatcherConfig(max_parallel_runs=10),
+            config=DispatcherConfig(max_parallel_runs=10, optimizer_fanout=3),
             run_tracker=tracker,
             use_host_workspace=True,
             proof_bridge=bridge,

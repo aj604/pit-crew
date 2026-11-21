@@ -6,13 +6,14 @@ boundaries on the host. Never imports ``google`` or any lane module directly; la
 execution goes through the injected ``LaneRunner`` or ``ProofBridge``.
 """
 
+import contextvars
 import difflib
 import json
 import logging
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module
@@ -95,6 +96,7 @@ class DispatcherConfig:
     auto_open_pr: bool = True
     base_branch: str = "main"
     max_parallel_runs: int = 1
+    optimizer_fanout: int = 1  # Optimizer lanes run at once on the top hypotheses; the first candidate wins
 
 
 @runtime_checkable
@@ -493,6 +495,7 @@ class Dispatcher:
         self._use_host_workspace = use_host_workspace
         self._proof_bridge = proof_bridge
         self._declined_hypothesis_ids: set[str] = set()
+        self._inflight_hypothesis_ids: set[str] = set()
         self._target_cache: dict[str, _TargetContext] = {}
         self._cycle_local = threading.local()
 
@@ -599,11 +602,18 @@ class Dispatcher:
 
     def select_next_hypothesis(self, repo: str) -> Hypothesis | None:
         """Return the highest-impact unattempted ``Hypothesis`` for ``repo``, or ``None``."""
-        attempted_ids = {cand.hypothesis_id for cand in self.ledger.all(Candidate)} | self._declined_hypothesis_ids
+        top = self._next_hypotheses(repo, 1)
+        return top[0] if top else None
+
+    def _next_hypotheses(self, repo: str, limit: int) -> list[Hypothesis]:
+        """Return up to ``limit`` unattempted, not in-flight hypotheses for ``repo``, highest impact first."""
+        attempted_ids = (
+            {cand.hypothesis_id for cand in self.ledger.all(Candidate)}
+            | self._declined_hypothesis_ids
+            | self._inflight_hypothesis_ids
+        )
         unattempted = [hyp for hyp in self.ledger.hypotheses_for_repo(repo) if hyp.id not in attempted_ids]
-        if not unattempted:
-            return None
-        return max(unattempted, key=lambda hyp: hyp.expected_savings_seconds)
+        return sorted(unattempted, key=lambda hyp: hyp.expected_savings_seconds, reverse=True)[: max(1, limit)]
 
     def validate_candidate_paths(self, candidate: Candidate) -> tuple[str, ...]:
         """Return any disallowed file paths touched by ``candidate``."""
@@ -1246,21 +1256,12 @@ class Dispatcher:
                 logger.info("No unattempted hypotheses remain for %s", repo)
                 return None
 
-            logger.info(
-                "Running optimizer for %s hypothesis=%s (%s, est=%.1fs)",
-                repo,
-                hypothesis.id,
-                hypothesis.skill,
-                hypothesis.expected_savings_seconds,
-            )
             self._report_progress("optimizer", 0, 0)
-            candidate, optimizer_completed = self._run_optimizer(repo, resolved_base_sha, hypothesis)
-            if candidate is None:
-                if optimizer_completed:
-                    logger.info("Optimizer declined hypothesis %s (%s)", hypothesis.id, hypothesis.skill)
-                    self._declined_hypothesis_ids.add(hypothesis.id)
+            hypotheses = [hypothesis, *self._next_hypotheses(repo, self.config.optimizer_fanout)[1:]]
+            found = self._run_optimizers(repo, resolved_base_sha, hypotheses)
+            if found is None:
                 return None
-
+            hypothesis, candidate = found
             return self._evaluate_candidate(repo, resolved_base_sha, candidate, hypothesis)
         finally:
             self._cycle_local.on_progress = prev_progress
@@ -1388,6 +1389,58 @@ class Dispatcher:
                 head=candidate.branch,
                 base=ctx.base_branch,
             )
+
+    def _run_optimizers(
+        self,
+        repo: str,
+        base_sha: str,
+        hypotheses: list[Hypothesis],
+    ) -> tuple[Hypothesis, Candidate] | None:
+        """Run the Optimizer on every hypothesis at once and return the first that yields a candidate.
+
+        Lanes still running when a candidate arrives keep going in the background. Their candidates
+        land in the ledger, and a later cycle evaluates them as pending candidates.
+        """
+        self._inflight_hypothesis_ids.update(hyp.id for hyp in hypotheses)
+        pool = ThreadPoolExecutor(max_workers=len(hypotheses), thread_name_prefix="optimizer")
+        futures = {
+            pool.submit(contextvars.copy_context().run, self._optimize_one, repo, base_sha, hyp): hyp
+            for hyp in hypotheses
+        }
+        pool.shutdown(wait=False)
+        first_error: Exception | None = None
+        for future in as_completed(futures):
+            try:
+                candidate = future.result()
+            except Exception as exc:  # noqa: BLE001  re-raised below unless another lane succeeds
+                first_error = first_error or exc
+                continue
+            if candidate is not None:
+                return futures[future], candidate
+        if first_error is not None:
+            raise first_error
+        return None
+
+    def _optimize_one(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> Candidate | None:
+        logger.info(
+            "Running optimizer for %s hypothesis=%s (%s, est=%.1fs)",
+            repo,
+            hypothesis.id,
+            hypothesis.skill,
+            hypothesis.expected_savings_seconds,
+        )
+        try:
+            candidate, completed = self._run_optimizer(repo, base_sha, hypothesis)
+            if candidate is None and completed:
+                logger.info("Optimizer declined hypothesis %s (%s)", hypothesis.id, hypothesis.skill)
+                self._declined_hypothesis_ids.add(hypothesis.id)
+        except Exception:
+            logger.exception("Optimizer failed for hypothesis %s (%s)", hypothesis.id, hypothesis.skill)
+            raise
+        finally:
+            # Discard last, so the hypothesis is never briefly selectable between in-flight and declined.
+            self._inflight_hypothesis_ids.discard(hypothesis.id)
+        return candidate
 
     def _run_optimizer(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> tuple[Candidate | None, bool]:
         work_repo = self._work_repo_for(repo)
