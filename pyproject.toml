@@ -66,6 +66,8 @@ known-first-party = ["pit_crew"]
 quote-style = "double"
 indent-style = "space"
 docstring-code-format = true
+# Master specs are design records copied verbatim; their code blocks are illustrative sketches.
+exclude = ["docs/specs/*.md"]
 
 [tool.mypy]
 python_version = "3.12"
