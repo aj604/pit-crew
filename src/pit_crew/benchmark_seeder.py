@@ -1,13 +1,17 @@
-"""Provision a benchmark target repository and seed its green baseline: ``pit-crew seed-target``.
+"""Provision a benchmark target repository and seed its history: ``pit-crew seed-target``.
 
 The seeder resets ``main`` of the target repository to ``c0``, a parentless commit holding the
-``benchmarks/target_template`` tree, then dispatches ``workflow_dispatch`` runs of ``ci.yml`` on
-``main`` until at least N of them finished green. Every run it counts was made with the same
+``benchmarks/target_template`` tree. It then seeds four red-to-green bug pairs, ``b1/f1 .. b4/f4``:
+each bug commit breaks one CI check and must finish its push run ``"failure"`` on that check, and
+the fix commit after it restores the template file and must finish ``"success"``, so Proof's miner
+sees every check fail deterministically and get fixed. Last, it dispatches ``workflow_dispatch``
+runs of ``ci.yml`` on ``main`` until at least N of them finished green. Every run it counts was made with the same
 ``.github/workflows/ci.yml`` blob (the *frozen workflow*), which is the invariant Analysis's
 workflow-version filter relies on: nothing after ``c0`` may change ``.github/``.
 
 Re-running is idempotent. A repository whose ``main`` already carries the frozen workflow is not
-reset, and green frozen runs from earlier invocations count toward N, so only the shortfall is
+reset, bug/fix commits already on ``main`` are not made again (their runs are only re-checked), and
+green frozen runs from earlier invocations count toward N, so only the shortfall is
 dispatched. All GitHub access goes through the narrow :class:`GitHubClient` protocol so tests can
 substitute an in-memory fake.
 """
@@ -30,6 +34,7 @@ WORKFLOW_FILE = "ci.yml"
 WORKFLOW_PATH = f".github/workflows/{WORKFLOW_FILE}"
 WORKFLOW_DIR = ".github/"
 DISPATCH_EVENT = "workflow_dispatch"
+PUSH_EVENT = "push"
 C0_MESSAGE = "c0: benchmark target baseline"
 DEFAULT_BASELINE_RUNS = 10
 DEFAULT_TEMPLATE = Path(__file__).resolve().parents[2] / "benchmarks" / "target_template"
@@ -59,6 +64,18 @@ class FrozenWorkflowEditError(SeedError):
     def __init__(self, paths: Iterable[str]) -> None:
         """List the offending paths."""
         super().__init__(f"the workflow is frozen after c0; refusing to change {sorted(paths)}")
+
+
+class BugPairError(SeedError):
+    """A bug/fix commit's push run did not finish the way the pair needs it to."""
+
+
+class BugPairTimeoutError(SeedError):
+    """A bug/fix commit's push run did not finish before the deadline."""
+
+    def __init__(self, repo: str, message: str, sha: str, timeout: float) -> None:
+        """Name the commit that is still waiting."""
+        super().__init__(f"{repo}: no completed push run for {message!r} ({sha}) after {timeout:g}s")
 
 
 class BaselineFailedError(SeedError):
@@ -141,6 +158,14 @@ class GitHubClient(Protocol):
 
     def list_workflow_runs(self, repo: str, workflow: str, *, branch: str, event: str) -> list[WorkflowRunInfo]:
         """Recent runs of ``workflow`` on ``branch`` triggered by ``event``, any status, newest first."""
+        ...
+
+    def list_run_jobs(self, repo: str, run_id: int) -> dict[str, str | None]:
+        """The latest attempt of every job of run ``run_id``: display name to conclusion."""
+        ...
+
+    def list_commits(self, repo: str, branch: str) -> list[tuple[str, str]]:
+        """Recent ``(sha, message)`` pairs of the commits on ``branch``, newest first."""
         ...
 
 
@@ -290,6 +315,234 @@ class BaselineWaiter:
         return self._frozen_at[sha]
 
 
+# --- Red-to-green bug pairs --------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BugPair:
+    """One red-to-green pair: a bug commit that breaks ``job`` and the fix commit that restores ``path``.
+
+    The bug replaces the single occurrence of ``old`` in the template's ``path`` with ``new``; the fix
+    puts the template file back byte for byte.
+    """
+
+    key: str
+    job: str
+    """The ``ci.yml`` job id the bug targets, e.g. ``unit-test``."""
+    job_name: str
+    """That job's display name, which is what the Actions jobs API reports."""
+    summary: str
+    path: str
+    old: str
+    new: str
+
+    @property
+    def fix_key(self) -> str:
+        """``f1`` for ``b1``."""
+        return "f" + self.key.removeprefix("b")
+
+    @property
+    def bug_message(self) -> str:
+        """The bug commit's message; its first line marks the pair as seeded."""
+        return f"{self.key}: {self.summary}"
+
+    @property
+    def fix_message(self) -> str:
+        """The fix commit's message."""
+        return f"{self.fix_key}: fix {self.job} ({self.summary})"
+
+    def bug_files(self, template: Mapping[str, bytes]) -> dict[str, bytes]:
+        """The bug commit's change: ``path`` with ``old`` swapped for ``new``."""
+        original = self.fix_files(template)[self.path].decode()
+        if original.count(self.old) != 1:
+            msg = f"{self.key}: expected exactly one {self.old!r} in {self.path}, found {original.count(self.old)}"
+            raise SeedError(msg)
+        return {self.path: original.replace(self.old, self.new).encode()}
+
+    def fix_files(self, template: Mapping[str, bytes]) -> dict[str, bytes]:
+        """The fix commit's change: ``path`` exactly as the template has it."""
+        if self.path not in template:
+            msg = f"{self.key}: the template has no {self.path}"
+            raise SeedError(msg)
+        return {self.path: template[self.path]}
+
+
+_MODEL_DOC = '"""Service health: what each service reports, and what the board shows for all of them."""\n\n'
+
+BUG_PAIRS: tuple[BugPair, ...] = (
+    BugPair(
+        "b1",
+        "lint",
+        "Lint",
+        "unused import in the service model",
+        "status_board/model.py",
+        _MODEL_DOC,
+        _MODEL_DOC + "import os\n",
+    ),
+    BugPair(
+        "b2",
+        "typecheck",
+        "Typecheck",
+        "availability declares an int return but computes a float",
+        "status_board/model.py",
+        "def availability(history: Sequence[Status]) -> float:",
+        "def availability(history: Sequence[Status]) -> int:",
+    ),
+    BugPair(
+        "b3",
+        "unit-test",
+        "Unit test",
+        "off-by-one at the slow-latency boundary",
+        "status_board/model.py",
+        "self.latency_ms >= SLOW_LATENCY_MS",
+        "self.latency_ms > SLOW_LATENCY_MS",
+    ),
+    BugPair(
+        "b4",
+        "ui-check",
+        "UI check",
+        "status badge shows the reported status instead of the shown one",
+        "status_board/render.py",
+        'f\'<section class="card status-{shown}"',
+        'f\'<section class="card status-{service.status}"',
+    ),
+)
+"""The pairs ``seed-target`` seeds, in order: one per CI check (lint, typecheck, unit-test, ui-check)."""
+
+
+@dataclass(frozen=True)
+class PairReport:
+    """One seeded pair: its two commits and the push runs that judged them."""
+
+    key: str
+    job: str
+    bug_sha: str
+    bug_run: int
+    fix_sha: str
+    fix_run: int
+    created: bool
+    """Whether this invocation made either commit (false when both were already on ``main``)."""
+
+    def as_json(self) -> dict[str, Any]:
+        """A JSON-ready summary."""
+        return {
+            "key": self.key,
+            "job": self.job,
+            "bug_sha": self.bug_sha,
+            "bug_run": self.bug_run,
+            "fix_sha": self.fix_sha,
+            "fix_run": self.fix_run,
+            "created": self.created,
+        }
+
+
+@dataclass(frozen=True)
+class _Step:
+    pair: BugPair
+    bug: bool
+
+    @property
+    def message(self) -> str:
+        return self.pair.bug_message if self.bug else self.pair.fix_message
+
+
+def _seeded_steps(client: GitHubClient, repo: str, steps: Sequence[_Step]) -> list[str]:
+    """SHAs of the steps already on ``main``, oldest first; they must be a prefix of ``steps``."""
+    after_c0: list[tuple[str, str]] = []
+    for sha, message in client.list_commits(repo, MAIN):
+        if message.split("\n", 1)[0] == C0_MESSAGE:
+            break
+        after_c0.append((sha, message.split("\n", 1)[0]))
+    else:
+        msg = f"{repo}: cannot find {C0_MESSAGE!r} in the recent history of {MAIN}"
+        raise SeedError(msg)
+    after_c0.reverse()
+    found = [message for _, message in after_c0]
+    wanted = [step.message for step in steps]
+    if found != wanted[: len(found)]:
+        msg = f"{repo}: {MAIN} after c0 is {found}, which is not a prefix of the bug/fix sequence {wanted}"
+        raise SeedError(msg)
+    return [sha for sha, _ in after_c0]
+
+
+@dataclass
+class PairSeeder:
+    """Commit each bug and fix on ``main`` in order, and await the push run that judges each one."""
+
+    client: GitHubClient
+    repo: str
+    template: Mapping[str, bytes]
+    pairs: Sequence[BugPair] = BUG_PAIRS
+    poll_seconds: float = 30.0
+    timeout_seconds: float = 3600.0
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+
+    def seed(self) -> list[PairReport]:
+        """Seed the missing steps, re-check the existing ones, and report every pair."""
+        if not self.pairs:
+            return []
+        steps = [_Step(pair, bug) for pair in self.pairs for bug in (True, False)]
+        seeded = _seeded_steps(self.client, self.repo, steps)
+        results: list[tuple[str, int]] = []
+        for i, step in enumerate(steps):
+            if i < len(seeded):
+                sha = seeded[i]
+            else:
+                change = step.pair.bug_files(self.template) if step.bug else step.pair.fix_files(self.template)
+                sha = commit_on_main(self.client, self.repo, change, step.message)
+            results.append((sha, self._judge(step, sha)))
+        return [
+            PairReport(
+                pair.key,
+                pair.job,
+                results[2 * i][0],
+                results[2 * i][1],
+                results[2 * i + 1][0],
+                results[2 * i + 1][1],
+                created=2 * i + 1 >= len(seeded),
+            )
+            for i, pair in enumerate(self.pairs)
+        ]
+
+    def _judge(self, step: _Step, sha: str) -> int:
+        """Await the push run of ``sha`` and check it went red on the pair's job (bug) or green (fix)."""
+        run = self._await_push_run(step, sha)
+        if step.bug:
+            jobs = self.client.list_run_jobs(self.repo, run.id)
+            if run.conclusion != "failure" or jobs.get(step.pair.job_name) != "failure":
+                msg = (
+                    f"{self.repo}: {step.message!r} ({sha}) should fail {step.pair.job_name!r}, but run {run.id} "
+                    f"concluded {run.conclusion!r} with that job {jobs.get(step.pair.job_name)!r}"
+                )
+                raise BugPairError(msg)
+        elif run.conclusion != "success":
+            msg = (
+                f"{self.repo}: {step.message!r} ({sha}) should be green, but run {run.id} concluded {run.conclusion!r}"
+            )
+            raise BugPairError(msg)
+        return run.id
+
+    def _await_push_run(self, step: _Step, sha: str) -> WorkflowRunInfo:
+        deadline = self.clock() + self.timeout_seconds
+        while True:
+            runs = self.client.list_workflow_runs(self.repo, WORKFLOW_FILE, branch=MAIN, event=PUSH_EVENT)
+            done = [
+                r
+                for r in runs
+                if r.head_sha == sha
+                and r.event == PUSH_EVENT
+                and r.head_branch == MAIN
+                and r.path.split("@", 1)[0] == WORKFLOW_PATH
+                and r.completed
+            ]
+            if done:
+                return done[0]
+            if self.clock() >= deadline:
+                raise BugPairTimeoutError(self.repo, step.message, sha, self.timeout_seconds)
+            self.sleep(self.poll_seconds)
+
+
 @dataclass(frozen=True)
 class SeedReport:
     """What ``seed_target`` did, printed by the CLI as JSON."""
@@ -300,6 +553,7 @@ class SeedReport:
     workflow_sha: str
     dispatched: int
     green_runs: list[int]
+    bug_pairs: list[PairReport] = field(default_factory=list)
 
     def as_json(self) -> dict[str, Any]:
         """A JSON-ready summary."""
@@ -310,6 +564,7 @@ class SeedReport:
             "workflow_sha": self.workflow_sha,
             "dispatched": self.dispatched,
             "green_runs": self.green_runs,
+            "bug_pairs": [pair.as_json() for pair in self.bug_pairs],
         }
 
 
@@ -325,14 +580,28 @@ def seed_target(  # noqa: PLR0913  keyword-only knobs mirror the CLI flags
     timeout_seconds: float = 3600.0,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    bug_pairs: Sequence[BugPair] = BUG_PAIRS,
 ) -> SeedReport:
-    """Provision ``repo`` from ``template`` and wait for ``baseline_runs`` green runs on the frozen workflow."""
+    """Provision ``repo`` from ``template``, seed ``bug_pairs``, then wait for green runs on the frozen workflow.
+
+    ``timeout_seconds`` bounds each wait separately: every bug or fix run, and the baseline.
+    """
     if baseline_runs < 1 or max_concurrent < 1:
         msg = "baseline_runs and max_concurrent must be at least 1"
         raise ValueError(msg)
     files = load_template(template)
     frozen = git_blob_sha(files[WORKFLOW_PATH])
-    action, head = provision(client, repo, files, private=private)
+    action, _ = provision(client, repo, files, private=private)
+    pairs = PairSeeder(
+        client,
+        repo,
+        files,
+        bug_pairs,
+        poll_seconds=poll_seconds,
+        timeout_seconds=timeout_seconds,
+        sleep=sleep,
+        clock=clock,
+    ).seed()
     waiter = BaselineWaiter(
         client,
         repo,
@@ -347,9 +616,9 @@ def seed_target(  # noqa: PLR0913  keyword-only knobs mirror the CLI flags
     green = waiter.wait()
     final = client.get_ref(repo, MAIN)
     found = None if final is None else client.get_file_sha(repo, WORKFLOW_PATH, final)
-    if found != frozen:
+    if final is None or found != frozen:
         raise WorkflowDriftError(repo, frozen, found)
-    return SeedReport(repo, action, head, frozen, waiter.dispatched, green)
+    return SeedReport(repo, action, final, frozen, waiter.dispatched, green, pairs)
 
 
 # --- The real client ---------------------------------------------------------------------------
@@ -485,3 +754,14 @@ class RestGitHubClient:
             )
             for r in body["workflow_runs"]
         ]
+
+    def list_run_jobs(self, repo: str, run_id: int) -> dict[str, str | None]:
+        """Display name to conclusion for the latest attempt of each job of ``run_id``."""
+        body = self._call("GET", f"/repos/{repo}/actions/runs/{run_id}/jobs?{urlencode({'per_page': 100})}")
+        return {str(j["name"]): j.get("conclusion") for j in body["jobs"]}
+
+    def list_commits(self, repo: str, branch: str) -> list[tuple[str, str]]:
+        """The newest 100 commits on ``branch`` as ``(sha, message)``."""
+        query = urlencode({"sha": branch, "per_page": 100})
+        body = self._call("GET", f"/repos/{repo}/commits?{query}")
+        return [(str(c["sha"]), str(c["commit"]["message"])) for c in body]
