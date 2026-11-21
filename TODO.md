@@ -9,16 +9,16 @@ See [docs/architecture.md](docs/architecture.md) for system design and [docs/lan
 ## Big Picture & Platform (Architecture Owner)
 
 - [ ] Fill in lane owners in [README.md](README.md) and add `.github/CODEOWNERS`.
-- [ ] Finalize v1 contract updates in `src/pit_crew/contracts.py` (separate PR):
-  - [ ] Decide whether `Candidate` carries `repo`, `base_sha`, and `head_sha`.
-  - [ ] Decide how synthetic mutations are represented in `ReplayPlan`.
-  - [ ] Add read/query methods to `Ledger` (e.g., prior verdicts by repo, in-flight records).
-- [ ] Lock in the three open architectural decisions:
-  - [ ] Managed Agents runtime (Gemini Interactions API vs. Cloud Agent Platform).
-  - [ ] Production ledger storage backend (SQLite vs. Postgres / Firestore).
-  - [ ] Tool transport (in-process `@tool` functions vs. remote MCP server).
-- [ ] Define the GitHub Actions replay execution spec (how a candidate's workflow change is applied to a historical `bug_sha`).
-- [ ] Update `managed_agent.build_request()` to support mounting per-fix playbook sub-skills for Optimizer.
+- [x] Finalize v1 contract updates in `src/pit_crew/contracts.py` (separate PR, 100% backwards-compatible):
+  - [x] `Candidate` carries `repo`, `base_sha`, `head_sha`, `files`, `changed_files` + `is_allowed_candidate_path()`.
+  - [x] `BugCase` (`commit` + `mutation` + multimodal `artifact_ref`) synced with `ReplayPlan.bug_shas`.
+  - [x] `SqliteLedger` (WAL) + `prior_attempts(repo)` and `latest_kept_candidate(repo)` in `Ledger`.
+- [x] Lock in the three open architectural decisions:
+  - [x] Managed Agents runtime: Gemini Interactions API (`antigravity-preview-09-2026` on `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-4-carbon`).
+  - [x] Production ledger storage backend: WAL-mode `SqliteLedger`.
+  - [x] Tool transport: Host-mediated `@tool` capability gates via `requires_action` loop (zero secrets in sandbox).
+- [x] Define the GitHub Actions replay execution spec (3-way overlay on `bug_sha` + baseline-verified synthetic mutations).
+- [x] Update `managed_agent.build_request()` to auto-mount `lanes/optimizer/playbooks/*.md` + multimodal `extra_sources`.
 
 **Deliverables:** Locked v1 `contracts.py` + `Ledger` protocol, recorded ADRs for the three open decisions, and a shared replay execution spec so Dispatcher and Proof align.
 

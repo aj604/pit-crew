@@ -65,8 +65,8 @@ record in `contracts.py`, open a separate PR, because every lane depends on it.
 - [Lane Owner Guide](docs/lane-guide.md) — working agreements, `@tool` and `SKILL.md` conventions, testing, and per-lane starting points.
 - [TODO](TODO.md) — tasks, deliverables, and integration milestones per lane.
 
-## Open decisions
+## Locked Architecture Decisions
 
-- Gemini API or the Cloud Agent Platform surface for Managed Agents.
-- Which database backs the ledger.
-- Whether tools stay custom functions or move behind a remote MCP server.
+- **Models (Gemini 4 Managed Agents via Interactions API):** `gemini-4-hydrogen` (`analysis`), `gemini-4-neon` (`optimizer`), and `gemini-4-carbon` (`proof`, including multimodal CI failure artifact inspection).
+- **Target CI Goal:** Compounding verified optimizations toward **`median <= 60s` and `p95 <= 120s`** (`MIN_SPEEDUP = 1.05x`, `p <= 0.05`, `100%` replayed bugs caught).
+- **Ledger & Transport:** Event-driven `workflow_run` webhook + Pit Wall FastAPI server backed by WAL-mode `SqliteLedger` (`src/pit_crew/ledger.py`) and host-mediated `@tool` gates (`src/pit_crew/tools.py`) with zero secrets inside the remote sandbox.

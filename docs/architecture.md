@@ -112,22 +112,13 @@ All cross-lane state is represented by five frozen dataclasses:
 - **Additive by default:** Prefer adding optional fields with sensible defaults over renaming or removing existing fields.
 - **JSON-serializable types only:** Keep fields restricted to primitives, `tuple`, `dict`, and `None` so any future database or MCP serialization layer works cleanly.
 
-### Known Contract & Platform Gaps to Resolve Next
+### Locked v1 Contract & Platform Decisions
 
-These are intentionally deferred from the initial scaffold and should be agreed on before lanes depend on them:
-
-1. **Candidate git coordinates:** `Candidate` currently stores `branch`, not `repo`, `base_sha`, or `head_sha`. Proof and Dispatcher will likely need exact SHAs to diff and run reproducible baselines.
-2. **Ledger read queries:** `Ledger` currently exposes `add`, `get`, and `all`. Optimizer needs to query prior attempts/verdicts for a repo, and Dispatcher needs to track in-flight work.
-3. **Synthetic mutations in `ReplayPlan`:** `ReplayPlan.bug_shas` assumes real historical commits. If Proof injects synthetic mutations for repos without red history, we need to decide whether mutations are pushed as synthetic commit SHAs or represented as structured patches in `ReplayPlan`.
-4. **Optimizer playbook sub-skills:** `managed_agent.build_request()` currently mounts only `.agents/skills/{lane}/SKILL.md`. Once Optimizer adds per-fix playbooks (`dep-cache`, `shard-by-timing`, etc.), `build_request()` will need to mount the lane's additional skill files.
-5. **Replay execution mechanics:** How GitHub Actions combines a `Candidate` workflow change with a historical `bug_sha` (e.g., checking out `bug_sha` and overlaying `.github/workflows/` from the candidate branch, vs. cherry-picking the bug commit onto the candidate).
-
-## Open Architecture Decisions
-
-None of these decisions block individual lane owners from building and unit-testing their lanes today:
-
-| Decision | Options | What Lane Owners Can Assume Today |
-|---|---|---|
-| **Managed Agents runtime** | Gemini Interactions API (`google-genai`) vs. Cloud Agent Platform | **No impact on lanes.** Isolated entirely to `src/pit_crew/managed_agent.py`. |
-| **Ledger storage backend** | SQLite (single-node) vs. Postgres / Firestore (hosted) | **No impact on lanes.** Program only against the `Ledger` protocol in `ledger.py` and test with `InMemoryLedger`. |
-| **Tool transport** | In-process Python `@tool` functions vs. remote MCP server | **Minimal impact.** Keep `@tool` arguments/return values JSON-serializable, stateless aside from `ledger`, and documented via clear docstrings + JSON Schema. |
+1. **Gemini 4 Multi-Model Lanes (`managed_agent.py`):**
+   - `analysis`: **`gemini-4-hydrogen`** (high-throughput DAG & step-log scanning).
+   - `optimizer`: **`gemini-4-neon`** (surgical workflow & runner-config refactoring, auto-mounting `lanes/optimizer/playbooks/*.md`).
+   - `proof`: **`gemini-4-carbon`** (adversarial & multimodal failure artifact inspection via base64-mounted screenshots/traces under `/workspace/.pit-crew/artifacts/`).
+2. **Zero-Secret Sandbox & Candidate Coordinates:** All untrusted repo/log/image inspection runs inside Google's remote sandbox. `GITHUB_TOKEN` stays on the Dispatcher host. `Candidate` carries `repo`, `base_sha`, `head_sha`, `files`, and `changed_files`, validated by `contracts.is_allowed_candidate_path()` (`.github/**` and runner configs only).
+3. **Compounding Pit Stops Toward 60s / 120s SLA (`rater.py`):** Target repo CI goal is **`median <= 60s` and `p95 <= 120s`**. Any candidate achieving `speedup >= 1.05x` (`MIN_SPEEDUP`), `p <= 0.05` (exact permutation up to 10 runs/side, deterministic Monte Carlo above 10, including cold Run #1 across 5 staggered pairs), and `100%` bugs caught is kept (`keep=True`) and promoted as the new `base_sha` until `Verdict.sla_met` is `True`.
+4. **Dual Replay Plan (`BugCase` in `ReplayPlan`):** Supports both historical red SHAs (`kind="commit"`) via 3-way overlay of Candidate files onto `bug_sha` and synthetic mutations (`kind="mutation"`, `mutated_files`) verified to fail Baseline so dud mutations cannot game Rater.
+5. **Runtime, Storage & UI:** Single FastAPI service (`workflow_run` webhooks + live Pit Wall UI + PR SVG/PNG charts) backed by WAL-mode `SqliteLedger` (`ledger.prior_attempts(repo)`, `ledger.latest_kept_candidate(repo)`) and in-process `@tool` gates via the Interactions API `requires_action` loop.
