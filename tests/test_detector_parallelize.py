@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, CriticalPath, profile
-from pit_crew.lanes.analysis.detectors.parallelize import detect_parallelize_dag
+from pit_crew.lanes.analysis.detectors.parallelize import _trivial_run, detect_parallelize_dag
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -322,3 +322,27 @@ def test_parallelize_allows_cut_when_uploader_stays_an_ancestor() -> None:
     assert ("test", "lint") in by_edge  # build is still a direct need of test
     assert ("test", "build") not in by_edge  # the direct upload/download edge stays
     assert by_edge["test", "lint"].expected_savings_seconds == 10.0
+
+
+def test_parallelize_logging_prefix_does_not_hide_real_work() -> None:
+    steps = "    steps:\n      - run: echo Starting tests && npm test"
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert [(f.job, f.expected_savings_seconds) for f in detect_parallelize_dag(p, wf, PATH)] == [("test", 60.0)]
+
+
+@pytest.mark.parametrize(
+    ("script", "trivial"),
+    [
+        ("echo a; echo b", True),
+        ("echo a && true", True),
+        ("echo a | true", True),
+        ("echo a; npm test", False),
+        ("true || npm test", False),
+        ("echo a | npm test", False),
+        ("echo $(make build)", False),
+        ("echo `make build`", False),
+        ("echo done;", True),
+    ],
+)
+def test_trivial_run_checks_every_segment(script: str, *, trivial: bool) -> None:
+    assert _trivial_run(script) is trivial

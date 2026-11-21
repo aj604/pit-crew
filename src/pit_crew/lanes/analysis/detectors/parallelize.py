@@ -1,5 +1,6 @@
 """parallelize-dag: find `needs:` edges that make independent jobs wait for each other."""
 
+import re
 from dataclasses import replace
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, critical_path
@@ -9,14 +10,23 @@ from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 _UPLOAD = "actions/upload-artifact"
 _DOWNLOAD = "actions/download-artifact"
 _CONFIDENCE = 0.6
+_SEGMENT_SEPARATOR = re.compile(r"&&|\|\||[;|&]")  # shell command separators; alternation of fixed tokens, linear
 _TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
 
 
 def _trivial_run(run: str) -> bool:
-    lines = [line.strip() for line in run.splitlines()]
-    return all(
-        line.split(maxsplit=1)[0].lower() in _TRIVIAL_COMMANDS for line in lines if line and not line.startswith("#")
-    )
+    """True when every shell segment of every line starts with a trivial command; substitutions are never trivial."""
+    for raw in run.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "$(" in line or "`" in line:
+            return False
+        for segment in _SEGMENT_SEPARATOR.split(line):
+            words = segment.split(maxsplit=1)
+            if words and words[0].lower() not in _TRIVIAL_COMMANDS:
+                return False
+    return True
 
 
 def _only_waits(job: JobSpec) -> bool:
