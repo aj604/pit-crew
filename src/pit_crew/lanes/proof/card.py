@@ -89,7 +89,7 @@ def render_card(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequ
     return "\n".join(out)
 
 
-def pr_body(  # noqa: PLR0913  optional preview_base_url and media_base_url preserve legacy positional callers
+def pr_body(  # noqa: PLR0913  optional preview/media options preserve legacy positional callers
     branch: str,
     evidence: Evidence,
     verdict: Verdict,
@@ -98,6 +98,7 @@ def pr_body(  # noqa: PLR0913  optional preview_base_url and media_base_url pres
     *,
     preview_base_url: str = "",
     media_base_url: str = "",
+    media_requires_auth: bool = False,
 ) -> str:
     """Return the markdown PR body: the card, replay table, visual comparisons, and trust rule."""
     rows = [
@@ -106,7 +107,9 @@ def pr_body(  # noqa: PLR0913  optional preview_base_url and media_base_url pres
         *(
             f"| `{r.sha[:7]}` | {_cell(r.check)} | {_modality_md(r.modality)} "
             f"| {_outcome(failed=r.baseline_failed)} | {_outcome(failed=r.candidate_failed)} "
-            f"| **{r.status}** | {_recordings(r, media_base_url=media_base_url)} | {_cell(_seen_summary(r))} |"
+            f"| **{r.status}** "
+            f"| {_recordings(r, media_base_url=media_base_url, media_requires_auth=media_requires_auth)} "
+            f"| {_cell(_seen_summary(r))} |"
             for r in replays
         ),
     ]
@@ -242,28 +245,30 @@ def _median(seconds: Sequence[float]) -> str:
     return _duration(median(seconds)) if seconds else "no runs"
 
 
-def _resolve_recording_link(
+def _resolve_recording_link(  # noqa: PLR0913
     video_url: str,
     artifact_urls: tuple[str, ...],
     fallback_video: str,
     *,
     side: str,
     media_base_url: str,
+    media_requires_auth: bool = False,
 ) -> tuple[str, str]:
     cleaned_video = video_url.strip()
-    if cleaned_video.startswith(("https://", "http://")):
-        label = f"{side}.mp4" if cleaned_video.lower().endswith(".mp4") else side
-        return label, cleaned_video
     base = media_base_url.strip().rstrip("/")
-    if cleaned_video.startswith("/media/") and base.startswith(("https://", "http://")):
+    if cleaned_video.startswith(("https://", "http://")):
+        if not (media_requires_auth and base and cleaned_video.startswith(f"{base}/media/")):
+            label = f"{side}.mp4" if cleaned_video.lower().endswith(".mp4") else side
+            return label, cleaned_video
+    elif not media_requires_auth and cleaned_video.startswith("/media/") and base.startswith(("https://", "http://")):
         label = f"{side}.mp4" if cleaned_video.lower().endswith(".mp4") else side
         return label, f"{base}{cleaned_video}"
     fallback = artifact_urls[0] if artifact_urls else fallback_video
     return side, fallback
 
 
-def _recordings(replay: Replay, *, media_base_url: str = "") -> str:
-    # Prefer playable deployed MP4 URLs when available; otherwise fall back to artifact/run URLs.
+def _recordings(replay: Replay, *, media_base_url: str = "", media_requires_auth: bool = False) -> str:
+    # Prefer playable public MP4 URLs when unauthenticated; otherwise fall back to GitHub artifact/run URLs.
     entries = (
         _resolve_recording_link(
             replay.baseline_video_url,
@@ -271,6 +276,7 @@ def _recordings(replay: Replay, *, media_base_url: str = "") -> str:
             replay.baseline_video,
             side="baseline",
             media_base_url=media_base_url,
+            media_requires_auth=media_requires_auth,
         ),
         _resolve_recording_link(
             replay.candidate_video_url,
@@ -278,6 +284,7 @@ def _recordings(replay: Replay, *, media_base_url: str = "") -> str:
             replay.candidate_video,
             side="candidate",
             media_base_url=media_base_url,
+            media_requires_auth=media_requires_auth,
         ),
     )
     return " / ".join(f"[{label}]({url})" for label, url in entries if url) or "none"

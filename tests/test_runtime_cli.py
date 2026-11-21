@@ -725,3 +725,92 @@ def test_live_dispatcher_and_serve_persist_and_stream_replay_mp4(
         assert cand_resp.status_code == 200
         assert cand_resp.headers["content-disposition"].startswith("attachment;")
         assert cand_resp.content == cand_mp4
+
+
+def test_build_live_dispatcher_marks_media_auth_and_until_sla_preserves_replay_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1. When PIT_CREW_API_TOKEN is set alongside PIT_CREW_PUBLIC_URL, ProofBridge sets media_requires_auth=True.
+    monkeypatch.setenv("PIT_CREW_PUBLIC_URL", "https://deployed.pit-crew.test")
+    monkeypatch.setenv("PIT_CREW_API_TOKEN", "secret-api-tok")
+    ledger_path = tmp_path / "until_sla.db"
+    ledger = SqliteLedger(ledger_path)
+    workflow_yaml = (
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pytest\n"
+    )
+    with (
+        _LiveRecordingGitHub(workflow_yaml, transport=httpx.MockTransport(lambda _r: httpx.Response(404))) as gh,
+        ExitStack() as stack,
+    ):
+        live_dispatcher = runtime_cli._build_live_dispatcher(  # noqa: SLF001
+            ledger,
+            RunTracker(),
+            DispatcherConfig(timing_pairs=0),
+            github=gh,
+            stack=stack,
+        )
+        assert live_dispatcher._proof_bridge is not None  # noqa: SLF001
+        assert live_dispatcher._proof_bridge.media_requires_auth is True  # noqa: SLF001
+
+    # 2. Under --until-sla, a trailing no-work cycle returning None must not clear cycle 1's replay_videos or pr_url.
+    class _StubGithub:
+        def get_default_branch_sha(self, _repo: str) -> str:
+            return "a" * 40
+
+        def get_file_content(self, _repo: str, _path: str, _ref: str) -> str | None:
+            return None
+
+        def open_pull_request(self, _repo: str, *, title: str, body: str, head: str, base: str) -> str:
+            _ = (title, body, head, base)
+            return "https://github.com/org/repo/pull/77"
+
+    verdict_1 = Verdict(
+        id="v-1",
+        candidate_id="cand-1",
+        keep=True,
+        speedup=1.5,
+        p_value=0.01,
+        median_seconds=90.0,
+        p95_seconds=95.0,
+        sla_met=False,
+        reason="faster but above SLA",
+    )
+    ledger.add(
+        Evidence(
+            id="ev-1",
+            candidate_id="cand-1",
+            baseline_seconds=(135.0,) * 5,
+            candidate_seconds=(90.0,) * 5,
+            bugs_total=1,
+            bugs_caught=1,
+        )
+    )
+    ledger.add(verdict_1)
+    saved_pair = (str(tmp_path / "base.mp4"), str(tmp_path / "cand.mp4"))
+    real_dispatcher = Dispatcher(
+        ledger,
+        _StubGithub(),  # type: ignore[arg-type]
+        config=DispatcherConfig(max_compounding_cycles=3),
+    )
+    calls = 0
+
+    def fake_run_cycle(repo: str, base_sha: str | None = None, *, on_progress: object = None) -> Verdict | None:
+        nonlocal calls
+        _ = (repo, base_sha, on_progress)
+        calls += 1
+        real_dispatcher._set_verified_replays(())  # noqa: SLF001
+        real_dispatcher._cycle_local.last_pr_url = None  # noqa: SLF001
+        if calls == 1:
+            real_dispatcher._set_verified_replays((), (), saved_pair)  # noqa: SLF001
+            real_dispatcher._cycle_local.last_pr_url = "https://github.com/org/repo/pull/77"  # noqa: SLF001
+            return verdict_1
+        return None
+
+    monkeypatch.setattr(real_dispatcher, "run_cycle", fake_run_cycle)
+    args = _parser().parse_args(["run-cycle", "--repo", "org/repo", "--ledger", str(ledger_path), "--until-sla"])
+    summary, ok = runtime_cli.run_runtime_command(args, dispatcher=real_dispatcher)
+    assert ok is True
+    assert calls == 2
+    assert summary["keep"] is True
+    assert summary["replay_videos"] == list(saved_pair)
+    assert summary["pr_url"] == "https://github.com/org/repo/pull/77"

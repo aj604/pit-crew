@@ -67,10 +67,20 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None) -> int:
+def record(
+    argv: list[str],
+    cast_path: str | Path,
+    echo: BinaryIO | None = None,
+    *,
+    masks_file: str | Path | None = None,
+) -> int:
     """Run argv in a pseudo-terminal, write a secret-scrubbed asciicast v2 recording, and return its exit code."""
     out = echo if echo is not None else sys.stdout.buffer
-    masks = _collect_env_secrets(os.environ)
+    masks_path = Path(masks_file) if masks_file is not None else None
+    persisted_masks = _load_masks_file(masks_path) if masks_path is not None else set()
+    masks, explicit_masks = _collect_env_secrets_with_explicit(os.environ)
+    masks |= persisted_masks
+    dynamic_masks: set[str] = set()
     env = {**os.environ, "TERM": "xterm-256color", "COLUMNS": str(WIDTH), "LINES": str(HEIGHT)}
     env.pop(SECRET_ENV_VARS_KEY, None)
     path = Path(cast_path)
@@ -86,7 +96,7 @@ def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None)
                 start = time.monotonic()
                 proc = _start(argv, slave, env)
                 try:
-                    _copy(master, proc, out, cast, start, masks=masks)
+                    _copy(master, proc, out, cast, start, masks=masks, dynamic_masks=dynamic_masks)
                 except BaseException:
                     proc.kill()  # the recording broke: stop the check rather than leave it running unseen
                     proc.wait()
@@ -97,6 +107,8 @@ def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None)
     finally:
         if scrub_needed and path.exists():
             _scrub_cast_file(path, masks)
+        if masks_path is not None:
+            _append_masks_file(masks_path, (dynamic_masks | explicit_masks) - persisted_masks)
     return _SIGNAL_EXIT_BASE - code if code < 0 else code
 
 
@@ -126,13 +138,20 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="only render --video when the check exits non-zero",
     )
+    parser.add_argument(
+        "--masks-file",
+        help="private per-job file used to persist and share ::add-mask:: values across steps",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="the check, after --")
     parsed = parser.parse_args(args)
     command: list[str] = parsed.command[1:] if parsed.command[:1] == ["--"] else parsed.command
     if not command:
         parser.error("give the check to run after --")
 
-    code = record(command, parsed.cast)
+    if parsed.masks_file:
+        code = record(command, parsed.cast, masks_file=parsed.masks_file)
+    else:
+        code = record(command, parsed.cast)
     if parsed.video and (code != 0 or not parsed.video_on_failure):
         try:
             render_video(parsed.cast, parsed.video)
@@ -151,6 +170,9 @@ def _start(argv: list[str], slave: int, env: dict[str, str]) -> "subprocess.Pope
         os.close(slave)  # the check has its own copy; ours would hold the terminal open after it exits
 
 
+_MAX_RAW_LINE_TAIL = 65_536
+
+
 def _copy(  # noqa: PLR0913  internal stream loop passing recording handles and secret masks
     master: int,
     proc: "subprocess.Popen[bytes]",
@@ -159,33 +181,105 @@ def _copy(  # noqa: PLR0913  internal stream loop passing recording handles and 
     start: float,
     *,
     masks: set[str],
+    dynamic_masks: set[str] | None = None,
 ) -> None:
     """Stream raw check output to the job log while writing secret-masked events to the recording."""
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    raw_tail = ""
     for data in _chunks(master, proc):
         out.write(data)
         out.flush()
         text = decoder.decode(data)
-        _register_add_masks(text, masks)
+        raw_tail = _track_raw_add_masks(raw_tail, text, masks, dynamic_masks)
         _event(cast, start, _redact_text(text, masks))
     tail = decoder.decode(b"", final=True)  # a character cut off by the check exiting
-    _register_add_masks(tail, masks)
+    _track_raw_add_masks(raw_tail, tail, masks, dynamic_masks, final=True)
     _event(cast, start, _redact_text(tail, masks))
 
 
+def _track_raw_add_masks(
+    raw_tail: str,
+    chunk: str,
+    masks: set[str],
+    dynamic_masks: set[str] | None,
+    *,
+    final: bool = False,
+) -> str:
+    """Register complete ``::add-mask::`` lines across chunk boundaries without losing split characters."""
+    buf = f"{raw_tail}{chunk}"
+    if not buf:
+        return ""
+    if final:
+        _register_add_masks(buf, masks, dynamic_masks=dynamic_masks)
+        return ""
+    last_nl = max(buf.rfind("\n"), buf.rfind("\r"))
+    if last_nl < 0:
+        return buf[-_MAX_RAW_LINE_TAIL:]
+    _register_add_masks(buf[: last_nl + 1], masks, dynamic_masks=dynamic_masks)
+    return buf[last_nl + 1 :][-_MAX_RAW_LINE_TAIL:]
+
+
 def _collect_env_secrets(environ: Mapping[str, str]) -> set[str]:
-    masks: set[str] = set()
+    masks, _ = _collect_env_secrets_with_explicit(environ)
+    return masks
+
+
+def _collect_env_secrets_with_explicit(environ: Mapping[str, str]) -> tuple[set[str], set[str]]:
+    explicit_masks: set[str] = set()
     explicit_raw = environ.get(SECRET_ENV_VARS_KEY, "")
     explicit_names = {name.strip() for name in explicit_raw.split(",") if name.strip()}
     for name in explicit_names:
         value = environ.get(name, "")
-        _add_secret_value(masks, value, min_len=1, expand_json=True)
+        _add_secret_value(explicit_masks, value, min_len=1, expand_json=True)
+    masks = set(explicit_masks)
     for name, value in environ.items():
         if name == SECRET_ENV_VARS_KEY or name in explicit_names:
             continue
         if _SENSITIVE_ENV_RE.search(name):
             _add_secret_value(masks, value, min_len=_MIN_AUTO_SECRET_LEN, expand_json=False)
+    return masks, explicit_masks
+
+
+def _load_masks_file(path: Path) -> set[str]:
+    if not path.is_file() or path.is_symlink():
+        return set()
+    masks: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return masks
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, str) and item:
+            masks.add(item)
     return masks
+
+
+def _append_masks_file(path: Path, new_masks: Iterable[str]) -> None:
+    items = sorted({m for m in new_masks if m})
+    if not items:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "ab")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            handle.write("".join(f"{json.dumps(item)}\n" for item in items).encode("utf-8"))
+    except OSError:
+        return
 
 
 def _add_secret_value(masks: set[str], value: str, *, min_len: int, expand_json: bool) -> None:
@@ -222,13 +316,17 @@ def _unescape_workflow_command(value: str) -> str:
     return value.replace("%0D", "\r").replace("%0d", "\r").replace("%0A", "\n").replace("%0a", "\n").replace("%25", "%")
 
 
-def _register_add_masks(text: str, masks: set[str]) -> None:
+def _register_add_masks(text: str, masks: set[str], *, dynamic_masks: set[str] | None = None) -> None:
+    discovered: set[str] = set()
     for match in _ADD_MASK_RE.finditer(text):
         raw = match.group(1)
-        _add_secret_lines(masks, raw, min_len=1)
+        _add_secret_lines(discovered, raw, min_len=1)
         unescaped = _unescape_workflow_command(raw)
         if unescaped != raw:
-            _add_secret_lines(masks, unescaped, min_len=1)
+            _add_secret_lines(discovered, unescaped, min_len=1)
+    masks.update(discovered)
+    if dynamic_masks is not None:
+        dynamic_masks.update(discovered)
 
 
 def _find_secret_spans(text: str, masks: Iterable[str]) -> list[tuple[int, int]]:

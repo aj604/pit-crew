@@ -734,7 +734,7 @@ def _instrument_job(  # noqa: PLR0913
     safe_job_id = _safe_job_slug(job_id)
     job_default = _default_shell(job)
     effective_default = job_default if job_default is not None else workflow_shell
-    inherited_secret_env = workflow_secret_env | _secret_env_var_names(job.get("env"))
+    accumulated_secret_env = set(workflow_secret_env | _secret_env_var_names(job.get("env")))
     new_steps: list[Any] = []
     recorder_checkout_path: str | None = None
     installed_tools = False
@@ -745,6 +745,7 @@ def _instrument_job(  # noqa: PLR0913
             new_steps.append(raw_step)
             continue
 
+        accumulated_secret_env.update(_secret_env_var_names(raw_step.get("env")))
         effect, rel_path = _checkout_effect(raw_step, mixed=mixed)
         if effect != "none":
             new_steps.append(raw_step)
@@ -766,7 +767,7 @@ def _instrument_job(  # noqa: PLR0913
                 step_idx=step_idx,
                 default_shell=effective_default,
                 recorder_expr=_recorder_shell_expr(recorder_checkout_path),
-                secret_env_vars=inherited_secret_env | _secret_env_var_names(raw_step.get("env")),
+                secret_env_vars=frozenset(accumulated_secret_env),
                 mixed=mixed,
             )
             if emitted is not None:
@@ -968,6 +969,7 @@ def _wrap_run_step(  # noqa: PLR0913
     wrapped_script = (
         f'_pc_dir="${{RUNNER_TEMP:-/tmp}}/pit-crew-replay/{safe_job_id}"\n'
         'mkdir -p "$_pc_dir"\n'
+        f'_pc_masks="${{RUNNER_TEMP:-/tmp}}/pit-crew-masks/{safe_job_id}.masks"\n'
         '_pc_script="$(mktemp)"\n'
         f"cat <<'{delimiter}' > \"$_pc_script\"\n"
         f"{body}"
@@ -977,6 +979,7 @@ def _wrap_run_step(  # noqa: PLR0913
         f"python3 {recorder_expr} "
         f'--cast "$_pc_dir/step-{step_idx}.cast" '
         f'--video "$_pc_dir/step-{step_idx}.mp4" '
+        '--masks-file "$_pc_masks" '
         f'--video-on-failure -- {exec_argv} "$_pc_script" || _pc_rc=$?\n'
         'rm -f "$_pc_script"\n'
         'exit "$_pc_rc"\n'
@@ -1125,6 +1128,7 @@ def _prepare_metadata_step(
     script = (
         f'_pc_dir="${{RUNNER_TEMP:-/tmp}}/pit-crew-replay/{safe_job_id}"\n'
         'mkdir -p "$_pc_dir"\n'
+        f'rm -f "${{RUNNER_TEMP:-/tmp}}/pit-crew-masks/{safe_job_id}.masks"\n'
         f"python3 - \"$_pc_dir/{REPLAY_META_FILENAME}\" <<'__PIT_CREW_META_EOF__'\n"
         "import json, os, re, sys\n"
         "wf = os.environ.get('PIT_CREW_WORKFLOW', '')\n"

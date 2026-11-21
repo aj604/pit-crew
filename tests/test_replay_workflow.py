@@ -983,3 +983,93 @@ jobs:
     assert "wf=*** job=*** step=*** dyn=***" in cast_text
     assert "::add-mask::***" in cast_text
     assert "raw_gh=***" in cast_text
+
+
+def test_cross_step_add_mask_and_step_secret_env_stay_masked_in_later_step(tmp_path: Path) -> None:
+    wf_yaml = """\
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Step 1 exports mask and step secret
+        env:
+          EARLY_VALUE: ${{ secrets.EARLY_VALUE }}
+        run: |
+          echo "::add-mask::cross-step-masked-555"
+          printf '%s' "$EARLY_VALUE" > secret_file.txt
+      - name: Step 2 fails while printing earlier secrets
+        run: |
+          echo "dyn=cross-step-masked-555"
+          echo "early=$(cat secret_file.txt)"
+          exit 3
+"""
+    overlay = build_replay_overlay(".github/workflows/ci.yml", wf_yaml, {})
+    parsed = yaml.safe_load(overlay[".github/workflows/ci.yml"])
+    steps = parsed["jobs"]["test"]["steps"]
+    step1, step2, meta_step, upload_step = steps[2], steps[3], steps[-2], steps[-1]
+
+    # Step 2 inherits EARLY_VALUE in PIT_CREW_SECRET_ENV_VARS and passes --masks-file outside pit-crew-replay/.
+    assert step2["env"]["PIT_CREW_SECRET_ENV_VARS"] == "EARLY_VALUE"  # noqa: S105
+    assert "--masks-file" in step1["run"]
+    assert "--masks-file" in step2["run"]
+    assert "pit-crew-masks" not in str(upload_step["with"]["path"])
+
+    workspace = tmp_path / "ws"
+    runner_temp = tmp_path / "tmp"
+    runner_temp.mkdir()
+    script_file = workspace / RECORD_SCRIPT_PATH
+    script_file.parent.mkdir(parents=True)
+    script_file.write_text(overlay[RECORD_SCRIPT_PATH], encoding="utf-8")
+
+    sh_bin = shutil.which("sh") or "/bin/sh"
+    base_env = {
+        **os.environ,
+        "GITHUB_WORKSPACE": str(workspace),
+        "RUNNER_TEMP": str(runner_temp),
+        "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+    }
+    proc1 = subprocess.run(  # noqa: S603
+        [sh_bin, "-e", "-c", step1["run"]],
+        cwd=workspace,
+        env={**base_env, "EARLY_VALUE": "early-step-secret-888", "PIT_CREW_SECRET_ENV_VARS": "EARLY_VALUE"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc1.returncode == 0
+    masks_path = runner_temp / "pit-crew-masks" / "test.masks"
+    assert masks_path.is_file()
+    assert (masks_path.stat().st_mode & 0o777) == 0o600
+
+    # Step 2 does NOT have EARLY_VALUE in its environment, yet still scrubs both secrets from its .cast.
+    proc2 = subprocess.run(  # noqa: S603
+        [sh_bin, "-e", "-c", step2["run"]],
+        cwd=workspace,
+        env={**base_env, "PIT_CREW_SECRET_ENV_VARS": "EARLY_VALUE"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc2.returncode == 3
+    cast2 = (runner_temp / "pit-crew-replay" / "test" / "step-2.cast").read_text(encoding="utf-8")
+    assert "cross-step-masked-555" not in cast2
+    assert "early-step-secret-888" not in cast2
+    assert "dyn=***" in cast2
+    assert "early=***" in cast2
+
+    # Metadata step cleans up the temporary masks file on failure.
+    meta_proc = subprocess.run(  # noqa: S603
+        [sh_bin, "-e", "-c", meta_step["run"]],
+        cwd=workspace,
+        env={**base_env, "PIT_CREW_WORKFLOW": "CI", "PIT_CREW_JOB_ID": "test"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert meta_proc.returncode == 0
+    assert not masks_path.exists()

@@ -17,7 +17,6 @@ const MODALITY_LABELS = Object.freeze({
 });
 const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SAFE_MEDIA_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp4$/;
-const API_TOKEN_STORAGE_KEY = "pit_crew_api_token";
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const isNonNeg = (v) => isNum(v) && v >= 0;
@@ -86,16 +85,12 @@ export function isSafeVideoUrl(url) {
   return isSafeExternalUrl(trimmed);
 }
 
-/** Pure: resolve a playable replay MP4 URL, attaching an optional session token only on same-origin `/media/` paths. */
-export function resolveVideoUrl(rawUrl, token = "") {
+/** Pure: resolve a playable replay MP4 URL without embedding credentials in query parameters. */
+export function resolveVideoUrl(rawUrl) {
   if (!isSafeVideoUrl(rawUrl)) return null;
   const trimmed = rawUrl.trim();
-  const cleanToken = typeof token === "string" ? token.trim() : "";
-  if (trimmed.startsWith("/media/") && cleanToken) {
-    const [pathOnly, query = ""] = trimmed.split("?", 2);
-    const params = new URLSearchParams(query);
-    params.set("token", cleanToken);
-    return `${pathOnly}?${params.toString()}`;
+  if (trimmed.startsWith("/media/")) {
+    return trimmed.split(/[?#]/, 1)[0];
   }
   return trimmed;
 }
@@ -103,22 +98,10 @@ export function resolveVideoUrl(rawUrl, token = "") {
 function buildDownloadVideoUrl(videoUrl) {
   if (!videoUrl) return "";
   if (videoUrl.startsWith("/media/")) {
-    const [pathOnly, query = ""] = videoUrl.split("?", 2);
-    const params = new URLSearchParams(query);
-    params.set("download", "1");
-    return `${pathOnly}?${params.toString()}`;
+    const pathOnly = videoUrl.split(/[?#]/, 1)[0];
+    return `${pathOnly}?download=1`;
   }
   return videoUrl;
-}
-
-function readStoredApiToken(root) {
-  try {
-    const storage = root?.defaultView?.sessionStorage ?? globalThis.sessionStorage ?? null;
-    const raw = storage?.getItem?.(API_TOKEN_STORAGE_KEY);
-    return typeof raw === "string" ? raw.trim() : "";
-  } catch {
-    return "";
-  }
 }
 
 /** Pure: resolve a committed preview path or URL to a safe image URL for the Pit Wall UI. */
@@ -205,9 +188,8 @@ export function normalizeBugOutcome(outcome, context = null) {
       : "";
   const baselinePreviewUrl = resolvePreviewUrl(item.baseline_preview_url ?? item.baseline_preview_path ?? "", context);
   const candidatePreviewUrl = resolvePreviewUrl(item.candidate_preview_url ?? item.candidate_preview_path ?? "", context);
-  const apiToken = typeof context?.apiToken === "string" ? context.apiToken : "";
-  const baselineVideoUrl = resolveVideoUrl(item.baseline_video_url ?? "", apiToken);
-  const candidateVideoUrl = resolveVideoUrl(item.candidate_video_url ?? "", apiToken);
+  const baselineVideoUrl = resolveVideoUrl(item.baseline_video_url ?? "");
+  const candidateVideoUrl = resolveVideoUrl(item.candidate_video_url ?? "");
   const baselineArtifactUrls = safeUrlList(item.baseline_artifact_urls);
   const candidateArtifactUrls = safeUrlList(item.candidate_artifact_urls);
   return {
@@ -587,6 +569,8 @@ export function createTelemetryCenter(root, slot, store) {
   matrixPanel.append(matrixHeader, matrixHost);
   slot.replaceChildren(timingPanel, matrixPanel);
 
+  let lastMatrixSignature = null;
+
   const render = (state) => {
     const { candidateId, evidence, verdict } = resolveAttemptTelemetry(state);
     const candidates = Array.isArray(state?.records?.candidates) ? state.records.candidates : [];
@@ -596,7 +580,6 @@ export function createTelemetryCenter(root, slot, store) {
     const previewContext = {
       repo: state?.status?.repo || state?.repo || matchedCandidate?.repo || "",
       headSha: state?.selectedAttempt?.head_sha || matchedCandidate?.head_sha || "",
-      apiToken: readStoredApiToken(root),
     };
     const chart = buildTimingChartModel(evidence, verdict);
     const matrix = buildBugMatrixModel(evidence, previewContext);
@@ -614,23 +597,36 @@ export function createTelemetryCenter(root, slot, store) {
       chartHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
     }
 
+    const activeCandidateId = evidence?.candidate_id ?? candidateId ?? null;
     if (!matrix.hasEvidence) {
       matrixBadge.textContent = "Awaiting CI";
       matrixBadge.dataset.state = "pending";
       const msg = state?.mode === "demo" ? "Bug replay verification runs in the Fork CI stage." : "No bug replay outcomes recorded for this attempt yet.";
-      matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
+      const signature = JSON.stringify({ kind: "empty", candidateId: activeCandidateId, msg });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
+      }
     } else if (matrix.rows.length === 0) {
       matrixBadge.textContent = "0 bugs";
       matrixBadge.dataset.state = "pending";
-      matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", "No bug replay outcomes recorded."));
+      const signature = JSON.stringify({ kind: "zero", candidateId: activeCandidateId });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", "No bug replay outcomes recorded."));
+      }
     } else {
       matrixBadge.textContent =
         matrix.missed > 0 ? `${matrix.caught}/${matrix.total} CAUGHT \u00b7 ${matrix.missed} MISSED` : `${matrix.caught}/${matrix.total} CAUGHT`;
       matrixBadge.dataset.state = matrix.missed > 0 ? "missed" : "caught";
-      const children = [renderBugTable(root, matrix)];
-      const visualPanel = renderVisualProofPanel(root, matrix);
-      if (visualPanel) children.push(visualPanel);
-      matrixHost.replaceChildren(...children);
+      const signature = JSON.stringify({ kind: "rows", candidateId: activeCandidateId, rows: matrix.rows });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        const children = [renderBugTable(root, matrix)];
+        const visualPanel = renderVisualProofPanel(root, matrix);
+        if (visualPanel) children.push(visualPanel);
+        matrixHost.replaceChildren(...children);
+      }
     }
   };
 

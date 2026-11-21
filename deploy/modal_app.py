@@ -104,6 +104,7 @@ def web() -> Any:  # noqa: ANN401
             media_dir=media_dir,
             on_media_saved=_commit_media,
             public_base_url=public_base_url,
+            media_requires_auth=bool(api_token),
         )
         dispatcher = Dispatcher(
             ledger,

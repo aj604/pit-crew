@@ -237,6 +237,7 @@ class ProofPRConfig:
     base_branch: str = "main"
     repo: str = ""
     media_base_url: str = ""
+    media_requires_auth: bool = False
 
 
 @dataclass(frozen=True)
@@ -648,6 +649,7 @@ class ProofBridge:
         media_dir: Path | str | None = None,
         on_media_saved: Callable[[Path], None] | None = None,
         public_base_url: str = "",
+        media_requires_auth: bool = False,
     ) -> None:
         """Create a bridge using ``github``, optional ``run_lane``, ``ask``, and optional MP4 storage."""
         self._github = github
@@ -657,6 +659,7 @@ class ProofBridge:
         self._media_dir = Path(media_dir) if media_dir is not None else None
         self._on_media_saved = on_media_saved
         self._public_base_url = public_base_url.strip().rstrip("/")
+        self._media_requires_auth = bool(media_requires_auth)
 
     @property
     def media_dir(self) -> Path | None:
@@ -667,6 +670,11 @@ class ProofBridge:
     def public_base_url(self) -> str:
         """Return the configured public base URL for deployed MP4 links, if any."""
         return self._public_base_url
+
+    @property
+    def media_requires_auth(self) -> bool:
+        """Return True when deployed ``/media/*`` URLs require API authentication."""
+        return self._media_requires_auth
 
     def prepare_context(
         self,
@@ -961,6 +969,7 @@ class ProofBridge:
             card_url=card_url,
             preview_base_url=raw_base if valid_previews else "",
             media_base_url=effective.media_base_url or self._public_base_url,
+            media_requires_auth=effective.media_requires_auth or self._media_requires_auth,
         )
         title = _pr_title(candidate)
         url = self._github.open_pull_request(

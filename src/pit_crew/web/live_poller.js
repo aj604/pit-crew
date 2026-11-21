@@ -5,11 +5,25 @@ export const LIVE_POLL_ACTIVE_MS = 3000;
 export const LIVE_POLL_IDLE_MS = 15000;
 export const API_TOKEN_STORAGE_KEY = "pit_crew_api_token";
 
+const MEDIA_SESSION_REFRESH_MS = 45 * 60 * 1000;
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const RECORD_KEYS = Object.freeze(["hypotheses", "candidates", "replay_plans", "evidence", "verdicts"]);
 
 const isRepoSlug = (v) => typeof v === "string" && REPO_PATTERN.test(v.trim());
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+function recordsHaveLocalMedia(records) {
+  const evidenceList = Array.isArray(records?.evidence) ? records.evidence : [];
+  for (const ev of evidenceList) {
+    const outcomes = Array.isArray(ev?.bug_outcomes) ? ev.bug_outcomes : [];
+    for (const row of outcomes) {
+      const base = typeof row?.baseline_video_url === "string" ? row.baseline_video_url.trim() : "";
+      const cand = typeof row?.candidate_video_url === "string" ? row.candidate_video_url.trim() : "";
+      if (base.startsWith("/media/") || cand.startsWith("/media/")) return true;
+    }
+  }
+  return false;
+}
 
 /** Resolve an optional Bearer token from `?token=` (persisting to `sessionStorage`) or `sessionStorage`. */
 export function resolveApiToken(options = {}, root = null) {
@@ -111,7 +125,27 @@ export function createLivePoller(root, header, store, options = {}) {
 
   let destroyed = false, contextGen = 0, pollGen = 0, pollTimer = null, lastPollDelayMs = null;
   let activeController = null, triggerInFlight = false, assumedActive = false;
+  let mediaSessionToken = "", mediaSessionAt = 0;
   let prevMode = store.getState().mode, prevRepo = store.getState().repo;
+
+  const ensureMediaSession = async (token, signal) => {
+    if (!token || typeof fetchFn !== "function") return;
+    if (mediaSessionToken === token && Date.now() - mediaSessionAt < MEDIA_SESSION_REFRESH_MS) return;
+    try {
+      const response = await fetchFn("/api/media/session", {
+        method: "POST",
+        headers: withBearerHeader({}, token),
+        credentials: "same-origin",
+        ...(signal ? { signal } : {}),
+      });
+      if (response?.ok) {
+        mediaSessionToken = token;
+        mediaSessionAt = Date.now();
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+    }
+  };
 
   const isHidden = () => doc?.hidden === true;
   const canPoll = () => {
@@ -160,6 +194,11 @@ export function createLivePoller(root, header, store, options = {}) {
       if (!isPlainObject(status)) throw new Error("Invalid status response payload");
       if (!Array.isArray(attempts)) throw new Error("Invalid attempts response payload");
       if (!isValidRecordsPayload(records)) throw new Error("Invalid records response payload");
+      if (token && recordsHaveLocalMedia(records)) {
+        await ensureMediaSession(token, controller?.signal);
+        const afterSession = store.getState();
+        if (destroyed || ctx !== contextGen || pollToken !== pollGen || afterSession.mode !== "live" || afterSession.repo.trim() !== paths.repo) return false;
+      }
       if (activeController === controller) activeController = null;
       assumedActive = false;
       store.setLiveData({ status, attempts, records });

@@ -1,17 +1,19 @@
 """FastAPI HTTP server scaffold for Pit Crew."""
 
 import asyncio
+import hashlib
 import hmac
 import inspect
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, get_args
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -307,26 +309,66 @@ def _resolve_media_file(media_dir: Path | None, filename: str) -> Path:
     return resolved
 
 
+MEDIA_SESSION_COOKIE = "pit_crew_media_session"
+_MEDIA_SESSION_TTL_SECONDS = 3600
+
+
+def _sign_media_session(api_token: str, expires_at: int) -> str:
+    """Create an HMAC-SHA256 signed media session cookie value without embedding ``api_token``."""
+    digest = hmac.new(
+        api_token.encode("utf-8"),
+        f"media-session:{expires_at}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{expires_at}.{digest}"
+
+
+def _is_valid_media_session(cookie_value: str | None, api_token: str, *, now: float | None = None) -> bool:
+    """Return True when ``cookie_value`` carries a valid, unexpired signature for ``api_token``."""
+    if not cookie_value or "." not in cookie_value:
+        return False
+    exp_str, sep, _sig = cookie_value.partition(".")
+    if not sep or not exp_str.isdigit():
+        return False
+    expires_at = int(exp_str)
+    current = time.time() if now is None else now
+    if expires_at < current:
+        return False
+    expected = _sign_media_session(api_token, expires_at)
+    return hmac.compare_digest(cookie_value, expected)
+
+
+def _is_https_request(request: Request) -> bool:
+    """Return True when ``request`` arrived over HTTPS directly or via a reverse proxy."""
+    if request.url.scheme == "https":
+        return True
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    return forwarded == "https"
+
+
 def _make_media_token_dependency(
     api_token: str,
-) -> Callable[[HTTPAuthorizationCredentials | None, str | None], None]:
-    """Build a FastAPI dependency enforcing Bearer header or ``?token=`` query auth on ``/media/*``."""
+) -> Callable[[HTTPAuthorizationCredentials | None, Request], None]:
+    """Build a FastAPI dependency enforcing Bearer header or signed ``HttpOnly`` media cookie auth."""
 
     def _require_media_token(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
-        token: Annotated[str | None, Query()] = None,
+        request: Request,
     ) -> None:
-        provided = ""
-        if credentials is not None and credentials.scheme.lower() == "bearer" and credentials.credentials:
-            provided = credentials.credentials
-        elif token:
-            provided = token.strip()
-        if not provided or not hmac.compare_digest(provided, api_token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing or invalid bearer token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        if (
+            credentials is not None
+            and credentials.scheme.lower() == "bearer"
+            and credentials.credentials
+            and hmac.compare_digest(credentials.credentials, api_token)
+        ):
+            return
+        if _is_valid_media_session(request.cookies.get(MEDIA_SESSION_COOKIE), api_token):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     return _require_media_token
 
@@ -597,16 +639,52 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
         """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
-    _register_media_route(app, media_dir=resolved_media_dir, api_token=api_token)
+    _register_media_route(
+        app,
+        media_dir=resolved_media_dir,
+        api_token=api_token,
+        api_auth_dependencies=api_auth_dependencies,
+    )
     resolved_brand = brand_dir if brand_dir is not None else _resolve_default_brand_dir()
     _mount_pit_wall(app, brand_dir=resolved_brand, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app
 
 
-def _register_media_route(app: FastAPI, *, media_dir: Path | None, api_token: str | None) -> None:
-    """Register ``GET /media/{filename}`` for Range-streamed and downloadable MP4 replays."""
-    cache_control = "private, max-age=3600" if api_token is not None else "public, max-age=3600"
+def _register_media_route(
+    app: FastAPI,
+    *,
+    media_dir: Path | None,
+    api_token: str | None,
+    api_auth_dependencies: list[Any],
+) -> None:
+    """Register ``POST /api/media/session`` and ``GET /media/{filename}`` for Range-streamed MP4 replays."""
+    media_headers = (
+        {"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"}
+        if api_token is not None
+        else {"Cache-Control": "public, max-age=3600"}
+    )
     media_auth_deps = [Depends(_make_media_token_dependency(api_token))] if api_token is not None else []
+
+    @app.post(
+        "/api/media/session",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=api_auth_dependencies,
+    )
+    def create_media_session(request: Request) -> Response:
+        """Issue a scoped ``HttpOnly`` media session cookie after verifying Bearer authentication."""
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        if api_token is not None:
+            expires_at = int(time.time()) + _MEDIA_SESSION_TTL_SECONDS
+            response.set_cookie(
+                key=MEDIA_SESSION_COOKIE,
+                value=_sign_media_session(api_token, expires_at),
+                max_age=_MEDIA_SESSION_TTL_SECONDS,
+                path=MEDIA_URL_PREFIX,
+                httponly=True,
+                samesite="strict",
+                secure=_is_https_request(request),
+            )
+        return response
 
     @app.get(f"{MEDIA_URL_PREFIX}/{{filename}}", dependencies=media_auth_deps)
     def replay_media(
@@ -621,7 +699,7 @@ def _register_media_route(app: FastAPI, *, media_dir: Path | None, api_token: st
             media_type="video/mp4",
             filename=filename,
             content_disposition_type="attachment" if download else "inline",
-            headers={"Cache-Control": cache_control},
+            headers=media_headers,
         )
 
 

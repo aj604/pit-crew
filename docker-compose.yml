@@ -10,6 +10,7 @@ services:
         required: false
     environment:
       PIT_CREW_LEDGER_PATH: /data/ledger.db
+      PIT_CREW_MEDIA_DIR: /data/media
       PIT_CREW_BRAND_DIR: /app/brand
     volumes:
       - pit-crew-data:/data

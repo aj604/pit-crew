@@ -1560,6 +1560,7 @@ class Dispatcher:
         prev_progress = getattr(self._cycle_local, "on_progress", None)
         self._cycle_local.on_progress = on_progress
         self._set_verified_replays(())
+        self._cycle_local.last_pr_url = None
         try:
             pending = self._select_pending_candidate(repo)
             if pending is not None:
@@ -1706,6 +1707,7 @@ class Dispatcher:
                         base_branch=ctx.base_branch,
                         repo=ctx.work_repo,
                         media_base_url=str(getattr(self._proof_bridge, "public_base_url", "") or ""),
+                        media_requires_auth=bool(getattr(self._proof_bridge, "media_requires_auth", False)),
                     ),
                     preview_files=self._get_preview_files(),
                 )
@@ -1831,6 +1833,10 @@ class Dispatcher:
     ) -> list[Verdict]:
         """Run compounding optimization cycles for ``repo`` until the CI SLA is met or cycles are exhausted."""
         verdicts: list[Verdict] = []
+        last_replays: tuple[Any, ...] = ()
+        last_previews: tuple[tuple[str, bytes], ...] = ()
+        last_videos: tuple[str, ...] = ()
+        last_pr_url: str | None = None
         for _ in range(self.config.max_compounding_cycles):
             declined_before = len(self._declined_hypothesis_ids)
             verdict = self.run_cycle(repo, on_progress=on_progress)
@@ -1842,8 +1848,15 @@ class Dispatcher:
                     continue
                 break
             verdicts.append(verdict)
+            last_replays = self._get_verified_replays()
+            last_previews = self._get_preview_files()
+            last_videos = self.last_replay_videos
+            last_pr_url = self.last_opened_pr_url
             if verdict.keep and verdict.sla_met and self._verdict_matches_target_workflow(verdict):
                 break
+        if verdicts:
+            self._set_verified_replays(last_replays, last_previews, last_videos)
+            self._cycle_local.last_pr_url = last_pr_url
         return verdicts
 
 

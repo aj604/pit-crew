@@ -1202,6 +1202,27 @@ def test_proof_bridge_and_verifier_persist_mp4_and_link_in_kept_pr(tmp_path: Pat
     assert f"[baseline.mp4](https://pit-crew.example.test{replay.baseline_video_url})" in opened.body
     assert f"[candidate.mp4](https://pit-crew.example.test{replay.candidate_video_url})" in opened.body
 
+    # When /media/* requires API auth, kept PRs fall back to working GitHub run/artifact links instead of 401 URLs.
+    protected_bridge = ProofBridge(
+        github,
+        ask=ask,
+        media_dir=media_dir,
+        public_base_url="https://pit-crew.example.test/",
+        media_requires_auth=True,
+    )
+    assert protected_bridge.media_requires_auth is True
+    opened_protected = protected_bridge.open_kept_pr(
+        cand,
+        ev,
+        verdict,
+        verification.replays,
+        config=ProofPRConfig(auto_open_pr=True, repo=repo),
+    )
+    assert opened_protected is not None
+    assert "https://pit-crew.example.test/media/" not in opened_protected.body
+    assert "[baseline](https://github.com/acme/demo/actions/runs/101)" in opened_protected.body
+    assert "[candidate](https://github.com/acme/demo/actions/runs/102)" in opened_protected.body
+
     # Even if Gemini fails (unverified), persisted MP4 URLs are still kept on the Replay.
     bad_ask = partial(managed_agent.ask_multimodal, client=_FakeModelsClient(RuntimeError("gemini down")))
     unverified = bridge.verify_replay_runs(repo, [pair], ask=bad_ask)

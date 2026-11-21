@@ -1511,15 +1511,57 @@ def test_server_media_endpoint_streams_mp4_enforces_auth_and_blocks_traversal(tm
     assert detail["visual_proof"][0]["baseline_video_url"] == f"/media/{mp4_file.name}"
     assert detail["visual_proof"][0]["candidate_video_url"] == ""
 
-    # Token-protected server enforces Bearer header or ?token= query param on /media/*.
+
+def test_server_media_endpoint_enforces_bearer_or_signed_httponly_cookie_auth(tmp_path: Path) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41-stream-payload"
+    mp4_file = media_dir / "deadbee-101-baseline-a1b2c3d4e5f6.mp4"
+    mp4_file.write_bytes(mp4_bytes)
+    ledger = InMemoryLedger()
+
+    # Token-protected server rejects ?token= query auth and requires Bearer header or signed HttpOnly cookie.
     protected_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
     assert protected_client.get(f"/media/{mp4_file.name}").status_code == 401
-    assert protected_client.get(f"/media/{mp4_file.name}?token=wrong").status_code == 401
-    ok_query = protected_client.get(f"/media/{mp4_file.name}?token=tok-xyz")
-    assert ok_query.status_code == 200
-    assert "private" in ok_query.headers["cache-control"]
+    assert protected_client.get(f"/media/{mp4_file.name}?token=tok-xyz").status_code == 401
+    assert protected_client.post("/api/media/session").status_code == 401
+
     ok_header = protected_client.get(f"/media/{mp4_file.name}", headers={"Authorization": "Bearer tok-xyz"})
     assert ok_header.status_code == 200
+    assert ok_header.headers["cache-control"] == "private, no-store"
+    assert "Cookie" in ok_header.headers["vary"]
+
+    # POST /api/media/session exchanges Bearer token for a signed HttpOnly SameSite=Strict Path=/media cookie.
+    session_resp = protected_client.post(
+        "/api/media/session",
+        headers={"Authorization": "Bearer tok-xyz", "X-Forwarded-Proto": "https"},
+    )
+    assert session_resp.status_code == 204
+    set_cookie = session_resp.headers["set-cookie"]
+    assert "pit_crew_media_session=" in set_cookie
+    assert "tok-xyz" not in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=strict" in set_cookie or "SameSite=Strict" in set_cookie
+    assert "Path=/media" in set_cookie
+    assert "Secure" in set_cookie
+
+    cookie_val = session_resp.cookies["pit_crew_media_session"]
+    cookie_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    cookie_client.cookies.set("pit_crew_media_session", cookie_val, path="/media")
+    ok_cookie = cookie_client.get(f"/media/{mp4_file.name}")
+    assert ok_cookie.status_code == 200
+    assert ok_cookie.content == mp4_bytes
+    assert cookie_client.get(f"/media/{mp4_file.name}", headers={"Range": "bytes=0-11"}).status_code == 206
+    dl_cookie = cookie_client.get(f"/media/{mp4_file.name}?download=1")
+    assert dl_cookie.status_code == 200
+    assert dl_cookie.headers["content-disposition"].startswith("attachment;")
+
+    # Tampered or expired session cookies are rejected with 401.
+    bad_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    bad_client.cookies.set("pit_crew_media_session", "1.deadbeef", path="/media")
+    assert bad_client.get(f"/media/{mp4_file.name}").status_code == 401
+    bad_client.cookies.set("pit_crew_media_session", f"{cookie_val}tamper", path="/media")
+    assert bad_client.get(f"/media/{mp4_file.name}").status_code == 401
 
 
 _UI_VIDEO_PLAYBACK_SCRIPT = """
@@ -1528,6 +1570,7 @@ const makeNode = (tag, ns = null) => ({
   dataset: {}, attrs: {}, kids: [],
   setAttribute(k, v) { this.attrs[k] = String(v); },
   addEventListener() {},
+  removeEventListener() {},
   replaceChildren(...kids) { this.kids = kids; },
   append(...kids) { this.kids.push(...kids); },
   querySelectorAll() { return []; },
@@ -1540,21 +1583,23 @@ const walk = (n, pred, acc = []) => {
 };
 const tel = await import(process.argv[1]);
 const storeMod = await import(process.argv[2]);
+const liveMod = await import(process.argv[3]);
 const store = storeMod.createPitWallStore();
 const slot = makeNode("section");
 const root = {
   createElement: (t) => makeNode(t, null),
   createElementNS: (ns, t) => makeNode(t, ns),
+  getElementById: () => null,
   defaultView: { sessionStorage: { getItem: (k) => (k === "pit_crew_api_token" ? "tok-123" : null) } },
 };
 tel.createTelemetryCenter(root, slot, store);
-store.setMode("live");
-store.setRepo("acme/shop");
-store.setLiveData({
+const payload = {
   status: { repo: "acme/shop", active: false, base_sha: "head1111" },
   attempts: [{ candidate_id: "c1", head_sha: "head1111", rated: true }],
   records: {
+    hypotheses: [],
     candidates: [{ id: "c1", repo: "acme/shop", head_sha: "head1111" }],
+    replay_plans: [],
     evidence: [{
       candidate_id: "c1",
       baseline_seconds: [100, 95],
@@ -1574,14 +1619,67 @@ store.setLiveData({
     }],
     verdicts: [],
   },
-});
-const videos = walk(slot, (n) => n.tag === "video").map((n) => ({
+};
+store.setMode("live");
+store.setRepo("acme/shop");
+store.setLiveData(payload);
+const videoNodes1 = walk(slot, (n) => n.tag === "video");
+const videos = videoNodes1.map((n) => ({
   src: n.attrs.src, controls: "controls" in n.attrs, preload: n.attrs.preload,
 }));
 const downloads = walk(slot, (n) => n.tag === "a" && n.textContent === "Download MP4").map((n) => n.attrs.href);
+
+// Polling with identical data must NOT replace mounted <video> elements.
+store.setLiveData(JSON.parse(JSON.stringify(payload)));
+const videoNodes2 = walk(slot, (n) => n.tag === "video");
+const preservedVideoNodes =
+  videoNodes1.length === 2 &&
+  videoNodes1[0] === videoNodes2[0] &&
+  videoNodes1[1] === videoNodes2[1];
+
+// Updating the video URL must re-render the video player cleanly.
+const updatedPayload = JSON.parse(JSON.stringify(payload));
+updatedPayload.records.evidence[0].bug_outcomes[0].baseline_video_url = "/media/deadbee-2-baseline-f6e5d4c3b2a1.mp4";
+store.setLiveData(updatedPayload);
+const videoNodes3 = walk(slot, (n) => n.tag === "video");
+const updatedVideoSrc = videoNodes3[0]?.attrs?.src ?? null;
+const replacedOnChange = videoNodes3[0] !== videoNodes1[0];
+
+// Live poller exchanges Bearer token via POST /api/media/session once when records include /media/*.mp4.
+const pollStore = storeMod.createPitWallStore();
+pollStore.setMode("live");
+pollStore.setRepo("acme/shop");
+const sessionCalls = [];
+const fakeFetch = async (url, init = {}) => {
+  if (url === "/api/media/session") {
+    sessionCalls.push({ method: init.method, auth: init.headers?.Authorization, credentials: init.credentials });
+    return { ok: true, status: 204, json: async () => null };
+  }
+  if (url.endsWith("/status")) return { ok: true, status: 200, json: async () => payload.status };
+  if (url.endsWith("/attempts")) return { ok: true, status: 200, json: async () => payload.attempts };
+  return { ok: true, status: 200, json: async () => payload.records };
+};
+const fakeHeader = { setRunning() {}, repoInput: null, runButton: null };
+const fakeTimer = { setTimeout: () => 1, clearTimeout() {} };
+const poller = liveMod.createLivePoller(root, fakeHeader, pollStore, {
+  fetch: fakeFetch,
+  timer: fakeTimer,
+  doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+  search: "?repo=acme/shop&token=tok-123",
+  storage: { getItem: () => null, setItem() {} },
+});
+await new Promise((r) => setTimeout(r, 20));
+await poller.refresh();
+poller.destroy();
+
 console.log(JSON.stringify({
   videos,
   downloads,
+  preservedVideoNodes,
+  updatedVideoSrc,
+  replacedOnChange,
+  strippedQuery: tel.resolveVideoUrl("/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=leak"),
+  sessionCalls,
   safeVideoChecks: [
     tel.isSafeVideoUrl("/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4"),
     tel.isSafeVideoUrl("/media/../secret.mp4"),
@@ -1604,6 +1702,7 @@ def test_pit_wall_ui_renders_inline_mp4_video_players_and_download_links() -> No
             _UI_VIDEO_PLAYBACK_SCRIPT,
             (WEB_DIR / "telemetry.js").as_uri(),
             (WEB_DIR / "store.js").as_uri(),
+            (WEB_DIR / "live_poller.js").as_uri(),
         ],
         check=True,
         capture_output=True,
@@ -1614,7 +1713,7 @@ def test_pit_wall_ui_renders_inline_mp4_video_players_and_download_links() -> No
     assert out["safeVideoChecks"] == [True, False, False, False, True]
     assert out["videos"] == [
         {
-            "src": "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=tok-123",
+            "src": "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4",
             "controls": True,
             "preload": "metadata",
         },
@@ -1625,6 +1724,13 @@ def test_pit_wall_ui_renders_inline_mp4_video_players_and_download_links() -> No
         },
     ]
     assert out["downloads"] == [
-        "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=tok-123&download=1",
+        "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?download=1",
         "https://cdn.example.test/cand.mp4",
+    ]
+    assert out["strippedQuery"] == "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4"
+    assert out["preservedVideoNodes"] is True
+    assert out["replacedOnChange"] is True
+    assert out["updatedVideoSrc"] == "/media/deadbee-2-baseline-f6e5d4c3b2a1.mp4"
+    assert out["sessionCalls"] == [
+        {"method": "POST", "auth": "Bearer tok-123", "credentials": "same-origin"},
     ]

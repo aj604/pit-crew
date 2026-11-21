@@ -383,12 +383,14 @@ def _build_live_dispatcher(  # noqa: PLR0913
     stack.callback(adapter.close)
     resolved_media_dir = media_dir if media_dir is not None else default_media_dir(ledger.path)
     public_base_url = os.environ.get("PIT_CREW_PUBLIC_URL", "").strip()
+    media_requires_auth = bool(os.environ.get("PIT_CREW_API_TOKEN", "").strip())
     bridge = ProofBridge(
         adapter,
         run_lane=_bridge_lane_runner,
         ask=managed_agent.ask_multimodal,
         media_dir=resolved_media_dir,
         public_base_url=public_base_url,
+        media_requires_auth=media_requires_auth,
     )
     return Dispatcher(
         ledger,

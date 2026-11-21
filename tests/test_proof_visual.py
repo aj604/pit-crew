@@ -105,7 +105,7 @@ def test_record_scrubs_chunk_split_and_late_add_mask_secrets_from_cast(
     assert record.record([sys.executable, "-c", script], cast, echo) == 1
     _, *events = [json.loads(line) for line in cast.read_text(encoding="utf-8").splitlines()]
     recorded = "".join(text for _, kind, text in events if kind == "o")
-    for secret in ("env-tok-secret-999", "json-secret-888", "late-secret-777"):
+    for secret in ("env-tok-secret-999", "json-secret-888", "late-secret-777", "ret-777"):
         assert secret not in recorded
     assert "before=***" in recorded
     assert "split=***" in recorded
@@ -113,6 +113,43 @@ def test_record_scrubs_chunk_split_and_late_add_mask_secrets_from_cast(
     assert "::add-mask::***" in recorded
     # Raw output still echoed to stdout for GitHub Actions runner processing.
     assert b"::add-mask::late-secret-777" in echo.getvalue()
+
+
+def test_record_persists_masks_file_across_steps_with_private_permissions(tmp_path: Path) -> None:
+    masks_file = tmp_path / "masks" / "job.masks"
+    step1_cast = tmp_path / "step1.cast"
+    step2_cast = tmp_path / "step2.cast"
+    step1 = (
+        "import sys, time\n"
+        "sys.stdout.write('::add-mask::cross-step-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-42\\n'); sys.stdout.flush()\n"
+    )
+    step2 = "print('leaked=cross-step-secret-42'); raise SystemExit(2)"
+    assert record.record([sys.executable, "-c", step1], step1_cast, io.BytesIO(), masks_file=masks_file) == 0
+    assert masks_file.is_file()
+    assert (masks_file.stat().st_mode & 0o777) == 0o600
+    assert (masks_file.parent.stat().st_mode & 0o777) == 0o700
+
+    assert (
+        record.main(
+            [
+                "--cast",
+                str(step2_cast),
+                "--masks-file",
+                str(masks_file),
+                "--",
+                sys.executable,
+                "-c",
+                step2,
+            ]
+        )
+        == 2
+    )
+    _, *events = [json.loads(line) for line in step2_cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    assert "cross-step-secret-42" not in recorded
+    assert "leaked=***" in recorded
 
 
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
