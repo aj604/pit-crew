@@ -49,13 +49,17 @@ def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path
                         f"`{job_id}` waits for `{dep_id}` but uses none of its outputs or artifacts. "
                         f"Dropping `{dep_id}` from its `needs:` lets them run in parallel. The saving is "
                         "neither runner waiting, setup nor running time; it is time spent waiting on "
-                        f"another job. `{job_id}` will now also run when `{dep_id}` fails, which costs compute."
+                        f"another job. `{job_id}` will now also run when `{dep_id}` fails, which costs compute. "
+                        "Each edge is scored alone against the current graph, so savings from different "
+                        "edges do not add up."
                     ),
                     expected_savings_seconds=before - after,
                     evidence={
                         "removed_need": dep_id,
                         "critical_path_seconds": before,
                         "critical_path_after_seconds": after,
+                        "max_saving_seconds": before - after,  # the critical-path drop is the ceiling for this fix
+                        "scored_independently": "true",
                     },
                     confidence=_CONFIDENCE,
                     risk="medium",

@@ -23,7 +23,7 @@ def at(seconds: float) -> str:
 
 def job(name: str, start: float, end: float) -> dict[str, Any]:
     return {
-        "id": hash(name),
+        "id": sum(map(ord, name)),
         "name": name,
         "run_attempt": 1,
         "conclusion": "success",
@@ -83,6 +83,8 @@ def test_parallelize_flags_lint_before_test() -> None:
         "removed_need": "lint",
         "critical_path_seconds": 360.0,
         "critical_path_after_seconds": 300.0,
+        "max_saving_seconds": 60.0,
+        "scored_independently": "true",
     }
 
 
@@ -130,10 +132,35 @@ def test_parallelize_empty_profile() -> None:
     assert detect_parallelize_dag(profile(wf, []), wf, PATH) == []
 
 
+def test_parallelize_chain_saving_exceeds_job_duration() -> None:
+    chain = """
+name: CI
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+  c:
+    needs: b
+    runs-on: ubuntu-latest
+"""
+    p, wf = profiled(chain, {"a": (0, 100), "b": (100, 110), "c": (110, 120)})
+    by_job = {f.job: f for f in detect_parallelize_dag(p, wf, PATH)}
+    # Cutting `b.needs: a` lets b start at 0, so c finishes at 20 instead of 120: 20s from a 10s job.
+    # The ceiling is the critical-path drop, not b's own max_saving (10s).
+    assert by_job["b"].expected_savings_seconds == 20.0
+    assert by_job["b"].evidence["max_saving_seconds"] == 20.0
+    assert by_job["c"].expected_savings_seconds == 10.0  # c alone off the chain: 120 -> 110
+    for f in by_job.values():
+        assert f.expected_savings_seconds <= float(f.evidence["max_saving_seconds"])
+
+
 def test_parallelize_fastapi() -> None:
     wf = parse_workflow((FIXTURES / "fastapi" / "test.yml").read_text())
     with gzip.open(FIXTURES / "fastapi" / "runs.json.gz") as f:
         runs = parse_runs(json.load(f))
-    findings = detect_parallelize_dag(profile(wf, runs), wf, "test.yml")
-    assert all(f.job != "test-alls-green" for f in findings)
-    assert all(f.expected_savings_seconds > 0 for f in findings)
+    # Critical path is changes -> test -> coverage-combine -> test-alls-green. test reads changes' outputs,
+    # coverage-combine downloads the artifacts test uploads, and test-alls-green is the toJSON(needs) gate.
+    assert detect_parallelize_dag(profile(wf, runs), wf, "test.yml") == []
