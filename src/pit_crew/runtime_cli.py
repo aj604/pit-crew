@@ -303,7 +303,7 @@ def add_runtime_subcommands(commands: Any) -> None:  # noqa: ANN401
     )
     cycle.add_argument("--parallel-runs", type=int, default=10, help="max concurrent CI workflow runs (default: 10)")
     cycle.add_argument(
-        "--optimizer-fanout", type=int, default=3, help="Optimizer lanes run at once on top hypotheses (default: 3)"
+        "--optimizer-fanout", type=int, default=1, help="Optimizer lanes run at once on top hypotheses (default: 1)"
     )
     cycle.add_argument("--until-sla", action="store_true", help="compound cycles until the CI SLA is met")
     cycle.add_argument("--max-cycles", type=int, default=5, help="max compounding cycles for --until-sla (default: 5)")
