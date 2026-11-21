@@ -306,6 +306,26 @@ def test_matrix_shared_scalar_is_bounded_by_expanded_size() -> None:
     assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
 
 
+def _script_job(name: str, body: str, indent: int = 10) -> str:
+    pad = " " * indent
+    block = "".join(f"{pad}{line}\n" for line in body.splitlines())
+    return f"  {name}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n{block}"
+
+
+_REPORT_AFTER = "python - <<'EOF'\nfor t in tests:\n    run(t)\nreport()\nEOF"
+_REPORT_INSIDE = "python - <<'EOF'\nfor t in tests:\n    run(t)\n    report()\nEOF"
+
+
+def test_dedupe_ignores_scripts_that_differ_only_in_nested_indentation() -> None:
+    text = "jobs:\n" + _script_job("a", _REPORT_AFTER) + _script_job("b", _REPORT_INSIDE)
+    assert _findings(text) == 0
+
+
+def test_dedupe_flags_same_script_at_different_block_indents() -> None:
+    text = "jobs:\n" + _script_job("a", _REPORT_AFTER, 10) + _script_job("b", _REPORT_AFTER, 14)
+    assert _findings(text) == 1
+
+
 def _findings(text: str) -> int:
     p, wf = profiled(text, {"a": 100, "b": 200})
     return len(detect_dedupe_jobs(p, wf, PATH))

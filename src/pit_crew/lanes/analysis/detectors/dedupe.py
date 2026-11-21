@@ -11,8 +11,12 @@ Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...],
 
 
 def _script(run: str | None) -> str:
-    """The script with each line's leading and trailing whitespace stripped: YAML indentation is not shell meaning."""
-    return "\n".join(line.strip() for line in (run or "").strip().splitlines())
+    """The script exactly as written, minus whitespace around the whole text.
+
+    YAML already removes block-scalar indentation. Stripping each line would merge scripts whose indentation
+    matters (heredocs, Python) and could turn a trailing backslash-space into a line continuation.
+    """
+    return (run or "").strip()
 
 
 def _signature(job: JobSpec) -> Signature:
