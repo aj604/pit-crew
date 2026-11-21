@@ -8,12 +8,19 @@ from typing import Any
 
 import pytest
 
+from pit_crew.lanes.analysis import workflow as workflow_module
 from pit_crew.lanes.analysis.critical_path import profile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import _tokenize, match_step_name, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture
+def inner_bounds_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the whole-document bound so a test reaches the per-field bounds behind it."""
+    monkeypatch.setattr(workflow_module, "_require_bounded_document", lambda _doc: None)
 
 
 def make_finding(**overrides: Any) -> Finding:  # noqa: ANN401
@@ -322,6 +329,7 @@ def test_tokenizer_matches_the_regex_it_replaced() -> None:
         assert _tokenize(text) == (expression.split(text), expression.findall(text)), text
 
 
+@pytest.mark.usefixtures("inner_bounds_only")
 def test_job_body_with_shared_huge_scalar_reads_all_needs_quickly() -> None:
     big = "A" * 100_000
     refs = ", ".join(f"k{i}: *s" for i in range(2_000))
@@ -342,6 +350,7 @@ jobs:
     assert wf.jobs["c"].needs_refs == frozenset({"a", "b"})
 
 
+@pytest.mark.usefixtures("inner_bounds_only")
 def test_step_run_list_of_shared_huge_scalar_is_ignored_quickly() -> None:
     big = "A" * 100_000
     refs = ", ".join(["*s"] * 5_000)
@@ -359,6 +368,7 @@ jobs:
     assert wf.jobs["c"].steps[0].name == "Run"
 
 
+@pytest.mark.usefixtures("inner_bounds_only")
 def test_step_with_container_value_becomes_placeholder_quickly() -> None:
     big = "A" * 100_000
     refs = ", ".join(["*s"] * 5_000)

@@ -15,10 +15,21 @@ import yaml
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _MAX_EXPANSIONS = 1000
+_MAX_DOCUMENT_BYTES = 8_000_000  # the whole document with every alias expanded; beyond it the workflow is refused
+_MAX_DOCUMENT_NODES = 500_000  # node visits; a cyclic alias would otherwise walk until the byte limit
+_MAX_RUNS_ON_ITEMS = 64
+_MAX_RUNS_ON_CHARS = 4096
+_MAX_STEP_NAME_CHARS = 1024
+_MAX_NEEDS_NAMES = 10
+_MAX_NEEDS_NAME_CHARS = 100
 # GitHub expressions are case-insensitive and allow spaces around the dot. Group 1 is the named job, if any;
 # every other use of the word (`needs[...]`, `needs.*`, `format('{0}', needs)`, bare `needs`) is the whole context.
 _NEEDS_USE = re.compile(r"\bneeds\b(?:\s*\.\s*([A-Za-z0-9_-]+))?", re.IGNORECASE)
 _STATUS_FUNCTION = re.compile(r"\b(success|failure|always|cancelled)\s*\(", re.IGNORECASE)
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
 
 
 def _tokenize(text: str) -> tuple[list[str], list[str]]:
@@ -131,9 +142,17 @@ class Workflow:
         return None
 
 
+def _require_bounded_document(doc: object) -> None:
+    """Refuse a document whose aliases expand it past the analysis limit (or that is cyclic): not analysing is safe."""
+    if not _expanded_size_within(doc, _MAX_DOCUMENT_BYTES, _MAX_DOCUMENT_NODES):
+        msg = "workflow expands beyond the analysis limit (aliases multiply its size), so it will not be analysed"
+        raise ValueError(msg)
+
+
 def parse_workflow(text: str) -> Workflow:
-    """Parse workflow YAML. Raises ValueError when a job needs a job that does not exist."""
+    """Parse workflow YAML. Raises ValueError when a job needs a job that does not exist or the YAML expands too far."""
     doc = yaml.safe_load(text) or {}
+    _require_bounded_document(doc)
     jobs = {}
     for job_id, raw_body in (doc.get("jobs") or {}).items():
         body = raw_body or {}
@@ -162,7 +181,9 @@ def parse_workflow(text: str) -> Workflow:
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
         if unknown:
-            msg = f"job {job.id!r} needs unknown job(s) {unknown}"
+            shown = [_clip(str(n), _MAX_NEEDS_NAME_CHARS) for n in unknown[:_MAX_NEEDS_NAMES]]
+            more = f" and {len(unknown) - len(shown)} more" if len(unknown) > len(shown) else ""
+            msg = f"job {_clip(str(job.id), _MAX_NEEDS_NAME_CHARS)!r} needs unknown job(s) {shown}{more}"
             raise ValueError(msg)
     return Workflow(name=_text(doc.get("name")) or "", jobs=jobs)
 
@@ -196,11 +217,11 @@ def _with_value(value: object) -> str:
 
 def _step_name(item: dict[str, Any]) -> str:
     if name := _text(item.get("name")):
-        return name
+        return _clip(name, _MAX_STEP_NAME_CHARS)
     if uses := _text(item.get("uses")):
-        return f"Run {uses}"
+        return _clip(f"Run {_clip(uses, _MAX_STEP_NAME_CHARS)}", _MAX_STEP_NAME_CHARS)
     lines = (_text(item.get("run")) or "").strip().splitlines()
-    return f"Run {lines[0].strip()}" if lines else "Run"
+    return _clip(f"Run {lines[0].strip()}", _MAX_STEP_NAME_CHARS) if lines else "Run"
 
 
 def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
@@ -230,7 +251,8 @@ def _runs_on(raw: object) -> str:
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):
-        return ", ".join(r for r in raw if isinstance(r, str))
+        names = (r for r in raw if isinstance(r, str))
+        return _clip(", ".join(itertools.islice(names, _MAX_RUNS_ON_ITEMS)), _MAX_RUNS_ON_CHARS)
     return ""
 
 
@@ -270,19 +292,21 @@ _SCALAR_TYPES = (str, int, float, bool, type(None), date, datetime, bytes)
 _CONTAINERS = (list, tuple, set, frozenset)  # built once: a union made inside the walk's loop slowed it under coverage
 
 
-def _expanded_size_within(obj: object, limit: int) -> bool:
+def _expanded_size_within(obj: object, limit: int, max_visits: int | None = None) -> bool:
     """Whether `obj`, with every shared reference expanded, serializes to at most about `limit` characters.
 
     YAML aliases to scalars are written out in full on every use, so counting distinct nodes is not enough.
-    Shared nodes are visited each time they are referenced; the visit count is capped too, which bounds cycles.
+    Shared nodes are visited each time they are referenced; the visit count is capped too (at `max_visits`,
+    default `limit`), which bounds cycles.
     """
     total = 0
     visits = 0
+    max_visits = limit if max_visits is None else max_visits
     stack = [obj]
     while stack:
         node = stack.pop()
         visits += 1
-        if visits > limit:
+        if visits > max_visits:
             return False
         if isinstance(node, dict):
             total += _ENTRY_COST * len(node)

@@ -6,15 +6,23 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from pit_crew.lanes.analysis import workflow as workflow_module
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.detectors.dedupe import detect_dedupe_jobs
 from pit_crew.lanes.analysis.history import parse_runs
-from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, Workflow, parse_workflow
+from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, Workflow, _canonical, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PATH = ".github/workflows/ci.yml"
 T0 = datetime(2026, 11, 1, tzinfo=UTC)
+
+
+@pytest.fixture
+def inner_bounds_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the whole-document bound so a test reaches the per-field bounds behind it."""
+    monkeypatch.setattr(workflow_module, "_require_bounded_document", lambda _doc: None)
 
 
 def at(seconds: float) -> str:
@@ -276,6 +284,7 @@ def _laughs(levels: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+@pytest.mark.usefixtures("inner_bounds_only")
 def test_matrix_billion_laughs_is_cheap_and_bounded() -> None:
     start = time.perf_counter()
     wf = parse_workflow(_pair(_laughs(9), ""))
@@ -298,6 +307,7 @@ def test_matrix_definition_ignores_key_order() -> None:
     assert one.jobs["a"].matrix_definition == two.jobs["a"].matrix_definition != ""
 
 
+@pytest.mark.usefixtures("inner_bounds_only")
 def test_matrix_shared_scalar_is_bounded_by_expanded_size() -> None:
     big = "A" * 100_000
     refs = ", ".join(["*s"] * 2_000)
@@ -396,8 +406,15 @@ def test_job_level_if_is_kept_as_text() -> None:
     assert wf.jobs["b"].if_ is None
 
 
-def test_matrix_recursive_anchor_does_not_hang() -> None:
+def test_recursive_anchor_is_refused_without_hanging() -> None:
     start = time.perf_counter()
-    wf = parse_workflow(_pair("    strategy:\n      matrix:\n        a: &r [*r]\n", ""))
+    with pytest.raises(ValueError, match="expands beyond"):
+        parse_workflow(_pair("    strategy:\n      matrix:\n        a: &r [*r]\n", ""))
     assert time.perf_counter() - start < 0.5
-    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
+
+
+def test_matrix_recursive_anchor_does_not_hang() -> None:
+    cyclic = yaml.safe_load("a: &r [*r]")
+    start = time.perf_counter()
+    assert _canonical(cyclic) == MATRIX_TOO_LARGE
+    assert time.perf_counter() - start < 0.5
