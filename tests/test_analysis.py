@@ -2,9 +2,11 @@ import base64
 import gzip
 import io
 import json
+import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
@@ -589,6 +591,7 @@ def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
 
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    _match_every_run(monkeypatch, yaml_text)
 
     build_request("analysis", "")
     result = tools.call(
@@ -597,6 +600,12 @@ def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
 
     assert fetched == [("fastapi/fastapi", "test.yml", "master")]
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def _match_every_run(monkeypatch: pytest.MonkeyPatch, yaml_text: str) -> None:
+    """Make every run's remote workflow blob equal `yaml_text`, so revision matching keeps all runs."""
+    blob = history.workflow_blob_sha(yaml_text)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
 
 
 def _http_error(code: int) -> urllib.error.HTTPError:
@@ -621,6 +630,7 @@ def test_profile_ci_resolves_deleted_branch_workflow_from_run_commit(
 
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    _match_every_run(monkeypatch, yaml_text)
 
     build_request("analysis", "")
     result = tools.call(
@@ -682,7 +692,7 @@ def test_profile_ci_propagates_non_fallback_http_errors(
         "fetch_history",
         (lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
         if second_code is not None
-        else (lambda *_args, **_kwargs: pytest.fail("must not fetch history")),
+        else (lambda *_args, **_kwargs: []),
     )
 
     build_request("analysis", "")

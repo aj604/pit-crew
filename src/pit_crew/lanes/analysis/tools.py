@@ -6,6 +6,7 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 
 import math
 import re
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -181,7 +182,10 @@ def _profile_workflow(
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    _validate_workflow_name(workflow)
+    if workflow_content is None:
+        workflow_path(workflow)  # reject a bad workflow name before any network call
+    else:
+        _validate_workflow_name(workflow)
     raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
     text = _load_workflow_text(repo, workflow, branch, raw, workflow_content=workflow_content, ref=ref)
     spec = parse_workflow(text)

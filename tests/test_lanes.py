@@ -357,6 +357,8 @@ def test_run_lane_profiles_ci_from_remote_repo_without_local_checkout(
 
     monkeypatch.setattr(history, "_http_getter", fake_getter)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw_runs)
+    blob = history.workflow_blob_sha(workflow_yaml)  # every run used this exact file
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
 
     fake_client = _FakeClient(
         responses=[
