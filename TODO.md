@@ -29,10 +29,11 @@ See [docs/architecture.md](docs/architecture.md) for system design and [docs/lan
 
 - [x] Add GitHub Actions run/job/step history fetcher + parser (with offline JSON fixtures under `tests/fixtures/`).
 - [x] Implement critical-path calculation across workflow job DAGs (`needs:`) rather than raw sum of job durations.
-- [ ] Detect core bottleneck classes: cache misses, unsharded slow test suites, serial jobs that can parallelize, redundant jobs, and flaky retries.
+- [x] Detect core bottleneck classes: cache misses, unsharded slow test suites, serial jobs that can parallelize, and redundant jobs.
+- [ ] Detect flaky retries (`retried_runs` is profiled but no detector or skill acts on it yet).
 - [x] Align `Hypothesis.skill` vocabulary with Optimizer's playbook names via `contracts.PLAYBOOK_SKILLS` (`dep-cache`, `parallelize-dag`, `shard-by-timing`, `dedupe-jobs`, `affected-tests`).
 - [x] Prevent duplicate hypotheses for bottlenecks already open or recently rejected in the ledger.
-- [ ] Expand `SKILL.md` with clear ranking criteria (highest wall-clock savings first) and evidence formatting.
+- [x] Expand `SKILL.md` with clear ranking criteria (highest wall-clock savings first) and evidence formatting.
 
 **Deliverables:**
 - Tested analysis tools in `src/pit_crew/lanes/analysis/tools.py` + realistic multi-run workflow fixtures.

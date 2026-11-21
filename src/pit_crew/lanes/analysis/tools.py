@@ -13,9 +13,10 @@ from typing import Any
 from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Hypothesis
 from pit_crew.lanes.analysis import history
-from pit_crew.lanes.analysis.critical_path import profile
+from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.dedupe_ledger import DuplicateHypothesisError, hypothesis_key, recorded_keys
-from pit_crew.lanes.analysis.workflow import parse_workflow
+from pit_crew.lanes.analysis.detectors import DETECTORS
+from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
@@ -153,6 +154,19 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
     wall-clock time any change to that job can save. Jobs with max_saving_seconds of 0 are off
     the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
+    return _profile_workflow(repo, workflow, runs, branch, workflow_content=workflow_content, ref=ref)[0].to_dict()
+
+
+def _profile_workflow(
+    repo: str,
+    workflow: str,
+    runs: int,
+    branch: str | None,
+    *,
+    workflow_content: str | None = None,
+    ref: str | None = None,
+) -> tuple[CIProfile, Workflow]:
+    """Validate the arguments, read the workflow file and its run history, and profile it."""
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
@@ -164,7 +178,71 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
         workflow_content=workflow_content,
         ref=ref,
     )
-    return profile(parse_workflow(yaml_text), history.parse_runs(raw)).to_dict()
+    spec = parse_workflow(yaml_text)
+    return profile(spec, history.parse_runs(raw)), spec
+
+
+def _uncovered(ci: CIProfile) -> list[str]:
+    """Plain-language notes on time no playbook skill can shrink."""
+    notes: list[str] = []
+    if "waiting" in {ci.biggest_bucket, ci.biggest_bucket_p95}:
+        notes.append(
+            "The critical path's biggest bucket is waiting for a runner "
+            f"(p50: {ci.biggest_bucket}, p95: {ci.biggest_bucket_p95}): no playbook skill shrinks runner queueing. "
+            "Report it; runner choice and cancelling superseded runs are outside the playbook."
+        )
+    return notes
+
+
+@tool(
+    lane="analysis",
+    parameters={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "owner/name whose Actions history to read"},
+            "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
+            "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
+            "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
+        },
+        "required": ["repo", "workflow"],
+    },
+)
+def find_bottlenecks(
+    ledger: Ledger,
+    repo: str,
+    workflow: str,
+    runs: int = history.DEFAULT_RUNS,
+    branch: str | None = None,
+) -> dict[str, Any]:
+    """Profile one workflow, run every bottleneck detector, and rank what is left.
+
+    Returns profile_summary (wall-clock p50/p95, the critical path and its waiting/setup/running
+    split), findings (each ready to pass to record_hypothesis; biggest expected_savings_seconds
+    first; bottlenecks already in the ledger are left out) and uncovered (time no playbook skill
+    can shrink, such as runner queueing: report these).
+    """
+    ci, spec = _profile_workflow(repo, workflow, runs, branch)
+    path = f".github/workflows/{workflow}"
+    seen = recorded_keys(ledger, repo)
+    found = [f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen]
+    found.sort(key=lambda f: f.expected_savings_seconds, reverse=True)
+    summary = ci.to_dict()
+    return {
+        "profile_summary": {
+            key: summary[key]
+            for key in (
+                "runs_analyzed",
+                "wall_clock_median_seconds",
+                "wall_clock_p95_seconds",
+                "critical_path",
+                "critical_path_buckets",
+                "biggest_bucket",
+                "biggest_bucket_p95",
+            )
+        },
+        "findings": [f.to_dict() for f in found],
+        "uncovered": _uncovered(ci),
+    }
 
 
 class InvalidRecordError(ValueError):
