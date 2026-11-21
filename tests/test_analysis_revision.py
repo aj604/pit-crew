@@ -3,9 +3,11 @@
 import io
 import json
 import urllib.error
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -42,7 +44,7 @@ def make_run(run_id: int, head_sha: str, day: int, checks_seconds: float) -> dic
     return {
         "id": run_id,
         "path": ".github/workflows/ci.yml",
-        "event": "pull_request",
+        "event": "push",
         "head_branch": "main",
         "head_sha": head_sha,
         "conclusion": "success",
@@ -196,3 +198,165 @@ def test_a_run_whose_file_is_missing_at_its_commit_is_excluded(monkeypatch: pyte
 
     assert result["runs_analyzed"] == 1
     assert result["runs_excluded_revision"] == 1
+
+
+def with_event(run: dict[str, Any], event: str) -> dict[str, Any]:
+    return {**run, "event": event}
+
+
+@pytest.mark.usefixtures("checkout")
+def test_only_runs_that_execute_the_workflow_at_head_sha_are_profiled(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [
+        make_run(1, MATCH_NEW, 1, 100),
+        with_event(make_run(2, OTHER_NEWEST, 2, 200), "pull_request"),
+        make_run(3, MATCH_OLD, 3, 110),
+        with_event(make_run(4, GONE, 4, 200), "pull_request_target"),
+    ]
+    asked: list[str] = []
+
+    def blobs(_repo: str, _path: str, refs: Iterable[str], **_k: object) -> dict[str, str | None]:
+        asked.extend(refs)
+        return dict.fromkeys(refs, local)
+
+    monkeypatch.setattr(history, "fetch_history", lambda *_a, **_k: raw)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", blobs)
+
+    ci = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+    found = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert ci["runs_analyzed"] == 2
+    assert ci["runs_excluded_event"] == 2
+    assert ci["runs_excluded_revision"] == 0
+    assert found["profile_summary"]["runs_excluded_event"] == 2
+    assert set(asked) == {MATCH_NEW, MATCH_OLD}  # no blob fetch for the pull-request runs
+    assert found["profile_summary"]["base_sha"] == MATCH_OLD  # newest trusted run (day 3), not the newer PR run
+    assert found["uncovered"] == []  # a mix of trusted and pull-request runs is analysed normally
+
+
+@pytest.mark.usefixtures("checkout")
+def test_only_pull_request_runs_gives_no_findings_and_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [with_event(make_run(i, MATCH_NEW, i, 100), "pull_request") for i in range(1, 4)]
+    monkeypatch.setattr(history, "fetch_history", lambda *_a, **_k: raw)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda *_a, **_k: pytest.fail("must not fetch"))
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["runs_analyzed"] == 0
+    assert result["profile_summary"]["runs_excluded_event"] == 3
+    assert len(result["uncovered"]) == 1
+    assert "No push, workflow_dispatch, schedule or merge_group runs were found" in result["uncovered"][0]
+    assert "Pull-request and other runs" in result["uncovered"][0]
+    assert "branch=<default>" in result["uncovered"][0]
+
+
+@pytest.mark.usefixtures("checkout")
+@pytest.mark.parametrize("event", ["pull_request", "pull_request_target", "repository_dispatch", "", "made_up"])
+def test_other_and_unknown_events_are_excluded(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [make_run(1, MATCH_NEW, 1, 100), with_event(make_run(2, MATCH_OLD, 2, 100), event)]
+    patch_history(monkeypatch, raw, {MATCH_NEW: local, MATCH_OLD: local})
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["runs_analyzed"] == 1
+    assert result["runs_excluded_event"] == 1
+
+
+@pytest.mark.usefixtures("checkout")
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule", "merge_group"])
+def test_events_that_execute_the_workflow_at_head_sha_are_trusted(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    patch_history(monkeypatch, [with_event(make_run(1, MATCH_NEW, 1, 100), event)], {MATCH_NEW: local})
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["runs_analyzed"] == 1
+    assert result["runs_excluded_event"] == 0
+
+
+@pytest.mark.usefixtures("checkout")
+def test_empty_history_gives_the_trusted_runs_note_and_no_revision_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_history(monkeypatch, [], {})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["base_sha"] == ""
+    assert result["profile_summary"]["runs_excluded_event"] == 0
+    assert result["profile_summary"]["runs_excluded_revision"] == 0
+    assert "No push, workflow_dispatch, schedule or merge_group runs were found" in result["uncovered"][0]
+
+
+@pytest.mark.usefixtures("checkout")
+def test_event_exclusion_alongside_a_revision_mismatch_gives_only_the_revision_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every trusted run is of another revision, and the rest are pull-request runs: the trusted runs
+    # are what matter, so the note is the revision one, not a contradictory "only pull-request runs".
+    other = history.workflow_blob_sha(OTHER)
+    raw = [
+        make_run(1, OTHER_NEWEST, 1, 200),
+        with_event(make_run(2, MATCH_NEW, 2, 100), "pull_request"),
+    ]
+    patch_history(monkeypatch, raw, {OTHER_NEWEST: other})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["runs_excluded_event"] == 1
+    assert result["profile_summary"]["runs_excluded_revision"] == 1
+    assert len(result["uncovered"]) == 1
+    assert "exact workflow file" in result["uncovered"][0]
+    assert "pull-request" not in result["uncovered"][0]
+
+
+@pytest.mark.usefixtures("checkout")
+def test_the_window_is_filled_per_trusted_event_so_pull_request_runs_cannot_crowd_it_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    by_event = {
+        "pull_request": [with_event(make_run(100 + i, OTHER_NEWEST, 10 + i, 200), "pull_request") for i in range(9)],
+        "push": [make_run(2, MATCH_NEW, 5, 100), make_run(1, MATCH_OLD, 1, 110)],
+        "schedule": [with_event(make_run(i, MATCH_OLD, 3, 105), "schedule") for i in (3, 4)],
+    }
+    every = {r["id"]: r for runs in by_event.values() for r in runs}
+    run_requests: list[tuple[str, int]] = []
+    jobs_requested: list[int] = []
+
+    def get(url: str) -> tuple[Any, str | None]:
+        if "/jobs" in url:
+            run_id = int(url.split("/runs/")[1].split("/", maxsplit=1)[0])
+            jobs_requested.append(run_id)
+            return {"jobs": every[run_id]["jobs"]}, None
+        query = parse_qs(urlparse(url).query)
+        event, per_page = query["event"][0], int(query["per_page"][0])
+        run_requests.append((event, per_page))
+        page = [{k: v for k, v in r.items() if k != "jobs"} for r in by_event.get(event, [])[:per_page]]
+        return {"workflow_runs": page}, None
+
+    real_fetch = history.fetch_history
+    monkeypatch.setattr(history, "fetch_history", lambda *a, **k: real_fetch(*a, **k, get=get))
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, local))
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 3})
+
+    # Push first, then each call asks only for what is missing; pull_request is never requested.
+    assert run_requests == [("push", 3), ("merge_group", 1), ("workflow_dispatch", 1), ("schedule", 1)]
+    assert sorted(jobs_requested) == [1, 2, 3]  # jobs only for the three kept runs
+    assert result["runs_analyzed"] == 3
+    assert result["runs_excluded_event"] == 0
+
+
+@pytest.mark.usefixtures("checkout")
+def test_runs_returned_by_more_than_one_event_call_are_counted_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [make_run(2, MATCH_NEW, 2, 100), make_run(1, MATCH_OLD, 1, 110)]
+    patch_history(monkeypatch, raw, {MATCH_NEW: local, MATCH_OLD: local})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["profile_summary"]["runs_analyzed"] == 2  # the same fake answers every event call
+    assert result["profile_summary"]["base_sha"] == MATCH_NEW
