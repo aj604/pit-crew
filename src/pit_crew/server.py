@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI, HTTPException, status
 
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.webhooks import create_github_webhook_router
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,8 @@ def create_app(
         """Return service health and active ledger backend."""
         ledger_kind = "sqlite" if isinstance(ledger, SqliteLedger) else "memory"
         return {"status": "ok", "ledger": ledger_kind}
+
+    app.include_router(create_github_webhook_router(webhook_secret=webhook_secret))
 
     @app.post("/triggers/cycle", status_code=status.HTTP_202_ACCEPTED)
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
