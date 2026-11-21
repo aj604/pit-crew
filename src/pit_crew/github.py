@@ -8,9 +8,10 @@ developed and tested completely offline without network calls or secrets.
 """
 
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
 from urllib.parse import quote
@@ -19,10 +20,35 @@ import httpx
 
 DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_DISPATCH_POLL_ATTEMPTS = 10
+DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS = 1.0
 API_VERSION = "2022-11-28"
 USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class DispatchPollConfig:
+    """Polling configuration for ``dispatch_workflow`` run-ID fallback lookups."""
+
+    attempts: int = DEFAULT_DISPATCH_POLL_ATTEMPTS
+    interval_seconds: float = DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], datetime] = _utc_now
+
+    def __post_init__(self) -> None:
+        """Validate polling bounds."""
+        if self.attempts < 1:
+            msg = "Dispatch poll attempts must be at least 1."
+            raise ValueError(msg)
+        if self.interval_seconds < 0:
+            msg = "Dispatch poll interval_seconds must be non-negative."
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -89,7 +115,7 @@ class GitHubClient(Protocol):
 class HttpxGitHubClient:
     """Concrete ``GitHubClient`` using ``httpx`` and host-side bearer credentials."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         token: str | None = None,
         *,
@@ -97,6 +123,7 @@ class HttpxGitHubClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         transport: httpx.BaseTransport | None = None,
         client: httpx.Client | None = None,
+        dispatch_poll: DispatchPollConfig | None = None,
     ) -> None:
         """Initialize the client with an explicit token or ``GITHUB_TOKEN`` from the host environment.
 
@@ -106,6 +133,7 @@ class HttpxGitHubClient:
             timeout: Request timeout in seconds when creating an internal ``httpx.Client``.
             transport: Optional custom ``httpx`` transport (e.g. ``httpx.MockTransport`` for tests).
             client: Optional pre-built ``httpx.Client`` managed by the caller.
+            dispatch_poll: Optional polling configuration for ``dispatch_workflow`` fallback lookups.
 
         Raises:
             ValueError: If no token is available, ``base_url`` is empty, or both ``client`` and
@@ -120,7 +148,7 @@ class HttpxGitHubClient:
             msg = "GitHub token is required; pass 'token' or set GITHUB_TOKEN."
             raise ValueError(msg)
 
-        normalized_base_url = base_url.rstrip("/")
+        normalized_base_url = base_url.strip().rstrip("/")
         if not normalized_base_url:
             msg = "GitHub API base_url must not be empty."
             raise ValueError(msg)
@@ -141,6 +169,8 @@ class HttpxGitHubClient:
                 transport=transport,
             )
         )
+        self._dispatch_poll = dispatch_poll if dispatch_poll is not None else DispatchPollConfig()
+        self._seen_dispatch_run_ids: dict[str, set[int]] = {}
 
     def close(self) -> None:
         """Close the underlying ``httpx.Client`` when owned by this instance."""
@@ -227,7 +257,8 @@ class HttpxGitHubClient:
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
         """Trigger ``workflow_dispatch`` for ``workflow`` on ``ref`` and return the ``run_id``."""
         repo_path = _repo_path(repo)
-        workflow_path = quote(workflow, safe="")
+        workflow_path = _workflow_path(workflow)
+        cutoff = _to_utc(self._dispatch_poll.clock()).replace(microsecond=0)
         response = self._request(
             "POST",
             f"/repos/{repo_path}/actions/workflows/{workflow_path}/dispatches",
@@ -236,22 +267,48 @@ class HttpxGitHubClient:
         if response.status_code != _HTTP_NO_CONTENT and response.content:
             dispatch_data = _decode_json_object(response)
             if "workflow_run_id" in dispatch_data:
-                return _require_int(dispatch_data, "workflow_run_id")
+                run_id = _require_int(dispatch_data, "workflow_run_id")
+                self._seen_dispatch_run_ids.setdefault(repo_path, set()).add(run_id)
+                return run_id
 
-        runs_data = self._request_json(
-            "GET",
-            f"/repos/{repo_path}/actions/workflows/{workflow_path}/runs",
-            params={
-                "branch": ref,
-                "event": "workflow_dispatch",
-                "per_page": str(_DISPATCH_RUN_LOOKUP_LIMIT),
-            },
+        polled_run_id = self._poll_dispatched_run_id(
+            repo_path=repo_path,
+            workflow_path=workflow_path,
+            branch=ref.removeprefix("refs/heads/"),
+            cutoff=cutoff,
         )
-        runs = runs_data.get("workflow_runs")
-        if not isinstance(runs, list) or not runs or not isinstance(runs[0], dict):
+        if polled_run_id is None:
             msg = f"No workflow_dispatch run found for {repo!r} workflow {workflow!r} on ref {ref!r}."
             raise RuntimeError(msg)
-        return _require_int(runs[0], "id")
+        return polled_run_id
+
+    def _poll_dispatched_run_id(
+        self,
+        *,
+        repo_path: str,
+        workflow_path: str,
+        branch: str,
+        cutoff: datetime,
+    ) -> int | None:
+        seen_run_ids = self._seen_dispatch_run_ids.setdefault(repo_path, set())
+        params = {
+            "branch": branch,
+            "event": "workflow_dispatch",
+            "per_page": str(_DISPATCH_RUN_LOOKUP_LIMIT),
+        }
+        for attempt in range(self._dispatch_poll.attempts):
+            runs_data = self._request_json(
+                "GET",
+                f"/repos/{repo_path}/actions/workflows/{workflow_path}/runs",
+                params=params,
+            )
+            run_id = _find_dispatched_run_id(runs_data, cutoff=cutoff, seen_run_ids=seen_run_ids)
+            if run_id is not None:
+                seen_run_ids.add(run_id)
+                return run_id
+            if attempt + 1 < self._dispatch_poll.attempts:
+                self._dispatch_poll.sleep(self._dispatch_poll.interval_seconds)
+        return None
 
     def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
         """Fetch status, conclusion, and timing for workflow run ``run_id`` in ``repo``."""
@@ -327,6 +384,41 @@ def _repo_path(repo: str) -> str:
 
 def _branch_path(branch: str) -> str:
     return quote(branch, safe="/")
+
+
+def _workflow_path(workflow: str) -> str:
+    normalized = workflow.strip().removeprefix("./").lstrip("/").removeprefix(".github/workflows/")
+    if not normalized:
+        msg = f"Invalid workflow identifier {workflow!r}."
+        raise ValueError(msg)
+    return quote(normalized, safe="")
+
+
+def _find_dispatched_run_id(
+    runs_data: Mapping[str, object],
+    *,
+    cutoff: datetime,
+    seen_run_ids: set[int],
+) -> int | None:
+    runs = runs_data.get("workflow_runs")
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        run_id = _require_int(run, "id")
+        if run_id in seen_run_ids:
+            continue
+        created_at = _parse_timestamp(_optional_str(run, "created_at"))
+        if created_at is not None and _to_utc(created_at) >= cutoff:
+            return run_id
+    return None
+
+
+def _to_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _decode_json_object(response: httpx.Response) -> dict[str, object]:
