@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, status
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
 
 logger = logging.getLogger(__name__)
@@ -100,14 +101,17 @@ def create_app(
     ledger: Ledger,
     dispatcher: DispatcherProtocol | None = None,
     webhook_secret: str | None = None,
+    run_tracker: RunTracker | None = None,
 ) -> FastAPI:
     """Create and configure the Pit Crew FastAPI application."""
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
+    tracker = run_tracker if run_tracker is not None else RunTracker()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
+    app.state.run_tracker = tracker
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
 
@@ -117,7 +121,7 @@ def create_app(
         ledger_kind = "sqlite" if isinstance(ledger, SqliteLedger) else "memory"
         return {"status": "ok", "ledger": ledger_kind}
 
-    app.include_router(create_github_webhook_router(webhook_secret=webhook_secret))
+    app.include_router(create_github_webhook_router(webhook_secret=webhook_secret, run_tracker=tracker))
 
     @app.post("/triggers/cycle", status_code=status.HTTP_202_ACCEPTED)
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
