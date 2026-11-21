@@ -18,9 +18,9 @@ def at(seconds: float) -> str:
     return (T0 + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
 
 
-def job(name: str, seconds: float) -> dict[str, Any]:
+def job(name: str, seconds: float, index: int = 0) -> dict[str, Any]:
     return {
-        "id": sum(ord(c) for c in name),
+        "id": index,
         "name": name,
         "run_attempt": 1,
         "conclusion": "success",
@@ -42,7 +42,7 @@ def run(durations: dict[str, float]) -> dict[str, Any]:
         "conclusion": "success",
         "run_attempt": 1,
         "run_started_at": at(0),
-        "jobs": [job(n, s) for n, s in durations.items()],
+        "jobs": [job(n, s, i) for i, (n, s) in enumerate(durations.items(), 1)],
     }
 
 
@@ -184,3 +184,17 @@ def test_dedupe_group_of_three() -> None:
     assert len(findings) == 1
     assert findings[0].job == "b"
     assert findings[0].evidence["duplicate_of"] == "a, c"
+
+
+DYNAMIC = "    strategy:\n      matrix:\n        py: ${{ fromJSON(needs.x.outputs.v) }}\n"
+
+
+def test_dedupe_ignores_dynamic_matrix_vs_no_matrix() -> None:
+    p, wf = profiled(_pair(DYNAMIC, ""), {"a": 100, "b": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_known_limitation_flags_different_dynamic_matrices_on_same_key() -> None:
+    other = DYNAMIC.replace("needs.x.outputs.v", "needs.y.outputs.w")
+    p, wf = profiled(_pair(DYNAMIC, other), {"a": 100, "b": 200})
+    assert len(detect_dedupe_jobs(p, wf, PATH)) == 1
