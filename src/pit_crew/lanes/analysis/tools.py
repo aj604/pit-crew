@@ -4,6 +4,7 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 `critical_path.py` (profiling). This module only wraps it as agent tools.
 """
 
+import math
 import os
 import re
 from pathlib import Path
@@ -12,12 +13,14 @@ from typing import Any
 from pit_crew.contracts import Hypothesis
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.critical_path import profile
+from pit_crew.lanes.analysis.dedupe_ledger import DuplicateHypothesisError, hypothesis_key, recorded_keys
 from pit_crew.lanes.analysis.workflow import parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _WORKFLOW_FILE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
 
 
 def workspace() -> Path:
@@ -75,6 +78,49 @@ def profile_ci(
     return profile(spec, history.parse_runs(raw)).to_dict()
 
 
+class InvalidRecordError(ValueError):
+    """Raised when record_hypothesis arguments are inconsistent. The managed-agent loop returns it to the model."""
+
+    @classmethod
+    def bad_workflow_path(cls, value: str) -> "InvalidRecordError":
+        """Build error for a workflow_path outside .github/workflows."""
+        return cls(f"workflow_path must be empty or like .github/workflows/ci.yml, got {value!r}")
+
+    @classmethod
+    def non_positive_savings(cls, value: float) -> "InvalidRecordError":
+        """Build error for an expected saving of zero or less."""
+        return cls(f"expected_savings_seconds must be greater than 0, got {value!r}")
+
+    @classmethod
+    def non_finite_savings(cls, value: float) -> "InvalidRecordError":
+        """Build error for a nan or infinite expected saving."""
+        return cls(f"expected_savings_seconds must be a finite number, got {value!r}")
+
+    @classmethod
+    def non_finite_max(cls, value: float) -> "InvalidRecordError":
+        """Build error for a nan or infinite evidence max_saving_seconds."""
+        return cls(f"evidence max_saving_seconds must be a finite number, got {value!r}")
+
+    @classmethod
+    def savings_above_max(cls, value: float, maximum: float) -> "InvalidRecordError":
+        """Build error for an expected saving larger than the job can give."""
+        return cls(f"expected_savings_seconds {value!r} exceeds evidence max_saving_seconds {maximum!r}")
+
+
+def _check_record(workflow_path: str, expected_savings_seconds: float, evidence: dict[str, float | str]) -> None:
+    if workflow_path and not _WORKFLOW_PATH.fullmatch(workflow_path):
+        raise InvalidRecordError.bad_workflow_path(workflow_path)
+    if not math.isfinite(expected_savings_seconds):
+        raise InvalidRecordError.non_finite_savings(expected_savings_seconds)
+    if expected_savings_seconds <= 0:
+        raise InvalidRecordError.non_positive_savings(expected_savings_seconds)
+    maximum = evidence.get("max_saving_seconds")
+    if isinstance(maximum, int | float) and not math.isfinite(maximum):
+        raise InvalidRecordError.non_finite_max(maximum)
+    if isinstance(maximum, int | float) and expected_savings_seconds > maximum:
+        raise InvalidRecordError.savings_above_max(expected_savings_seconds, maximum)
+
+
 @tool(
     lane="analysis",
     parameters={
@@ -83,13 +129,63 @@ def profile_ci(
             "repo": {"type": "string", "description": "owner/name of the fork"},
             "description": {"type": "string", "description": "The bottleneck, with the evidence for it"},
             "skill": {"type": "string", "description": "Playbook skill that should fix it"},
-            "expected_savings_seconds": {"type": "number"},
+            "expected_savings_seconds": {
+                "type": "number",
+                "description": "Wall-clock seconds saved; above 0 and at most the job's max_saving_seconds",
+            },
+            "workflow_path": {"type": "string", "description": "e.g. .github/workflows/ci.yml"},
+            "job": {"type": "string", "description": "Job id under jobs: in the workflow"},
+            "step": {"type": "string", "description": "Step name within the job; empty for job-level changes"},
+            "bucket": {"type": "string", "description": "Where the time goes: waiting, setup or running"},
+            "evidence": {
+                "type": "object",
+                "description": "Measured numbers behind the claim, e.g. step_p50_seconds, max_saving_seconds",
+                "additionalProperties": {"type": ["number", "string"]},
+            },
+            "confidence": {"type": "number", "description": "0 to 1: how sure you are the saving is real"},
+            "risk": {"type": "string", "description": "Chance the change weakens what CI catches: low, medium, high"},
+            "base_sha": {"type": "string", "description": "Commit the measurements were taken on"},
         },
         "required": ["repo", "description", "skill", "expected_savings_seconds"],
     },
 )
-def record_hypothesis(ledger: Ledger, repo: str, description: str, skill: str, expected_savings_seconds: float) -> str:
-    """Record one bottleneck worth fixing. Returns the hypothesis id."""
-    hypothesis = Hypothesis(repo, description, skill, expected_savings_seconds)
+def record_hypothesis(  # noqa: PLR0913, PLR0917  tool arguments mirror Hypothesis fields; the agent passes them by keyword
+    ledger: Ledger,
+    repo: str,
+    description: str,
+    skill: str,
+    expected_savings_seconds: float,
+    workflow_path: str = "",
+    job: str = "",
+    step: str = "",
+    bucket: str = "",
+    evidence: dict[str, float | str] | None = None,
+    confidence: float | None = None,
+    risk: str = "",
+    base_sha: str = "",
+) -> str:
+    """Record one bottleneck worth fixing, with where to fix it. Returns the hypothesis id.
+
+    Refuses a bottleneck (same skill, workflow_path, job and step) that is already recorded, whether
+    it is open, rejected or kept: record a different one instead.
+    """
+    evidence = evidence or {}
+    _check_record(workflow_path, expected_savings_seconds, evidence)
+    if hypothesis_key(skill, workflow_path, job, step) in recorded_keys(ledger, repo):
+        raise DuplicateHypothesisError.already_recorded(skill, workflow_path, job, step)
+    hypothesis = Hypothesis(
+        repo,
+        description,
+        skill,
+        expected_savings_seconds,
+        base_sha=base_sha,
+        workflow_path=workflow_path,
+        job=job,
+        step=step,
+        bucket=bucket,
+        evidence=evidence,
+        confidence=confidence,
+        risk=risk,
+    )
     ledger.add(hypothesis)
     return hypothesis.id
