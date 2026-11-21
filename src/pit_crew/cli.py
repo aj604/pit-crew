@@ -6,7 +6,6 @@ to a SQLite ledger. It is the Milestone 2 check that a lane works end to end; se
 
 import argparse
 import json
-import os
 import sys
 import time
 from collections.abc import Iterator, Sequence
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from pit_crew import managed_agent
+from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Candidate, Hypothesis, Record, ReplayPlan
 from pit_crew.ledger import Ledger, SqliteLedger, normalize_repo
 
@@ -26,8 +26,7 @@ EXPECTED_RECORD: dict[str, type[Record]] = {
 }
 
 
-WORKSPACE_ENV = "PIT_CREW_WORKSPACE"
-DEFAULT_WORKSPACE = "/workspace"
+WORKSPACE_ENV = host_workspace.WORKSPACE_ENV
 
 
 class MissingWorkspaceError(FileNotFoundError):
@@ -84,27 +83,29 @@ def default_task(lane: str, repo: str, ledger: Ledger) -> str:
 
 
 @contextmanager
-def _workspace_env(workspace: str | None) -> Iterator[None]:
-    """Set ``PIT_CREW_WORKSPACE`` to ``workspace`` for the block and restore the previous value after."""
-    if workspace is None:
+def _lane_workspace(
+    lane: str, repo: str, workspace: str | None, download: host_workspace.Download | None
+) -> Iterator[None]:
+    """Bind the checkout host tools read while ``lane`` runs, without touching ``os.environ``.
+
+    ``--workspace`` wins, then ``PIT_CREW_WORKSPACE``. With neither, the analysis lane (the only one
+    whose tools read the checkout on the host) gets ``repo``'s tarball extracted to a temporary folder.
+    """
+    if workspace is not None:
+        with host_workspace.use_workspace(workspace):
+            yield
+    elif lane != "analysis" or host_workspace.configured_workspace() is not None:
         yield
-        return
-    previous = os.environ.get(WORKSPACE_ENV)
-    os.environ[WORKSPACE_ENV] = workspace
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(WORKSPACE_ENV, None)
-        else:
-            os.environ[WORKSPACE_ENV] = previous
+    else:
+        with host_workspace.materialize(repo, download=download) as checkout, host_workspace.use_workspace(checkout):
+            yield
 
 
-def _check_workspace(lane: str, workspace: str | None) -> None:
+def _check_workspace(lane: str) -> None:
     """Fail fast when ``analysis`` would read its workflow from a checkout that is not there."""
     if lane != "analysis":
         return
-    path = Path(workspace if workspace is not None else os.environ.get(WORKSPACE_ENV, DEFAULT_WORKSPACE))
+    path = host_workspace.active_workspace()
     if not path.is_dir():
         raise MissingWorkspaceError(path)
 
@@ -117,12 +118,14 @@ def smoke_lane(  # noqa: PLR0913  each keyword mirrors one smoke-lane flag
     *,
     workspace: str | None = None,
     client: managed_agent.InteractionsClientLike | None = None,
+    download: host_workspace.Download | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Run ``lane`` once and return its JSON summary and whether it passed.
 
     ``ledger`` is a Ledger or the path of a SQLite ledger to open. Opening and reading it happen inside
     the same error boundary as the run, so a bad ledger is reported in the summary like any other failure.
-    ``workspace`` is the local checkout the analysis tools read (``PIT_CREW_WORKSPACE`` while the lane runs).
+    ``workspace`` is the local checkout the analysis tools read. When it and ``PIT_CREW_WORKSPACE`` are both
+    unset, analysis downloads ``repo``'s tarball (via ``download``, default the GitHub API) for the run.
     """
     kind = EXPECTED_RECORD[lane]
     started = time.monotonic()
@@ -132,9 +135,9 @@ def smoke_lane(  # noqa: PLR0913  each keyword mirrors one smoke-lane flag
         opened = SqliteLedger(ledger) if isinstance(ledger, (str, Path)) else ledger
         before = len(opened.all(kind))
         try:
-            _check_workspace(lane, workspace)
-            prompt = task if task is not None else default_task(lane, repo, opened)
-            with _workspace_env(workspace):
+            with _lane_workspace(lane, repo, workspace, download):
+                _check_workspace(lane)
+                prompt = task if task is not None else default_task(lane, repo, opened)
                 interaction = managed_agent.run_lane(lane, prompt, opened, repo=repo, client=client)
         finally:
             records_written = len(opened.all(kind)) - before
@@ -159,7 +162,10 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--task", help="prompt to send instead of the lane's built-in default")
     smoke.add_argument(
         "--workspace",
-        help=f"local checkout of --repo that analysis tools read (default: ${WORKSPACE_ENV} or {DEFAULT_WORKSPACE})",
+        help=(
+            f"local checkout of --repo that analysis tools read (default: ${WORKSPACE_ENV}, else the "
+            "repository tarball downloaded to a temporary folder for the run)"
+        ),
     )
     return parser
 

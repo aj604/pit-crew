@@ -271,15 +271,7 @@ def test_a_quoted_here_document_delimiter_is_not_mutated() -> None:
 
 @pytest.mark.parametrize(
     ("opener", "closer"),
-    [
-        ("<<E\\OF", "EOF"),
-        ("<<E'OF'", "EOF"),
-        ('<<E"O"F', "EOF"),
-        ("<<$'EOF'", "EOF"),
-        ('<<$"EOF"', "EOF"),
-        ('<<"E\\$F"', "E$F"),
-        ("<<'E\\$F'", "E\\$F"),
-    ],
+    [("<<E'OF'", "EOF"), ('<<E"O"F', "EOF"), ('<<"E\\$F"', "E$F"), ("<<'E\\$F'", "E\\$F")],
 )
 def test_a_partly_quoted_here_document_delimiter_is_read_as_bash_reads_it(opener: str, closer: str) -> None:
     source = f"cat {opener}\n(( a < b )) && true\n{closer}\n(( n > 2 ))\n"
@@ -298,11 +290,6 @@ def test_a_here_document_it_cannot_read_or_close_masks_nothing(source: str) -> N
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        # The body of INNER follows the newline inside $( ), and OUTER's follows the one after the ).
-        (
-            "echo <<'OUTER' $(cat <<'INNER'\n(( a < b ))\nINNER\n(( x > y ))\n)\n(( a > b ))\nOUTER\n(( x < y ))\n",
-            [(4, "> -> <="), (8, "< -> >=")],
-        ),
         # The )) of (( )) inside $( ) does not close it.
         (
             "cat <<'OUTER' $( (( n > 1 )) && cat <<'INNER'\n(( a < b ))\nINNER\n)\n(( c < d ))\nOUTER\n(( x > y ))\n",
@@ -336,6 +323,38 @@ def test_shell_order_comparisons_flip_only_inside_arithmetic() -> None:
     )
     ops = [(m.line, m.operator) for m in mutants("retry.sh", source)]
     assert ops == [(1, "< -> >="), (2, ">= -> <"), (3, "&& -> ||")]
+
+
+@pytest.mark.parametrize("opening", ["echo $(( ", "(( "])
+def test_shell_order_comparisons_skip_commands_nested_in_arithmetic(opening: str) -> None:
+    line = f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x >= y ))) < limit ))"
+    order_mutants = [m.after for m in mutants("retry.sh", line)]
+    assert order_mutants == [
+        f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x < y ))) < limit ))",
+        f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x >= y ))) >= limit ))",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("redirect", "indent"),
+    [("<<'EOF'", ""), ('<<"EOF"', ""), ("<<-'EOF'", "\t"), (r"<<E\OF", ""), ("<<$'EOF'", ""), ('<<$"EOF"', "")],
+)
+def test_shell_mutants_skip_quoted_heredoc_bodies(redirect: str, indent: str) -> None:
+    source = f"cat {redirect}\n{indent}(( a < b )) && true\n{indent}EOF\n(( x > y ))\n"
+    assert mutants("retry.sh", source) == [
+        Mutant("retry.sh", 4, "(( x > y ))", "(( x <= y ))", "> -> <="),
+    ]
+
+
+def test_shell_heredocs_are_consumed_in_redirection_order() -> None:
+    # FIRST is unquoted, but its body is still text: cat prints that `true`, it doesn't run it.
+    source = "cat <<FIRST <<'SECOND'\ntrue\nFIRST\n(( a < b ))\nSECOND\n(( x > y ))\n"
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(6, "> -> <=")]
+
+
+def test_shell_heredocs_inside_command_substitution_have_their_own_queue() -> None:
+    source = "echo <<'OUTER' $(cat <<'INNER'\n(( a < b ))\nINNER\n(( x > y ))\n)\n(( a > b ))\nOUTER\n(( x < y ))\n"
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(4, "> -> <="), (8, "< -> >=")]
 
 
 def test_booleans_flip_only_where_the_language_spells_them_that_way() -> None:
