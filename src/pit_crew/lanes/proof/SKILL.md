@@ -29,6 +29,10 @@ Output: one replay plan.
      keep the whole mutated file. Do not commit or push; the host replays it for you.
    - Never write a bug that fails every check, such as a syntax error. It proves nothing
      about the check the candidate touched.
+   - Mutate the code under test, never CI or build config (anything in `.github/`,
+     `package.json`, `pyproject.toml`, a test runner's config) or a file the candidate
+     changed. Replaying it would overwrite the candidate's own change, so `plan_replays`
+     refuses it.
    - Every replay is recorded on video, and Gemini 4 Carbon checks that the candidate fails
      the same way the baseline does. Pick mutants that fail with a specific, readable
      message, like an assertion showing expected and actual values, not a crash or a hang.

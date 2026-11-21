@@ -3,11 +3,11 @@
 Each mutant flips one operator on one line: a comparison, a boolean, or a logical join.
 Only operators the file's language has are flipped. In shell, `<` and `>` are redirects
 except inside arithmetic, `(( ))` and `$(( ))`, and `and` is an ordinary word, so flipping
-them anywhere else would break the script rather than plant a bug in it. Operators inside strings and
-comments are left alone, and binary operators must have whitespace on both sides, which
-keeps TypeScript generics (`Array<T>`) and arrows (`=>`) out. A mutant is a bug only if
-the baseline CI catches it; the dispatcher replays it against the baseline first and
-drops any the baseline misses.
+them anywhere else would break the script rather than plant a bug in it. Operators inside
+strings, comments and shell here-documents are left alone, and binary operators must have
+whitespace on both sides, which keeps TypeScript generics (`Array<T>`) and arrows (`=>`)
+out. A mutant is a bug only if the baseline CI catches it; the dispatcher replays it
+against the baseline first and drops any the baseline misses.
 """
 
 import re
@@ -46,6 +46,9 @@ _WORDS = {"true": "false", "false": "true", "True": "False", "False": "True"}
 _FLIPS = _BINARY | _WORDS
 _BINARY_RE = re.compile(r"(?<=\s)(" + "|".join(re.escape(op) for op in _BINARY) + r")(?=\s)")
 _WORD_RE = re.compile(r"\b(" + "|".join(_WORDS) + r")\b")
+# A shell here-document: <<EOF, <<-EOF, << 'EOF', <<"EOF", <<\EOF, but not the here-string <<<.
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*\\?(['\"]?)([A-Za-z_]\w*)\2")
+_SHELL_WORD_START = " \t\n;|&()"  # where a shell # starts a comment; elsewhere ($#, ${#x}) it is code
 
 
 @dataclass(frozen=True)
@@ -73,15 +76,16 @@ def mutants(path: str, source: str, limit: int = 50) -> list[Mutant]:
     allowed = _OPERATORS.get(suffix)
     if limit < 1 or allowed is None:
         return []
-    code = _mask(source, hash_comments=suffix in _HASH)
+    shell = suffix == ".sh"
+    code = _mask(source, hash_comments=suffix in _HASH, shell=shell)
     found = []
     for number, (line, masked) in enumerate(zip(source.split("\n"), code.split("\n"), strict=True), start=1):
         operators = [*_BINARY_RE.finditer(masked), *_WORD_RE.finditer(masked)]
-        arithmetic = _arithmetic(masked) if suffix == ".sh" else []
+        arithmetic = _arithmetic(masked) if shell else [False] * len(masked)
         found += [
             _mutant(path, number, line, m.start(), m.group(1))
             for m in operators
-            if m.group(1) in allowed or (m.group(1) in _ORDER and any(a <= m.start() < b for a, b in arithmetic))
+            if m.group(1) in allowed or (m.group(1) in _ORDER and arithmetic[m.start()])
         ]
     if len(found) <= limit:
         return found
@@ -98,22 +102,34 @@ def apply_mutant(source: str, mutant: Mutant) -> str:
     return "\n".join(lines)
 
 
-def _arithmetic(line: str) -> list[tuple[int, int]]:
-    """Return where each shell arithmetic expression, `(( ... ))` or `$(( ... ))`, starts and ends on a line.
+def _arithmetic(line: str) -> list[bool]:
+    """Return, for each character of a shell line, whether it is in an arithmetic expression.
 
-    Only there do `<` and `>` compare. Inside `[[ ]]` they compare strings, where flipping
-    `<` to `>=` is a syntax error, so that is left out.
+    Only in `(( ... ))` and `$(( ... ))` do `<` and `>` compare. A command substitution
+    `$( ... )` inside one is ordinary shell again, where they redirect, and `[[ ]]` is never
+    arithmetic: `<` there compares strings, and flipping it to `>=` is a syntax error.
     """
-    spans = []
-    start = line.find("((")
-    while start != -1:
-        depth, end = 2, start + 2
-        while end < len(line) and depth:
-            depth += {"(": 1, ")": -1}.get(line[end], 0)
-            end += 1
-        spans.append((start, end))
-        start = line.find("((", end)
-    return spans
+    inside = [False] * len(line)
+    stack: list[tuple[bool, str]] = []  # (is arithmetic, what closes it), innermost last
+    i = 0
+    while i < len(line):
+        arithmetic = bool(stack) and stack[-1][0]
+        if line.startswith("$((", i) or (line.startswith("((", i) and not arithmetic):
+            stack.append((True, "))"))
+            i += 3 if line[i] == "$" else 2
+        elif line.startswith("$(", i):
+            stack.append((False, ")"))
+            i += 2
+        elif line[i] == "(":
+            stack.append((arithmetic, ")"))  # a group keeps the context it is in
+            i += 1
+        elif line[i] == ")" and stack:
+            _, closer = stack.pop()
+            i += len(closer) if line.startswith(closer, i) else 1
+        else:
+            inside[i] = arithmetic
+            i += 1
+    return inside
 
 
 def _mutant(path: str, number: int, line: str, col: int, op: str) -> Mutant:
@@ -121,26 +137,67 @@ def _mutant(path: str, number: int, line: str, col: int, op: str) -> Mutant:
     return Mutant(path, number, line, line[:col] + new + line[col + len(op) :], f"{op} -> {new}")
 
 
-def _mask(source: str, *, hash_comments: bool) -> str:
-    """Return the source with strings and comments blanked to spaces; newlines and offsets kept."""
+def _mask(source: str, *, hash_comments: bool, shell: bool = False) -> str:
+    """Return the source with strings, comments and here-documents blanked to spaces; newlines and offsets kept."""
     out = list(source)
+    heredocs: list[tuple[str, bool]] = []  # here-documents opened on the current line: (delimiter, tabs stripped)
     i = 0
     while i < len(source):
-        end = _literal_end(source, i, hash_comments=hash_comments)
-        if end is None:
+        if source[i] == "\n" and heredocs:
+            body_end = _heredoc_end(source, i + 1, heredocs)
+            _blank(out, i + 1, body_end)
+            heredocs = []
+            i = body_end
+        elif shell and (heredoc := _HEREDOC.match(source, i)):
+            heredocs.append((heredoc.group(3), heredoc.group(1) == "-"))
+            i = heredoc.end()
+        elif (end := _literal_end(source, i, hash_comments=hash_comments, shell=shell)) is not None:
+            _blank(out, i, end)
+            if shell and source[i] == '"':
+                _keep_arithmetic(out, source, i, end)
+            i = end
+        else:
             i += 1
-            continue
-        for k in range(i, end):
-            if out[k] != "\n":
-                out[k] = " "
-        i = end
     return "".join(out)
 
 
-def _literal_end(source: str, i: int, *, hash_comments: bool) -> int | None:
+def _blank(out: list[str], start: int, end: int) -> None:
+    for k in range(start, end):
+        if out[k] != "\n":
+            out[k] = " "
+
+
+def _keep_arithmetic(out: list[str], source: str, start: int, end: int) -> None:
+    """Put back each $(( ... )) in a double-quoted shell string: Bash still evaluates it there, unless escaped."""
+    i = source.find("$((", start, end)
+    while i != -1:
+        depth, j = 2, i + 3
+        while j < end and depth:
+            depth += {"(": 1, ")": -1}.get(source[j], 0)
+            j += 1
+        if source[i - 1] != "\\":
+            out[i:j] = source[i:j]
+        i = source.find("$((", j, end)
+
+
+def _heredoc_end(source: str, start: int, heredocs: list[tuple[str, bool]]) -> int:
+    """Return where the here-documents whose bodies start at `start` end: after the last one's delimiter line."""
+    pos = start
+    for delimiter, tabs in heredocs:
+        while pos < len(source):
+            line_end = source.find("\n", pos)
+            line_end = len(source) if line_end == -1 else line_end
+            line, pos = source[pos:line_end], line_end + 1
+            if (line.lstrip("\t") if tabs else line) == delimiter:
+                break
+    return min(pos, len(source))
+
+
+def _literal_end(source: str, i: int, *, hash_comments: bool, shell: bool = False) -> int | None:
     """Return where the comment or string starting at `i` ends, or None if none starts there."""
     n = len(source)
-    if (hash_comments and source[i] == "#") or (not hash_comments and source.startswith("//", i)):
+    comment = source[i] == "#" and (not shell or i == 0 or source[i - 1] in _SHELL_WORD_START)
+    if (hash_comments and comment) or (not hash_comments and source.startswith("//", i)):
         end = source.find("\n", i)
         return n if end == -1 else end
     if not hash_comments and source.startswith("/*", i):

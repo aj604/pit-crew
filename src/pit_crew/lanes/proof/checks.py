@@ -65,7 +65,8 @@ def parse_workflow(text: str, path: str) -> Workflow | None:
     name = doc.get("name")
     return Workflow(
         name=name if isinstance(name, str) and name else path,
-        header={str(k): v for k, v in doc.items() if k != "jobs"},
+        # YAML 1.1 reads the key `on` as true, so it is named back here.
+        header={("on" if k is True else str(k)): v for k, v in doc.items() if k != "jobs"},
         jobs=doc["jobs"],
     )
 
@@ -75,9 +76,11 @@ def touched_checks(changes: Iterable[FileChange]) -> set[Check] | None:
 
     A changed file that is not a workflow directly in .github/workflows/ (a script, a test
     config, a lockfile, a composite action) can affect any check, so it answers None, as
-    does a workflow that won't parse. A change outside `jobs:` (triggers, env, permissions)
-    touches every job in that workflow. A removed job is reported as touched, so its old
-    bugs are replayed and the removal fails.
+    does a workflow that won't parse. So does a reusable workflow (`on: workflow_call`):
+    its jobs report under each caller's name, as "<caller job> / <job>", which this file
+    alone cannot say. A change outside `jobs:` (triggers, env, permissions) touches every
+    job in that workflow. A removed job is reported as touched, so its old bugs are
+    replayed and the removal fails.
     """
     touched: set[Check] = set()
     for change in changes:
@@ -86,7 +89,7 @@ def touched_checks(changes: Iterable[FileChange]) -> set[Check] | None:
             return None
         before = _side(change["before"], path)
         after = _side(change["after"], path)
-        if before is None or after is None:
+        if before is None or after is None or _is_reusable(before) or _is_reusable(after):
             return None
         every_job = before.jobs.keys() | after.jobs.keys()
         if before.header == after.header:
@@ -112,6 +115,12 @@ def all_checks(workflows: Mapping[str, str]) -> set[Check] | None:
 
 def _side(text: str | None, path: str) -> Workflow | None:
     return Workflow(path) if text is None else parse_workflow(text, path)
+
+
+def _is_reusable(workflow: Workflow) -> bool:
+    on = workflow.header.get("on")
+    events = {on} if isinstance(on, str) else set(on) if isinstance(on, list | dict) else set()
+    return "workflow_call" in events
 
 
 def _is_workflow(path: str) -> bool:

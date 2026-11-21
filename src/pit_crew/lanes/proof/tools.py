@@ -11,7 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
 
-from pit_crew.contracts import BugCase, Candidate, ReplayPlan
+from pit_crew.contracts import BugCase, Candidate, ReplayPlan, is_allowed_candidate_path
 from pit_crew.lanes.proof.checks import Check
 from pit_crew.lanes.proof.miner import RedCommit
 from pit_crew.lanes.proof.mutants import mutants
@@ -36,9 +36,22 @@ class InvalidReplayPlanError(ValueError):
         return cls(f"not commit SHAs: {', '.join(bad)}")
 
     @classmethod
-    def bad_mutation(cls, path: str) -> "InvalidReplayPlanError":
+    def not_a_list(cls, field: str) -> "InvalidReplayPlanError":
+        """Build the error for bug_shas or mutations given as something other than a list."""
+        return cls(f"{field} must be a list")
+
+    @classmethod
+    def bad_mutation(cls, path: object) -> "InvalidReplayPlanError":
         """Build the error for a mutation without a relative path and new contents."""
         return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
+
+    @classmethod
+    def mutates_the_candidate(cls, path: str) -> "InvalidReplayPlanError":
+        """Build the error for a mutation of CI config or of a file the candidate changed."""
+        return cls(
+            f"a mutation must change code under test, not {path!r}: the candidate may change that file, "
+            "so replaying the mutation would overwrite the change it is meant to test"
+        )
 
 
 def pick_replays(red: Iterable[RedCommit], touched: Iterable[Check] | None, limit: int = MAX_REPLAYS) -> list[str]:
@@ -135,12 +148,10 @@ def plan_replays(
     mutations: list[dict[str, str]] | None = None,
 ) -> str:
     """Choose which bugs to replay against a candidate: red commits and mutated files. Returns the plan id."""
-    ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
-    shas = tuple(dict.fromkeys(sha.strip().lower() for sha in bug_shas or ()))
-    if bad := [sha for sha in shas if not _SHA.match(sha)]:
-        raise InvalidReplayPlanError.not_shas(bad)
+    candidate = ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
+    shas = _shas(_listed(bug_shas, "bug_shas"))
     cases = [BugCase(kind="commit", commit_sha=sha, reason="historical red commit") for sha in shas]
-    cases += [_mutation_case(m) for m in mutations or ()]
+    cases += [_mutation_case(m, candidate) for m in _listed(mutations, "mutations")]
     if not cases:
         raise InvalidReplayPlanError.empty()
     plan = ReplayPlan(candidate_id, bug_shas=shas, cases=tuple(cases))
@@ -148,11 +159,34 @@ def plan_replays(
     return plan.id
 
 
-def _mutation_case(mutation: Mapping[str, str]) -> BugCase:
-    path, content = mutation.get("path", ""), mutation.get("content", "")
-    # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
-    if not content or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+# The model writes these arguments, so each has its type checked here: a wrong one must come
+# back to the model as an error it can fix, not crash the lane.
+
+
+def _listed(value: object, field: str) -> list[object]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise InvalidReplayPlanError.not_a_list(field)
+    return value
+
+
+def _shas(values: list[object]) -> tuple[str, ...]:
+    # A number is refused, not read as hex: 0012345 written as a number is the wrong commit.
+    shas = [v.strip().lower() for v in values if isinstance(v, str)]
+    if bad := [repr(v) for v in values if not isinstance(v, str)] + [sha for sha in shas if not _SHA.match(sha)]:
+        raise InvalidReplayPlanError.not_shas(bad)
+    return tuple(dict.fromkeys(shas))
+
+
+def _mutation_case(mutation: object, candidate: Candidate) -> BugCase:
+    fields = mutation if isinstance(mutation, Mapping) else {}
+    path, content, reason = (fields.get(k, "") for k in ("path", "content", "reason"))
+    if not (isinstance(path, str) and isinstance(content, str) and isinstance(reason, str)) or not content:
         raise InvalidReplayPlanError.bad_mutation(path)
-    return BugCase(
-        kind="mutation", mutated_files={path: content}, reason=mutation.get("reason") or "synthetic mutation"
-    )
+    # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
+    if "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+        raise InvalidReplayPlanError.bad_mutation(path)
+    if is_allowed_candidate_path(path) or path in candidate.changed_files:
+        raise InvalidReplayPlanError.mutates_the_candidate(path)
+    return BugCase(kind="mutation", mutated_files={path: content}, reason=reason or "synthetic mutation")

@@ -123,6 +123,19 @@ def test_a_change_outside_workflows_touches_every_check() -> None:
     assert touched_checks([{"path": "vitest.config.ts", "before": "a", "after": "b"}]) is None
 
 
+@pytest.mark.parametrize("on", ["workflow_call", "[push, workflow_call]", "\n  workflow_call:\n    inputs: {}"])
+def test_a_reusable_workflow_touches_every_check(on: str) -> None:
+    # Its jobs report as "<caller job> / build" under each caller, never under this file's name.
+    before = f"name: Build\non: {on}\njobs:\n  build: {{runs-on: x, steps: [{{run: make}}]}}\n"
+    after = before.replace("make", "make -j8")
+    assert touched_checks(change(after, before, path=".github/workflows/build.yml")) is None
+
+
+def test_a_trigger_change_is_still_read_as_a_header_change() -> None:
+    after = WORKFLOW.replace("  pull_request:", "  push:")  # YAML reads `on` as true; it must still compare
+    assert touched_checks(change(after)) == EVERY_JOB
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -221,6 +234,33 @@ def test_shell_redirects_and_words_are_not_mutated() -> None:
     source = 'echo ok > out.txt\nsort < in.txt > sorted.txt\necho cats and dogs\n[[ "$a" == "$b" ]] && true\n'
     ops = [(m.line, m.operator) for m in mutants("ci.sh", source)]
     assert ops == [(4, "== -> !="), (4, "&& -> ||"), (4, "true -> false")]
+
+
+def test_shell_command_substitution_inside_arithmetic_is_shell_again() -> None:
+    # `<` here is inside [[ ]] in $( ), where flipping it to >= is a syntax error.
+    source = "echo $(( $([[ a < b ]] && echo 1 || echo 0) + 1 ))\nif (( n > 1 )); then :; fi\n"
+    ops = [(m.line, m.operator) for m in mutants("a.sh", source)]
+    assert ops == [(1, "&& -> ||"), (1, "|| -> &&"), (2, "> -> <=")]
+
+
+def test_shell_here_documents_are_text_not_code() -> None:
+    source = (
+        "cat <<'EOF' > notes.txt\n(( a < b )) && true\nEOF\n"
+        "cat <<-END <<\\LAST\n\t[ x == y ]\n\tEND\n(( c > d ))\nLAST\n"
+        "grep x <<< y && (( e < f ))\n"
+    )
+    ops = [(m.line, m.operator) for m in mutants("a.sh", source)]
+    assert ops == [(9, "&& -> ||"), (9, "< -> >=")]
+
+
+def test_shell_arithmetic_in_double_quotes_is_still_code() -> None:
+    source = "printf '%s\\n' \"n=$(( a < b ))\"\necho \"\\$(( c > d ))\" '$(( e > f ))'\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(1, "< -> >=")]
+
+
+@pytest.mark.parametrize("line", ["if (( $# > 0 )); then :; fi", "(( ${#items[@]} > 0 )) || exit"])
+def test_a_shell_hash_inside_a_word_is_not_a_comment(line: str) -> None:
+    assert "> -> <=" in [m.operator for m in mutants("a.sh", line + "\n")]
 
 
 def test_shell_order_comparisons_flip_only_inside_arithmetic() -> None:
@@ -330,6 +370,16 @@ def test_a_plan_of_only_mutations_is_valid(ledger_and_candidate: tuple[InMemoryL
         ({"mutations": [{"path": "src//a.py", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
+        # The model writes these arguments; a wrong type must come back as an error, not crash the lane.
+        ({"bug_shas": [1818181]}, "not commit SHAs: 1818181"),
+        ({"bug_shas": "b2b2b2b"}, "bug_shas must be a list"),
+        ({"mutations": {"path": "a.py", "content": "x"}}, "mutations must be a list"),
+        ({"mutations": ["src/a.py"]}, "relative path"),
+        ({"mutations": [{"path": "a.py", "content": 5, "reason": "r"}]}, "whole mutated file"),
+        ({"mutations": [{"path": "a.py", "content": "x", "reason": 3}]}, "whole mutated file"),
+        # Replaying these would overwrite the candidate's own CI change.
+        ({"mutations": [{"path": ".github/workflows/ci.yml", "content": "x", "reason": "r"}]}, "code under test"),
+        ({"mutations": [{"path": "package.json", "content": "{}", "reason": "r"}]}, "code under test"),
     ],
 )
 def test_plan_replays_refuses_a_plan_that_proves_nothing(
@@ -338,6 +388,16 @@ def test_plan_replays_refuses_a_plan_that_proves_nothing(
     ledger, candidate_id = ledger_and_candidate
     with pytest.raises(InvalidReplayPlanError, match=message):
         tools.call("plan_replays", ledger, {"candidate_id": candidate_id, **arguments})
+
+
+def test_plan_replays_refuses_to_mutate_a_file_the_candidate_changed() -> None:
+    build_request("proof", "")
+    ledger = InMemoryLedger()
+    candidate = Candidate("h1", "pc/x", "x", changed_files=("scripts/ci.sh",))
+    ledger.add(candidate)
+    mutation = {"path": "scripts/ci.sh", "content": "exit 1\n", "reason": "r"}
+    with pytest.raises(InvalidReplayPlanError, match="code under test"):
+        tools.call("plan_replays", ledger, {"candidate_id": candidate.id, "mutations": [mutation]})
 
 
 def test_plan_replays_refuses_an_unknown_candidate() -> None:
