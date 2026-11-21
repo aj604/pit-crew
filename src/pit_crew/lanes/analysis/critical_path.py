@@ -79,7 +79,7 @@ class CIProfile:
 
     workflow: str
     runs_analyzed: int
-    runs_excluded: dict[str, int]  # conclusion -> count, for runs left out of the timings
+    runs_excluded: dict[str, int]  # reason (a conclusion, or "workflow_changed") -> runs left out
     retried_runs: int  # runs that needed more than one attempt: a flake signal
     wall_clock_median_seconds: float
     wall_clock_p95_seconds: float
@@ -158,18 +158,25 @@ def max_saving(workflow: Workflow, seconds: Mapping[str, float], job_id: str) ->
 def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...] = ("success",)) -> CIProfile:
     """Profile the runs whose conclusion is in `include`.
 
-    Failed and cancelled runs stop early, so their timings would understate the pipeline.
+    Failed and cancelled runs stop early, so their timings would understate the pipeline. Runs
+    with a job the current workflow file does not have ran an older version of the pipeline,
+    so they are left out too, counted as "workflow_changed".
     """
-    kept = [r for r in runs if r.conclusion in include]
+    finished = [r for r in runs if r.conclusion in include]
     excluded = Counter(str(r.conclusion) for r in runs if r.conclusion not in include)
 
     per_job: dict[str, list[JobTiming]] = defaultdict(list)
     critical_counts: Counter[str] = Counter()
     critical_buckets: list[Buckets] = []
     unmatched: set[str] = set()
-    for run in kept:
+    kept = []
+    for run in finished:
         timings, missing = job_timings(run, workflow)
-        unmatched.update(missing)
+        if missing or not timings:
+            unmatched.update(missing)
+            excluded["workflow_changed"] += 1
+            continue
+        kept.append(run)
         for job_id, timing in timings.items():
             per_job[job_id].append(timing)
         path = critical_path(workflow, {j: t.seconds for j, t in timings.items()})

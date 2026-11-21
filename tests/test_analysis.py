@@ -98,12 +98,19 @@ def run(
         "run_attempt": attempt,
         "run_started_at": at(0),
         "jobs": [
-            job("lint", 0, 0, 60 * s),
-            job("build", 0, 0, 100 * s, steps=[("Install", 70 * s, "success"), ("Lint fix", 0, "skipped")]),
-            job("test (ubuntu-latest)", 100 * s, 100 * s, 300 * s),
-            job("test (macos-latest)", 100 * s, 150 * s, 400 * s),
-            job("docs", 100 * s, 100 * s, 150 * s),
-            job("deploy", 400 * s, 400 * s, 410 * s),
+            job("lint", 0, 0, 60 * s, attempt=attempt),
+            job(
+                "build",
+                0,
+                0,
+                100 * s,
+                attempt=attempt,
+                steps=[("Install", 70 * s, "success"), ("Lint fix", 0, "skipped")],
+            ),
+            job("test (ubuntu-latest)", 100 * s, 100 * s, 300 * s, attempt=attempt),
+            job("test (macos-latest)", 100 * s, 150 * s, 400 * s, attempt=attempt),
+            job("docs", 100 * s, 100 * s, 150 * s, attempt=attempt),
+            job("deploy", 400 * s, 400 * s, 410 * s, attempt=attempt),
             *extra_jobs,
         ],
     }
@@ -204,12 +211,19 @@ def test_profile_leaves_out_failed_runs_and_counts_retries(workflow: Workflow) -
     assert p.retried_runs == 1
 
 
+def test_runs_of_an_older_workflow_version_are_left_out(workflow: Workflow) -> None:
+    old = run(2)
+    old["jobs"] = [job("check", 0, 0, 30)]  # the workflow used to be a single job
+    p = profile(workflow, parse_runs([run(1), old]))
+    assert p.runs_analyzed == 1
+    assert p.runs_excluded == {"workflow_changed": 1}
+    assert p.unmatched_jobs == ("check",)
+    assert p.wall_clock_median_seconds == 410
+
+
 def test_only_the_final_attempt_counts(workflow: Workflow) -> None:
     stale = job("deploy", 0, 0, 5000, attempt=1)  # first attempt; superseded
     raw = run(attempt=2, extra_jobs=[stale])
-    for j in raw["jobs"]:
-        if j is not stale:
-            j["run_attempt"] = 2
     p = profile(workflow, parse_runs([raw]))
     assert p.wall_clock_median_seconds == 410
 
