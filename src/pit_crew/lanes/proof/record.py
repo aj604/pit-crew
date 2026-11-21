@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import pty
+import select
 import shlex
 import struct
 import subprocess
@@ -38,6 +39,11 @@ WIDTH, HEIGHT = 120, 36
 LAST_FRAME_SECONDS = 5
 IDLE_SECONDS = 2
 _SIGNAL_EXIT_BASE = 128  # a shell reports death by signal N as exit code 128 + N
+_POLL_SECONDS = 0.1  # how often to check whether the check has exited
+# After the check exits, how long to keep reading what it already wrote. A background
+# process it started can hold the terminal open for as long as it likes; CI moves on when
+# the check exits, so the recording does too.
+_DRAIN_SECONDS = 1.0
 
 
 def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None) -> int:
@@ -53,7 +59,7 @@ def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None)
             start = time.monotonic()
             proc = _start(argv, slave, env)
             try:
-                _copy(master, out, cast, start)
+                _copy(master, proc, out, cast, start)
             except BaseException:
                 proc.kill()  # the recording broke: stop the check rather than leave it running unseen
                 proc.wait()
@@ -110,10 +116,10 @@ def _start(argv: list[str], slave: int, env: dict[str, str]) -> "subprocess.Pope
         os.close(slave)  # the check has its own copy; ours would hold the terminal open after it exits
 
 
-def _copy(master: int, out: BinaryIO, cast: TextIO, start: float) -> None:
-    """Stream the check's output to the job log and to the recording until it closes the terminal."""
+def _copy(master: int, proc: "subprocess.Popen[bytes]", out: BinaryIO, cast: TextIO, start: float) -> None:
+    """Stream the check's output to the job log and to the recording until the check is done with it."""
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    for data in _chunks(master):
+    for data in _chunks(master, proc):
         out.write(data)
         out.flush()
         _event(cast, start, decoder.decode(data))
@@ -125,8 +131,20 @@ def _event(cast: TextIO, start: float, text: str) -> None:
         cast.write(json.dumps([round(time.monotonic() - start, 6), "o", text]) + "\n")
 
 
-def _chunks(master: int) -> Iterator[bytes]:
+def _chunks(master: int, proc: "subprocess.Popen[bytes]") -> Iterator[bytes]:
+    """Yield the check's output until the terminal closes, or for at most _DRAIN_SECONDS after the check exits."""
+    deadline = None
     while True:
+        if deadline is None and proc.poll() is not None:
+            deadline = time.monotonic() + _DRAIN_SECONDS
+        timeout = _POLL_SECONDS if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            return  # the check has exited and the drain time is up, however much is still coming
+        ready, _, _ = select.select([master], [], [], timeout)
+        if not ready:
+            if deadline is None:
+                continue
+            return
         try:
             data = os.read(master, 65536)
         except OSError:  # Linux raises EIO once the check closes the terminal

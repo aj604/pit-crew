@@ -5,6 +5,7 @@ picture cannot disagree with the decision. The card is SVG with its own backgrou
 reads the same on GitHub's light and dark themes.
 """
 
+import re
 from collections.abc import Sequence
 from statistics import median
 from xml.sax.saxutils import escape
@@ -28,6 +29,8 @@ text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .muted { fill: #8b949e; }
 .red { fill: #f85149; }
 """
+# Markdown that could turn quoted CI output into links, images, HTML or formatting.
+_MARKDOWN = re.compile(r"([\\`*_\[\]<>|~!])")
 _STATUS = {"caught": "good", "missed": "bad", "different failure": "bad", "unverified": "warn", "not a bug": "muted"}
 _COLUMNS = ((28, "bug"), (120, "check"), (340, "baseline"), (450, "candidate"), (570, "result"))
 
@@ -164,4 +167,6 @@ def _outcome(*, failed: bool) -> str:
 
 
 def _cell(s: str) -> str:
-    return s.replace("|", "\\|").replace("\n", " ")
+    """Return text for a table cell, as plain text: it can quote CI output, which anyone's commit can print."""
+    text = _MARKDOWN.sub(r"\\\1", " ".join(s.splitlines()))
+    return text.replace("@", "@\u2060")  # a word joiner after @ stops it pinging a user or team

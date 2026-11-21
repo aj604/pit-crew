@@ -1,8 +1,13 @@
 import functools
 import io
 import json
+import os
+import pty
+import select
+import signal
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -82,6 +87,54 @@ def test_record_keeps_the_checks_exit_code_and_output(tmp_path: Path) -> None:
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
     script = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
     assert record.record([sys.executable, "-c", script], tmp_path / "r.cast", io.BytesIO()) == 128 + 15
+
+
+def test_record_stops_when_the_check_exits_even_if_its_background_process_does_not(tmp_path: Path) -> None:
+    # The sleep keeps the terminal open; CI moves on when the check exits, so the recording must too.
+    pid = tmp_path / "pid"
+    cast = tmp_path / "r.cast"
+    started = time.monotonic()
+    try:
+        code = record.record(["sh", "-c", f"sleep 30 & echo $! > {pid}; echo done; exit 4"], cast, io.BytesIO())
+    finally:
+        if pid.exists():
+            os.kill(int(pid.read_text()), signal.SIGKILL)
+    assert code == 4
+    assert time.monotonic() - started < 10
+    assert "done" in cast.read_text()
+
+
+def test_record_stops_at_the_drain_deadline_while_output_keeps_coming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As when a background process writes faster than the recorder reads: output is always waiting.
+    real_openpty, real_read, real_select = pty.openpty, os.read, select.select
+    terminals: list[int] = []
+    reads = 0
+
+    def openpty() -> tuple[int, int]:
+        master, slave = real_openpty()
+        terminals.append(master)
+        return master, slave
+
+    def read(fd: int, size: int) -> bytes:
+        nonlocal reads
+        if fd not in terminals:
+            return real_read(fd, size)
+        reads += 1
+        if reads > 200_000:
+            raise AssertionError("still recording long after the drain deadline")  # noqa: EM101, TRY003
+        return b"spam\n"
+
+    def ready(read_fds: list[int], *rest: object) -> tuple[list[int], list[int], list[int]]:
+        return (read_fds, [], []) if read_fds == terminals else real_select(read_fds, *rest)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pty, "openpty", openpty)
+    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(select, "select", ready)
+    monkeypatch.setattr(record, "_DRAIN_SECONDS", 0.05)
+    assert record.record(["true"], tmp_path / "r.cast", io.BytesIO()) == 0
+    assert reads
 
 
 def test_a_check_that_reads_stdin_gets_the_jobs_own(tmp_path: Path) -> None:
@@ -374,6 +427,18 @@ def test_a_long_branch_name_is_clipped_clear_of_the_verdict(proof: tuple[Evidenc
     title = svg_texts(render_card("pc/" + "x" * 100, evidence, verdict, replays))[0]
     assert len(title) <= 56
     assert title.endswith("...")
+
+
+def test_pr_body_quotes_ci_output_as_plain_text(proof: tuple[Evidence, Verdict, list[Replay]]) -> None:
+    # Carbon quotes what the recordings show, and any commit can make CI print anything.
+    evidence, verdict, _ = proof
+    loud = replace(OTHER, reason="printed @octo-org/admins, [click](https://evil.example) <img src=x>")
+    body = pr_body("pc/x", evidence, verdict, [replay("aaaa", match=loud)], "card.svg")
+    assert "@octo-org" not in body
+    assert "@\u2060octo-org/admins" in body
+    assert "[click](" not in body
+    assert "\\[click\\](https://evil.example)" in body
+    assert "\\<img src=x\\>" in body  # escaped, so GitHub shows it as text
 
 
 def test_pr_body_says_when_a_replay_has_no_recording(proof: tuple[Evidence, Verdict, list[Replay]]) -> None:
