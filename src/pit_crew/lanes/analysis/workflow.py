@@ -4,6 +4,7 @@ The API reports jobs by display name ("test (ubuntu-latest, 3.12)"), while `need
 to job ids ("test"). Analysis needs both sides joined to build the dependency graph.
 """
 
+import itertools
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,8 @@ import yaml
 
 _EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
+_MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
+_MAX_EXPANSIONS = 1000
 _NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)")
 
 
@@ -39,6 +42,7 @@ class JobSpec:
     runs_on: str = ""
     matrix_keys: tuple[str, ...] = ()  # keys under strategy.matrix, minus include/exclude
     needs_refs: frozenset[str] = frozenset()  # jobs whose outputs this job reads via `needs.<id>`
+    matrix_values: tuple[tuple[str, tuple[str, ...]], ...] = ()  # literal values per matrix key, include entries added
 
 
 @dataclass(frozen=True)
@@ -50,7 +54,17 @@ class Workflow:
 
     def job_id_for(self, display_name: str) -> str | None:
         """The job id a display name from the API belongs to, or None if it matches no job."""
-        for job in self.jobs.values():
+        jobs = list(self.jobs.values())
+        for job in jobs:  # a literal name is the strongest evidence
+            if _EXPRESSION.search(job.name) is None and job.name == display_name:
+                return job.id
+        expanded = {job.id: _expand_name(job) for job in jobs}
+        for job in jobs:  # `${{ matrix.key }}` names with known values are literal names in disguise
+            if display_name in (expanded[job.id] or ()):
+                return job.id
+        # Names left over are patterns: most literal characters first, bare expressions last.
+        patterns = sorted((j for j in jobs if expanded[j.id] is None), key=lambda j: -_literal_length(j.name))
+        for job in patterns:
             if _matches(job, display_name):
                 return job.id
         caller = display_name.split(" / ", 1)[0]  # reusable workflows report "caller / inner job"
@@ -77,6 +91,7 @@ def parse_workflow(text: str) -> Workflow:
             runs_on=_runs_on(body.get("runs-on")),
             matrix_keys=_matrix_keys(body),
             needs_refs=_needs_refs(body, needs),
+            matrix_values=_matrix_values(body),
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
@@ -124,6 +139,53 @@ def _matrix_keys(body: dict[str, Any]) -> tuple[str, ...]:
     if not isinstance(matrix, dict):
         return ()
     return tuple(str(k) for k in matrix if k not in ("include", "exclude"))
+
+
+def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Literal values per matrix key: the key's list plus any `include` entries that set it."""
+    matrix = (body.get("strategy") or {}).get("matrix")
+    if not isinstance(matrix, dict):
+        return ()
+    values: dict[str, list[str]] = {}
+    for key, raw in matrix.items():
+        if key in ("include", "exclude"):
+            continue
+        if isinstance(raw, list) and all(isinstance(v, str | int | float | bool) for v in raw):
+            values[str(key)] = [str(v) for v in raw]
+    includes = matrix.get("include")
+    for entry in includes if isinstance(includes, list) else ():
+        for key, value in entry.items() if isinstance(entry, dict) else ():
+            if isinstance(value, str | int | float | bool) and (str(key) in values or key not in matrix):
+                values.setdefault(str(key), []).append(str(value))
+    return tuple((k, tuple(dict.fromkeys(v))) for k, v in values.items())
+
+
+def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
+    """Every concrete display name of a job named only by `${{ matrix.<key> }}` expressions, or None."""
+    expressions = _EXPRESSION.findall(job.name)
+    keys = [m.group(1) if (m := _MATRIX_EXPRESSION.fullmatch(e)) else None for e in expressions]
+    values = dict(job.matrix_values)
+    if not expressions or any(k is None or k not in values for k in keys):
+        return None
+    used = list(dict.fromkeys(k for k in keys if k is not None))
+    combos = 1
+    for k in used:
+        combos *= len(values[k])
+    if combos > _MAX_EXPANSIONS:
+        return None
+    literals = _EXPRESSION.split(job.name)
+    names = []
+    for combo in itertools.product(*(values[k] for k in used)):
+        chosen = dict(zip(used, combo, strict=True))
+        pieces = [literals[0]]
+        for key, literal in zip(keys, literals[1:], strict=True):
+            pieces += [chosen[str(key)], literal]
+        names.append("".join(pieces))
+    return tuple(names)
+
+
+def _literal_length(name: str) -> int:
+    return len(_EXPRESSION.sub("", name))
 
 
 def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:

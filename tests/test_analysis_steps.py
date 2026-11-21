@@ -167,3 +167,60 @@ def test_non_mapping_with_is_ignored() -> None:
         "jobs:\n  t:\n    steps:\n      - {uses: a/b@v1, with: oops}\n      - {uses: a/c@v1, with: [x]}\n"
     )
     assert [s.with_ for s in wf.jobs["t"].steps] == [{}, {}]
+
+
+def test_matrix_name_expands_instead_of_matching_everything() -> None:
+    wf = parse_workflow("""
+jobs:
+  wasm:
+    name: ${{ matrix.target }}
+    strategy: {matrix: {target: [x, y]}}
+  spelling:
+    name: check-spelling
+""")
+    assert wf.job_id_for("check-spelling") == "spelling"
+    assert wf.job_id_for("x") == "wasm"
+    assert wf.job_id_for("y") == "wasm"
+    assert wf.job_id_for("zzz") is None
+
+
+def test_include_values_and_two_keys_expand() -> None:
+    wf = parse_workflow("""
+jobs:
+  t:
+    name: build ${{ matrix.os }} ${{ matrix.py }}
+    strategy: {matrix: {os: [a], py: [1, 2], include: [{os: b}]}}
+""")
+    assert wf.job_id_for("build b 2") == "t"
+    assert wf.job_id_for("build c 2") is None
+
+
+def test_same_expression_name_in_two_jobs_with_disjoint_targets() -> None:
+    wf = parse_workflow("""
+jobs:
+  one:
+    name: ${{ matrix.target }}
+    strategy: {matrix: {target: [a, b]}}
+  two:
+    name: ${{ matrix.target }}
+    strategy: {matrix: {target: [c, d]}}
+""")
+    assert [wf.job_id_for(n) for n in "abcd"] == ["one", "one", "two", "two"]
+
+
+def test_unexpandable_bare_expression_is_tried_last() -> None:
+    wf = parse_workflow("""
+jobs:
+  dyn:
+    name: ${{ matrix.target }}
+    strategy: {matrix: {target: '${{ fromJSON(needs.x.outputs.t) }}'}}
+  pre:
+    name: pre-${{ matrix.v }}
+    strategy: {matrix: {v: '${{ fromJSON(y) }}'}}
+  lint:
+    name: lint
+    strategy: {matrix: {py: [1]}}
+""")
+    assert wf.job_id_for("pre-3") == "pre"
+    assert wf.job_id_for("lint (1)") == "lint"
+    assert wf.job_id_for("anything") == "dyn"
