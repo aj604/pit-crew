@@ -8,6 +8,14 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const EM_DASH = "\u2014";
 const PLOT = Object.freeze({ x: 48, y: 24, width: 460, height: 208 });
 const MIN_LABEL_GAP = 14;
+const MODALITY_LABELS = Object.freeze({
+  browser_video: "VIDEO",
+  screenshot: "SCREENSHOT",
+  trace_frame: "TRACE",
+  terminal_video: "TERMINAL",
+  log: "LOG",
+});
+const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const isNonNeg = (v) => isNum(v) && v >= 0;
@@ -48,6 +56,40 @@ export function isSafeExternalUrl(url) {
     return false;
   }
 }
+
+/** Pure: allow valid http(s) URLs or safe local static preview paths under `/web/` or `/brand/`. */
+export function isSafePreviewUrl(url) {
+  if (typeof url !== "string") return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("/web/") || trimmed.startsWith("/brand/")) {
+    return !trimmed.includes("..") && !trimmed.includes("\\");
+  }
+  return isSafeExternalUrl(trimmed);
+}
+
+/** Pure: resolve a committed preview path or URL to a safe image URL for the Pit Wall UI. */
+export function resolvePreviewUrl(rawPath, context = null) {
+  if (typeof rawPath !== "string") return null;
+  const trimmed = rawPath.trim();
+  if (!trimmed) return null;
+  if (isSafePreviewUrl(trimmed)) return trimmed;
+  const repo = typeof context?.repo === "string" ? context.repo.trim() : "";
+  const headSha = typeof context?.headSha === "string" ? context.headSha.trim() : "";
+  if (
+    repo &&
+    headSha &&
+    REPO_SLUG_RE.test(repo) &&
+    !trimmed.startsWith("/") &&
+    !trimmed.includes("\\") &&
+    !trimmed.includes(":") &&
+    !trimmed.split("/").includes("..")
+  ) {
+    return `https://raw.githubusercontent.com/${repo}/${encodeURIComponent(headSha)}/${trimmed}`;
+  }
+  return null;
+}
+
 export const formatMetricSeconds = (s) => (isNum(s) ? `${s.toFixed(1)}s` : EM_DASH);
 export const formatSpeedup = (x) => (isNum(x) ? `${x.toFixed(2)}x` : EM_DASH);
 export function formatPValue(p) {
@@ -70,8 +112,13 @@ export function resolveAttemptTelemetry(state) {
   return { candidateId: null, evidence: latest(rec.evidence), verdict: latest(rec.verdicts) };
 }
 
+function safeUrlList(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => (typeof item === "string" ? item.trim() : "")).filter(isSafeExternalUrl);
+}
+
 /** Pure: normalize one `Evidence.bug_outcomes` entry across Demo and Proof-lane shapes. */
-export function normalizeBugOutcome(outcome) {
+export function normalizeBugOutcome(outcome, context = null) {
   const item = outcome && typeof outcome === "object" ? outcome : {};
   const rawRef = String(item.ref ?? item.commit_sha ?? item.sha ?? "").trim();
   const kind =
@@ -81,15 +128,40 @@ export function normalizeBugOutcome(outcome) {
         ? "commit"
         : "unknown";
   const baselineFailed = typeof item.baseline_failed === "boolean" ? item.baseline_failed : null;
+  const rawStatus = typeof item.status === "string" ? item.status.trim().toLowerCase() : "";
   const caught =
     typeof item.caught === "boolean"
       ? item.caught
-      : typeof item.status === "string" && item.status.trim().toLowerCase() === "caught";
+      : rawStatus === "caught";
+  const statusLabel = caught
+    ? "CAUGHT"
+    : rawStatus === "different failure"
+      ? "DIFF FAILURE"
+      : rawStatus === "unverified"
+        ? "UNVERIFIED"
+        : "MISSED";
   const rawUrl = typeof item.run_url === "string" ? item.run_url.trim() : "";
+  const rawModality = typeof item.modality === "string" ? item.modality.trim().toLowerCase() : "";
+  const modality = Object.hasOwn(MODALITY_LABELS, rawModality) ? rawModality : "";
+  const modalityLabel = modality ? MODALITY_LABELS[modality] : "";
+  const visualEvidenceSeen = item.visual_evidence_seen === true;
+  const rawSummary = typeof item.visual_summary === "string" && item.visual_summary.trim()
+    ? item.visual_summary.trim()
+    : typeof item.seen === "string"
+      ? item.seen.trim()
+      : "";
+  const baselinePreviewUrl = resolvePreviewUrl(item.baseline_preview_url ?? item.baseline_preview_path ?? "", context);
+  const candidatePreviewUrl = resolvePreviewUrl(item.candidate_preview_url ?? item.candidate_preview_path ?? "", context);
+  const baselineArtifactUrls = safeUrlList(item.baseline_artifact_urls);
+  const candidateArtifactUrls = safeUrlList(item.candidate_artifact_urls);
   return {
     kind, rawRef, displayRef: rawRef ? (kind === "commit" ? rawRef.slice(0, 7) : rawRef) : EM_DASH,
     baselineFailed, baselineLabel: baselineFailed === true ? "FAIL" : baselineFailed === false ? "PASS" : EM_DASH,
-    caught, statusLabel: caught ? "CAUGHT" : "MISSED", runUrl: isSafeExternalUrl(rawUrl) ? rawUrl : null,
+    caught, statusLabel, runUrl: isSafeExternalUrl(rawUrl) ? rawUrl : null,
+    modality, modalityLabel, visualEvidenceSeen, visualSummary: rawSummary,
+    baselinePreviewUrl, candidatePreviewUrl,
+    baselineArtifactUrls, candidateArtifactUrls,
+    hasVisualPreview: Boolean(baselinePreviewUrl && candidatePreviewUrl),
   };
 }
 
@@ -161,12 +233,15 @@ export function buildTimingChartModel(evidence, verdict) {
 }
 
 /** Pure: compute Bug Replay Matrix view-model from `Evidence`. */
-export function buildBugMatrixModel(evidence) {
-  if (!evidence) return { hasEvidence: false, rows: [], total: 0, caught: 0, missed: 0 };
-  const rows = (Array.isArray(evidence.bug_outcomes) ? evidence.bug_outcomes : []).map(normalizeBugOutcome);
+export function buildBugMatrixModel(evidence, context = null) {
+  if (!evidence) return { hasEvidence: false, rows: [], total: 0, caught: 0, missed: 0, visualRows: [] };
+  const rows = (Array.isArray(evidence.bug_outcomes) ? evidence.bug_outcomes : []).map((row) =>
+    normalizeBugOutcome(row, context),
+  );
   const total = isNonNeg(evidence.bugs_total) && evidence.bugs_total >= rows.length ? evidence.bugs_total : rows.length;
   const caught = rows.length > 0 ? rows.filter((r) => r.caught).length : isNonNeg(evidence.bugs_caught) ? evidence.bugs_caught : 0;
-  return { hasEvidence: true, rows, total, caught, missed: Math.max(0, total - caught) };
+  const visualRows = rows.filter((r) => r.hasVisualPreview || r.visualSummary || r.modality);
+  return { hasEvidence: true, rows, total, caught, missed: Math.max(0, total - caught), visualRows };
 }
 
 function makeEl(root, tag, className = "", text = "", attrs = null) {
@@ -251,7 +326,7 @@ function renderBugTable(root, model) {
   const wrap = makeEl(root, "div", "bug-matrix__table-wrap");
   const table = makeEl(root, "table", "bug-matrix__table");
   const headRow = makeEl(root, "tr");
-  for (const label of ["Kind", "Ref", "Baseline", "Status", "CI Run"]) {
+  for (const label of ["Kind", "Ref", "Proof", "Baseline", "Status", "CI Run"]) {
     headRow.append(makeEl(root, "th", "bug-matrix__th", label, { scope: "col" }));
   }
   const thead = makeEl(root, "thead");
@@ -266,8 +341,15 @@ function renderBugTable(root, model) {
     const tr = makeEl(root, "tr", "bug-matrix__row");
     tr.dataset.kind = row.kind;
     tr.dataset.caught = String(row.caught);
+    if (row.modality) tr.dataset.modality = row.modality;
     const code = makeEl(root, "code", "bug-matrix__code telemetry", row.displayRef);
     if (row.rawRef) code.title = row.rawRef;
+    const modalityNode = row.modality
+      ? Object.assign(makeEl(root, "span", `bug-modality bug-modality--${row.modality} telemetry`, row.modalityLabel), {
+          title: row.visualSummary || row.modalityLabel,
+        })
+      : makeEl(root, "span", "bug-matrix__no-link telemetry", EM_DASH);
+    if (row.modality) modalityNode.dataset.modality = row.modality;
     const baseState = row.baselineFailed === true ? "failed" : row.baselineFailed === false ? "passed" : "unknown";
     const baseBadge = makeEl(root, "span", `bug-baseline bug-baseline--${baseState} telemetry`, row.baselineLabel);
     baseBadge.dataset.baselineFailed = row.baselineFailed === null ? "unknown" : String(row.baselineFailed);
@@ -286,6 +368,7 @@ function renderBugTable(root, model) {
     tr.append(
       cell(makeEl(root, "span", `bug-kind bug-kind--${row.kind}`, row.kind)),
       cell(code, "bug-matrix__ref telemetry"),
+      cell(modalityNode),
       cell(baseBadge),
       cell(statusBadge),
       cell(runNode, "bug-matrix__run-cell"),
@@ -295,6 +378,84 @@ function renderBugTable(root, model) {
   table.append(thead, tbody);
   wrap.append(table);
   return wrap;
+}
+
+function renderVisualProofPanel(root, model) {
+  if (!model.visualRows || model.visualRows.length === 0) return null;
+  const panel = makeEl(root, "section", "visual-proof", "", { "aria-label": "Multimodal visual proof evidence" });
+  const heading = makeEl(root, "h3", "visual-proof__heading", "Visual Proof (gemini-4-carbon)");
+  const list = makeEl(root, "div", "visual-proof__list");
+  for (const row of model.visualRows) {
+    const card = makeEl(root, "article", "visual-proof__card");
+    card.dataset.ref = row.displayRef;
+    if (row.modality) card.dataset.modality = row.modality;
+
+    const top = makeEl(root, "div", "visual-proof__head");
+    top.append(makeEl(root, "code", "visual-proof__ref telemetry", row.displayRef));
+    if (row.modality) {
+      const pill = makeEl(root, "span", `bug-modality bug-modality--${row.modality} telemetry`, row.modalityLabel);
+      pill.dataset.modality = row.modality;
+      top.append(pill);
+    }
+    const status = makeEl(
+      root,
+      "span",
+      row.caught ? "bug-status bug-status--caught telemetry" : "bug-status bug-status--missed telemetry",
+      row.statusLabel,
+    );
+    top.append(status);
+    card.append(top);
+
+    if (row.visualSummary) {
+      card.append(makeEl(root, "p", "visual-proof__summary", row.visualSummary));
+    }
+
+    if (row.hasVisualPreview) {
+      const grid = makeEl(root, "div", "visual-proof__frames");
+      for (const [side, label, url] of [
+        ["baseline", "Baseline", row.baselinePreviewUrl],
+        ["candidate", "Candidate", row.candidatePreviewUrl],
+      ]) {
+        const fig = makeEl(root, "figure", `visual-proof__frame visual-proof__frame--${side}`);
+        fig.append(
+          makeEl(root, "figcaption", "visual-proof__caption telemetry", label),
+          makeEl(root, "img", "visual-proof__img", "", {
+            src: url,
+            alt: `${label} failure frame for ${row.displayRef}`,
+            loading: "lazy",
+          }),
+        );
+        grid.append(fig);
+      }
+      card.append(grid);
+    }
+
+    if (row.baselineArtifactUrls.length > 0 || row.candidateArtifactUrls.length > 0) {
+      const links = makeEl(root, "div", "visual-proof__links");
+      if (row.baselineArtifactUrls[0]) {
+        links.append(
+          makeEl(root, "a", "bug-matrix__link telemetry", "Baseline artifact \u2197", {
+            href: row.baselineArtifactUrls[0],
+            target: "_blank",
+            rel: "noopener noreferrer",
+          }),
+        );
+      }
+      if (row.candidateArtifactUrls[0]) {
+        links.append(
+          makeEl(root, "a", "bug-matrix__link telemetry", "Candidate artifact \u2197", {
+            href: row.candidateArtifactUrls[0],
+            target: "_blank",
+            rel: "noopener noreferrer",
+          }),
+        );
+      }
+      card.append(links);
+    }
+    list.append(card);
+  }
+  panel.append(heading, list);
+  return panel;
 }
 
 function createPanelHeader(root, title, badgeClass, extra = null) {
@@ -339,9 +500,17 @@ export function createTelemetryCenter(root, slot, store) {
   slot.replaceChildren(timingPanel, matrixPanel);
 
   const render = (state) => {
-    const { evidence, verdict } = resolveAttemptTelemetry(state);
+    const { candidateId, evidence, verdict } = resolveAttemptTelemetry(state);
+    const candidates = Array.isArray(state?.records?.candidates) ? state.records.candidates : [];
+    const matchedCandidate = candidateId
+      ? findLast(candidates, (c) => c?.id === candidateId)
+      : (candidates.at(-1) ?? null);
+    const previewContext = {
+      repo: state?.status?.repo || state?.repo || matchedCandidate?.repo || "",
+      headSha: state?.selectedAttempt?.head_sha || matchedCandidate?.head_sha || "",
+    };
     const chart = buildTimingChartModel(evidence, verdict);
-    const matrix = buildBugMatrixModel(evidence);
+    const matrix = buildBugMatrixModel(evidence, previewContext);
     metricValues.speedup.textContent = chart.summary.speedup;
     metricValues.p_value.textContent = chart.summary.pValue;
     metricValues.median.textContent = chart.summary.median;
@@ -369,7 +538,10 @@ export function createTelemetryCenter(root, slot, store) {
       matrixBadge.textContent =
         matrix.missed > 0 ? `${matrix.caught}/${matrix.total} CAUGHT \u00b7 ${matrix.missed} MISSED` : `${matrix.caught}/${matrix.total} CAUGHT`;
       matrixBadge.dataset.state = matrix.missed > 0 ? "missed" : "caught";
-      matrixHost.replaceChildren(renderBugTable(root, matrix));
+      const children = [renderBugTable(root, matrix)];
+      const visualPanel = renderVisualProofPanel(root, matrix);
+      if (visualPanel) children.push(visualPanel);
+      matrixHost.replaceChildren(...children);
     }
   };
 
