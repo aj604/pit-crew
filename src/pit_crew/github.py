@@ -1,10 +1,11 @@
 """Host-side GitHub boundary contract and ``httpx`` REST implementation.
 
-Defines ``WorkflowRunResult``, the ``GitHubClient`` protocol, and the concrete
-``HttpxGitHubClient`` backed by GitHub's REST and Git Data APIs. Keeping the
-client and its bearer token strictly on the host allows the Dispatcher's
-orchestration, replay overlays, evidence collection, and compounding loop to be
-developed and tested completely offline without network calls or secrets.
+Defines ``WorkflowRunResult``, the ``GitHubClient``, ``CandidatePublisherClient``,
+and ``PullRequestClient`` protocols, and the concrete ``HttpxGitHubClient`` backed
+by GitHub's REST and Git Data APIs. Keeping the client and its bearer token
+strictly on the host allows the Dispatcher's orchestration, replay overlays,
+evidence collection, and compounding loop to be developed and tested completely
+offline without network calls or secrets.
 """
 
 import os
@@ -62,6 +63,32 @@ class WorkflowRunResult:
     html_url: str
     head_sha: str
     head_branch: str
+
+
+@runtime_checkable
+class CandidatePublisherClient(Protocol):
+    """Writes a Candidate's files onto a branch of the target fork."""
+
+    def reset_branch(self, repo: str, branch: str, sha: str) -> None:
+        """Point ``refs/heads/{branch}`` in ``repo`` at ``sha``, creating it or force-resetting it."""
+        ...
+
+    def commit_files(self, repo: str, branch: str, files: dict[str, str], message: str) -> str:
+        """Commit ``files`` (path to full content) atop ``branch``'s tip, advance the branch, return the new sha."""
+        ...
+
+
+@runtime_checkable
+class PullRequestClient(Protocol):
+    """Commits proof artifacts onto a candidate branch and opens a pull request."""
+
+    def commit_files(self, repo: str, branch: str, files: dict[str, str], message: str) -> str:
+        """Commit ``files`` (path to full content) atop ``branch``'s tip, advance the branch, return the new sha."""
+        ...
+
+    def open_pull_request(self, repo: str, *, head: str, base: str, title: str, body: str) -> str:
+        """Open a pull request from ``head`` into ``base`` in ``repo`` and return its URL."""
+        ...
 
 
 @runtime_checkable
