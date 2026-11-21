@@ -189,6 +189,7 @@ class SqliteLedger(_QueryMixin):
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection inside a transaction, then close it (``with conn`` alone never closes)."""
         conn = sqlite3.connect(self.path, timeout=5.0)
         try:
             conn.execute("PRAGMA busy_timeout=5000")

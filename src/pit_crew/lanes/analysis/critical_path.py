@@ -11,7 +11,6 @@ setup and running (see `buckets.py`) so the biggest bucket can be fixed first.
 """
 
 import json
-import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -21,9 +20,7 @@ from typing import Any
 from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, job_buckets
 from pit_crew.lanes.analysis.history import JobRun, WorkflowRun
 from pit_crew.lanes.analysis.stats import percentile
-from pit_crew.lanes.analysis.workflow import Workflow, topological_order
-
-_SHA = re.compile(r"\b[0-9a-f]{40}\b")
+from pit_crew.lanes.analysis.workflow import SHA, Workflow, topological_order
 
 
 @dataclass(frozen=True)
@@ -235,7 +232,7 @@ def step_profiles(workflow: Workflow, runs: list[WorkflowRun]) -> list[StepProfi
                 continue
             for step in job.steps:
                 if step.conclusion != "skipped":
-                    samples[(job_id, _SHA.sub("<sha>", step.name))].append(step.seconds)
+                    samples[(job_id, SHA.sub("<sha>", step.name))].append(step.seconds)
     steps = [
         StepProfile(job_id, name, median(values), percentile(values, 95), len(values))
         for (job_id, name), values in samples.items()
