@@ -25,14 +25,16 @@ Output: one replay plan.
    - Call `propose_mutants` with that file and pick a mutant on a line those tests cover.
      For a lint or typecheck check, write the smallest change that breaks that check
      instead, such as an unused import or a wrong type.
-   - Commit that one change on a new branch `pc/mutant/<candidate id>/<n>` off the
-     candidate's base, not off the candidate, and push it.
+   - Apply that one change to the file as it is on the candidate's base (`/workspace`) and
+     keep the whole mutated file. Do not commit or push; the host replays it for you.
    - Never write a bug that fails every check, such as a syntax error. It proves nothing
      about the check the candidate touched.
    - Every replay is recorded on video, and Gemini 4 Neon checks that the candidate fails
      the same way the baseline does. Pick mutants that fail with a specific, readable
      message, like an assertion showing expected and actual values, not a crash or a hang.
-4. Call `plan_replays` with the required replays, your additions and your mutant commits.
+4. Call `plan_replays` with the required replays and your additions as `bug_shas`, and each
+   mutant as a `mutations` entry: its path, the whole mutated file, and which check should
+   catch it.
 
 If an uncovered check has no code you can mutate, say so in your final message and still
 plan the replays you have. The gap shows in the evidence instead of hiding.

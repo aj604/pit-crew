@@ -8,9 +8,11 @@ The deterministic part runs in code the dispatcher calls before starting the age
 
 import re
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict
+from pathlib import PurePosixPath
 
-from pit_crew.contracts import Candidate, ReplayPlan
+from pit_crew.contracts import BugCase, Candidate, ReplayPlan
 from pit_crew.lanes.proof.miner import RedCommit
 from pit_crew.lanes.proof.mutants import mutants
 from pit_crew.ledger import Ledger
@@ -20,8 +22,27 @@ MAX_REPLAYS = 20
 _SHA = re.compile(r"^[0-9a-f]{4,40}$")  # git's shortest abbreviation up to a full SHA-1
 
 
-def pick_replays(red: list[RedCommit], touched: set[str] | None, limit: int = MAX_REPLAYS) -> list[str]:
-    """Bugs the touched checks caught, taking turns between checks so each gets coverage.
+class InvalidReplayPlanError(ValueError):
+    """Raised when plan_replays is given nothing to replay, or something that is not a bug."""
+
+    @classmethod
+    def empty(cls) -> "InvalidReplayPlanError":
+        """Build the error for a plan with no bugs in it."""
+        return cls("a replay plan needs at least one bug; the rater rejects a candidate with none")
+
+    @classmethod
+    def not_shas(cls, bad: Iterable[str]) -> "InvalidReplayPlanError":
+        """Build the error for values that are not commit SHAs."""
+        return cls(f"not commit SHAs: {', '.join(bad)}")
+
+    @classmethod
+    def bad_mutation(cls, path: str) -> "InvalidReplayPlanError":
+        """Build the error for a mutation without a relative path and new contents."""
+        return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
+
+
+def pick_replays(red: Iterable[RedCommit], touched: set[str] | None, limit: int = MAX_REPLAYS) -> list[str]:
+    """Return bugs the touched checks caught, taking turns between checks so each gets coverage.
 
     Within a check, bugs that were later fixed come first (a red-to-green fix is a real
     bug, not a broken branch), then the newest. touched=None means every check.
@@ -43,8 +64,8 @@ def pick_replays(red: list[RedCommit], touched: set[str] | None, limit: int = MA
     return picked
 
 
-def uncovered_checks(red: list[RedCommit], touched: set[str]) -> set[str]:
-    """Touched checks with no recorded bug. Each needs a mutant, or the change is unproven there."""
+def uncovered_checks(red: Iterable[RedCommit], touched: set[str]) -> set[str]:
+    """Return touched checks with no recorded bug. Each needs a mutant, or the change is unproven there."""
     caught = {check for commit in red for check in commit.checks}
     return touched - caught
 
@@ -61,11 +82,16 @@ def uncovered_checks(red: list[RedCommit], touched: set[str]) -> set[str]:
         "required": ["path", "source"],
     },
 )
-def propose_mutants(ledger: Ledger, path: str, source: str, limit: int = 50) -> list[dict]:
+def propose_mutants(
+    ledger: Ledger,  # noqa: ARG001  every tool takes the ledger first
+    path: str,
+    source: str,
+    limit: int = 50,
+) -> list[dict[str, object]]:
     """One-operator mutants of a source file, each a one-line bug: {path, line, before, after, operator}.
 
-    Replace line `line` (1-based) of `path` with `after`, commit that one change on a new
-    branch off the candidate's base, push it, and add the commit to the replay plan.
+    Replace line `line` (1-based) of the file with `after` and pass the whole mutated file
+    to plan_replays as a mutation.
     """
     return [asdict(m) for m in mutants(path, source, limit)]
 
@@ -79,20 +105,50 @@ def propose_mutants(ledger: Ledger, path: str, source: str, limit: int = 50) -> 
             "bug_shas": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Commits that turned CI red, or pushed mutant commits, that must still fail on the candidate",
+                "description": "Commits that turned CI red and must still fail on the candidate",
+            },
+            "mutations": {
+                "type": "array",
+                "description": "Synthetic bugs for checks with no recorded failure",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Repository path of the mutated file"},
+                        "content": {"type": "string", "description": "The whole file, with the bug in it"},
+                        "reason": {"type": "string", "description": "Which check should catch it, and why"},
+                    },
+                    "required": ["path", "content", "reason"],
+                },
             },
         },
-        "required": ["candidate_id", "bug_shas"],
+        "required": ["candidate_id"],
     },
 )
-def plan_replays(ledger: Ledger, candidate_id: str, bug_shas: list[str]) -> str:
-    """Choose which bugs to replay against a candidate. Returns the plan id."""
+def plan_replays(
+    ledger: Ledger,
+    candidate_id: str,
+    bug_shas: list[str] | None = None,
+    mutations: list[dict[str, str]] | None = None,
+) -> str:
+    """Choose which bugs to replay against a candidate: red commits and mutated files. Returns the plan id."""
     ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
-    shas = tuple(dict.fromkeys(sha.strip().lower() for sha in bug_shas))
-    if not shas:
-        raise ValueError("a replay plan needs at least one bug; the rater rejects a candidate with none")
+    shas = tuple(dict.fromkeys(sha.strip().lower() for sha in bug_shas or ()))
     if bad := [sha for sha in shas if not _SHA.match(sha)]:
-        raise ValueError(f"not commit SHAs: {', '.join(bad)}")
-    plan = ReplayPlan(candidate_id, shas)
+        raise InvalidReplayPlanError.not_shas(bad)
+    cases = [BugCase(kind="commit", commit_sha=sha, reason="historical red commit") for sha in shas]
+    cases += [_mutation_case(m) for m in mutations or ()]
+    if not cases:
+        raise InvalidReplayPlanError.empty()
+    plan = ReplayPlan(candidate_id, bug_shas=shas, cases=tuple(cases))
     ledger.add(plan)
     return plan.id
+
+
+def _mutation_case(mutation: Mapping[str, str]) -> BugCase:
+    path, content = mutation.get("path", ""), mutation.get("content", "")
+    parts = PurePosixPath(path).parts
+    if not path or path.startswith("/") or ".." in parts or not content:
+        raise InvalidReplayPlanError.bad_mutation(path)
+    return BugCase(
+        kind="mutation", mutated_files={path: content}, reason=mutation.get("reason") or "synthetic mutation"
+    )

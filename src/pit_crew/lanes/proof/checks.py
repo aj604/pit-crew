@@ -1,135 +1,113 @@
 """Work out which CI checks a candidate's change can affect.
 
 When in doubt this answers "every check" (None): proving too much costs replay minutes,
-proving too little lets a change hide a bug.
-
-The parser reads only the block structure of a GitHub Actions workflow: top-level keys,
-the jobs under `jobs:`, and each job's `name:` and `needs:`. Anything it does not
-recognise, such as flow-style YAML, makes it give up and answer None.
+proving too little lets a change hide a bug. Workflows are compared as parsed YAML, so
+comments and formatting never count as a change.
 """
 
-import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Any, TypedDict
+
+import yaml
 
 from pit_crew.lanes.proof.miner import check_key
 
 _WORKFLOWS = ".github/workflows/"
-_KEY = re.compile(r"""^(\s*)["']?([\w.-]+)["']?:\s*(.*)$""")
+
+
+class FileChange(TypedDict):
+    """One file in the candidate's diff; before is None when added, after is None when deleted."""
+
+    path: str
+    before: str | None
+    after: str | None
 
 
 @dataclass(frozen=True)
 class Workflow:
-    name: str
-    header: tuple[str, ...] = ()  # every line outside `jobs:`
-    jobs: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    names: dict[str, str] = field(default_factory=dict)  # job id -> display name
-    needs: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    """A parsed workflow: its name, every top-level key but `jobs`, and each job's body."""
 
-    def keys(self, job_ids: set[str]) -> set[str]:
-        """Check keys for these jobs, by id and by display name, so either spelling matches."""
+    name: str
+    header: dict[str, Any] = field(default_factory=dict)
+    jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def needs(self, job_id: str) -> tuple[str, ...]:
+        """Return the jobs `job_id` waits for."""
+        needs = self.jobs.get(job_id, {}).get("needs") or ()
+        return (needs,) if isinstance(needs, str) else tuple(str(n) for n in needs)
+
+    def keys(self, job_ids: Iterable[str]) -> set[str]:
+        """Return check keys for these jobs, by id and by display name, so either spelling matches."""
         out = set()
-        for job_id in job_ids & self.jobs.keys():
+        for job_id in set(job_ids) & self.jobs.keys():
+            name = self.jobs[job_id].get("name")
             out.add(check_key(self.name, job_id))
-            out.add(check_key(self.name, self.names.get(job_id, job_id)))
+            out.add(check_key(self.name, name if isinstance(name, str) and name else job_id))
         return out
 
 
-def touched_checks(changes: list[dict]) -> set[str] | None:
-    """Check keys a change can affect, or None for every check.
+def parse_workflow(text: str, path: str) -> Workflow | None:
+    """Parse a workflow file, or return None if it is not YAML with a mapping of jobs."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict) or not _is_jobs(doc.get("jobs")):
+        return None
+    name = doc.get("name")
+    return Workflow(
+        name=name if isinstance(name, str) and name else path,
+        header={str(k): v for k, v in doc.items() if k != "jobs"},
+        jobs=doc["jobs"],
+    )
 
-    Each change is {"path", "before", "after"}; before is None for an added file and after
-    is None for a deleted one. A changed file outside .github/workflows/ (a script, a test
-    config, a lockfile, a composite action) can affect any check, so it answers None. A
-    removed job is reported as touched, so its old bugs are replayed and the removal fails.
+
+def touched_checks(changes: Iterable[FileChange]) -> set[str] | None:
+    """Return the check keys a change can affect, or None for every check.
+
+    A changed file outside .github/workflows/ (a script, a test config, a lockfile, a
+    composite action) can affect any check, so it answers None, as does a workflow that
+    won't parse. A change outside `jobs:` (triggers, env, permissions) touches every job in
+    that workflow. A removed job is reported as touched, so its old bugs are replayed and
+    the removal fails.
     """
     touched: set[str] = set()
     for change in changes:
         path = change["path"]
         if not (path.startswith(_WORKFLOWS) and path.endswith((".yml", ".yaml"))):
             return None
-        before = parse_workflow(change["before"], path) if change["before"] is not None else Workflow(path)
-        after = parse_workflow(change["after"], path) if change["after"] is not None else Workflow(path)
+        before = _side(change["before"], path)
+        after = _side(change["after"], path)
         if before is None or after is None:
             return None
-        if before.header != after.header:
-            changed = before.jobs.keys() | after.jobs.keys()
+        every_job = before.jobs.keys() | after.jobs.keys()
+        if before.header == after.header:
+            changed = {j for j in every_job if before.jobs.get(j) != after.jobs.get(j)}
         else:
-            changed = {j for j in before.jobs.keys() | after.jobs.keys() if before.jobs.get(j) != after.jobs.get(j)}
+            changed = set(every_job)
         changed = _with_dependents(changed, before, after)
         touched |= before.keys(changed) | after.keys(changed)
     return touched
 
 
-def all_checks(workflows: dict[str, str]) -> set[str] | None:
-    """Every check key defined by these workflow files (path -> text), or None if one won't parse."""
+def all_checks(workflows: Mapping[str, str]) -> set[str] | None:
+    """Return every check key defined by these workflow files (path -> text), or None if one won't parse."""
     keys: set[str] = set()
     for path, text in workflows.items():
         workflow = parse_workflow(text, path)
         if workflow is None:
             return None
-        keys |= workflow.keys(set(workflow.jobs))
+        keys |= workflow.keys(workflow.jobs)
     return keys
 
 
-def parse_workflow(text: str, path: str) -> Workflow | None:
-    lines = [line.rstrip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-    start = next((i for i, line in enumerate(lines) if line.startswith("jobs:")), None)
-    if start is None or _value(lines[start]):
-        return None
-    end = next((i for i in range(start + 1, len(lines)) if not lines[i][0].isspace()), len(lines))
-    header = lines[:start] + lines[end:]
-    body = lines[start + 1 : end]
-
-    jobs: dict[str, list[str]] = {}
-    indent = _indent(body[0]) if body else 0
-    for line in body:
-        if _indent(line) < indent:
-            return None
-        if _indent(line) == indent:
-            match = _KEY.match(line)
-            if not match or _value(line):
-                return None
-            current = jobs.setdefault(match.group(2), [])
-        else:
-            current.append(line)
-
-    name = next((_unquote(_value(line)) for line in header if line.startswith("name:")), path)
-    return Workflow(
-        name=name,
-        header=tuple(header),
-        jobs={job_id: tuple(job) for job_id, job in jobs.items()},
-        names={job_id: n for job_id, job in jobs.items() if (n := _field(job, "name"))},
-        needs={job_id: _needs(job) for job_id, job in jobs.items()},
-    )
+def _side(text: str | None, path: str) -> Workflow | None:
+    return Workflow(path) if text is None else parse_workflow(text, path)
 
 
-def _field(job: list[str], key: str) -> str | None:
-    child = _indent(job[0]) if job else 0
-    for line in job:
-        match = _KEY.match(line)
-        if match and len(match.group(1)) == child and match.group(2) == key:
-            return _unquote(match.group(3))
-    return None
-
-
-def _needs(job: list[str]) -> tuple[str, ...]:
-    child = _indent(job[0]) if job else 0
-    for i, line in enumerate(job):
-        match = _KEY.match(line)
-        if not (match and len(match.group(1)) == child and match.group(2) == "needs"):
-            continue
-        value = match.group(3)
-        if value.startswith("["):
-            return tuple(_unquote(v) for v in value.strip("[]").split(",") if v.strip())
-        if value:
-            return (_unquote(value),)
-        items = []
-        for item in job[i + 1 :]:
-            if _indent(item) <= child or not item.lstrip().startswith("- "):
-                break
-            items.append(_unquote(item.lstrip()[2:]))
-        return tuple(items)
-    return ()
+def _is_jobs(jobs: object) -> bool:
+    return isinstance(jobs, dict) and all(isinstance(k, str) and isinstance(v, dict) for k, v in jobs.items())
 
 
 def _with_dependents(changed: set[str], *workflows: Workflow) -> set[str]:
@@ -139,23 +117,8 @@ def _with_dependents(changed: set[str], *workflows: Workflow) -> set[str]:
     while grew:
         grew = False
         for workflow in workflows:
-            for job_id, needs in workflow.needs.items():
-                if job_id not in out and out & set(needs):
+            for job_id in workflow.jobs.keys() - out:
+                if out.intersection(workflow.needs(job_id)):
                     out.add(job_id)
                     grew = True
     return out
-
-
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip())
-
-
-def _value(line: str) -> str:
-    match = _KEY.match(line)
-    value = match.group(3) if match else ""
-    return "" if value.startswith("#") else value
-
-
-def _unquote(value: str | None) -> str:
-    value = (value or "").split(" #")[0].strip()
-    return value.strip("'\"")
