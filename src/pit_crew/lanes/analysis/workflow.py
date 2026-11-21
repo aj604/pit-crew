@@ -204,26 +204,36 @@ def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], .
 
 
 MATRIX_TOO_LARGE = "<matrix too large>"  # sentinel: coverage unknown, so dedupe never treats such a job as a copy
-_MAX_MATRIX_NODES = 10_000
 _MAX_MATRIX_BYTES = 64 * 1024
+_MAX_BODY_BYTES = 1_000_000
+_ENTRY_COST = 2  # rough serialized overhead per container entry and per key
 
 
-def _within_node_budget(root: object) -> bool:
-    """Count distinct container and scalar nodes, each shared node once (aliases are shared references)."""
-    seen: set[int] = set()
-    stack = [root]
+def _expanded_size_within(obj: object, limit: int) -> bool:
+    """Whether `obj`, with every shared reference expanded, serializes to at most about `limit` characters.
+
+    YAML aliases to scalars are written out in full on every use, so counting distinct nodes is not enough.
+    Shared nodes are visited each time they are referenced; the visit count is capped too, which bounds cycles.
+    """
+    total = 0
+    visits = 0
+    stack = [obj]
     while stack:
         node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        if len(seen) > _MAX_MATRIX_NODES:
+        visits += 1
+        if visits > limit:
             return False
         if isinstance(node, dict):
+            total += _ENTRY_COST * len(node)
             stack.extend(node.keys())
             stack.extend(node.values())
         elif isinstance(node, list):
+            total += _ENTRY_COST * len(node)
             stack.extend(node)
+        else:
+            total += len(str(node))
+        if total > limit:
+            return False
     return True
 
 
@@ -239,7 +249,7 @@ def _matrix_definition(body: dict[str, Any]) -> str:
         return matrix  # an expression such as fromJSON(...): compared as written
     if not isinstance(matrix, dict):
         return ""
-    if not _within_node_budget(matrix):
+    if not _expanded_size_within(matrix, _MAX_MATRIX_BYTES):
         return MATRIX_TOO_LARGE
     try:
         text = yaml.safe_dump(matrix, sort_keys=True, default_flow_style=True, width=2**31)
@@ -289,6 +299,8 @@ def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
     if_ = body.get("if")
     if if_ is not None and _STATUS_FUNCTION.search(str(if_)):
         return frozenset(needs)  # the job decides on its needs' results, so every edge carries a signal
+    if not _expanded_size_within(body, _MAX_BODY_BYTES):
+        return frozenset(needs)  # too large to scan: assume it reads every need, so no edge is ever cut
     text = yaml.safe_dump(body, width=2**31)  # no line wrapping, so a pattern is never split across lines
     if _READS_EVERY_NEED.search(text):
         return frozenset(needs)

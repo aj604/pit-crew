@@ -294,3 +294,20 @@ def test_matrix_definition_ignores_key_order() -> None:
     one = parse_workflow(_pair("    strategy:\n      matrix:\n        a: [1]\n        b: [2]\n", ""))
     two = parse_workflow(_pair("    strategy:\n      matrix:\n        b: [2]\n        a: [1]\n", ""))
     assert one.jobs["a"].matrix_definition == two.jobs["a"].matrix_definition != ""
+
+
+def test_matrix_shared_scalar_is_bounded_by_expanded_size() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 2_000)
+    matrix = f'    strategy:\n      matrix:\n        x: &s "{big}"\n        y: [{refs}]\n'
+    start = time.perf_counter()
+    wf = parse_workflow(_pair(matrix, ""))
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
+
+
+def test_matrix_recursive_anchor_does_not_hang() -> None:
+    start = time.perf_counter()
+    wf = parse_workflow(_pair("    strategy:\n      matrix:\n        a: &r [*r]\n", ""))
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE

@@ -320,3 +320,23 @@ def test_tokenizer_matches_the_regex_it_replaced() -> None:
     for _ in range(5_000):
         text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
         assert _tokenize(text) == (expression.split(text), expression.findall(text)), text
+
+
+def test_job_body_with_shared_huge_scalar_reads_all_needs_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(f"k{i}: *s" for i in range(2_000))
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  a: {{runs-on: ubuntu-latest}}
+  b: {{runs-on: ubuntu-latest}}
+  c:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - run: echo hi
+        env: {{{refs}}}
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].needs_refs == frozenset({"a", "b"})
