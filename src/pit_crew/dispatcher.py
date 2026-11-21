@@ -27,10 +27,12 @@ from pit_crew.contracts import (
     is_allowed_candidate_path,
 )
 from pit_crew.github import GitHubClient, WorkflowRunResult
+from pit_crew.lanes.optimizer.tools import check_candidate_files
 from pit_crew.ledger import Ledger, normalize_repo
 from pit_crew.rater import rate
 
 DISALLOWED_PATH_REASON = "disallowed path modified"
+CHECKS_LESS_REASON = "candidate checks less than its base"
 NO_REPLAY_PLAN_REASON = "no replay plan produced, so safety is unproven"
 
 _Hunk = tuple[int, int, list[str]]
@@ -415,6 +417,16 @@ class Dispatcher:
         """Return any disallowed file paths touched by ``candidate``."""
         paths = dict.fromkeys((*candidate.changed_files, *candidate.files))
         return tuple(path for path in paths if not is_allowed_candidate_path(path))
+
+    def guard_candidate(self, repo: str, base_sha: str, candidate: Candidate) -> list[str]:
+        """Run the Optimizer's never-check-less guard against the real files at ``base_sha``.
+
+        The agent reports `original_files` itself; re-checking against GitHub's copy means a wrong or
+        invented "before" text cannot get a weakening change published.
+        """
+        fetched = {path: self.github.get_file_content(repo, path, base_sha) for path in candidate.files}
+        base = {path: text for path, text in fetched.items() if text is not None}
+        return check_candidate_files(candidate.files, base)
 
     def poll_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
         """Poll ``github.get_workflow_run`` until ``run_id`` completes or times out."""
@@ -856,6 +868,17 @@ class Dispatcher:
                 speedup=0.0,
                 p_value=None,
                 reason=DISALLOWED_PATH_REASON,
+            )
+            self.ledger.add(verdict)
+            return verdict
+
+        if problems := self.guard_candidate(repo, resolved_base_sha, candidate):
+            verdict = Verdict(
+                candidate_id=candidate.id,
+                keep=False,
+                speedup=0.0,
+                p_value=None,
+                reason=f"{CHECKS_LESS_REASON}: {problems[0]}",
             )
             self.ledger.add(verdict)
             return verdict

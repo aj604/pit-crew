@@ -6,6 +6,7 @@ pass `contracts.is_allowed_candidate_path` and the "never check less" guard in `
 """
 
 import re
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any
 
@@ -156,6 +157,21 @@ def _candidate_problems(branch: str, files: dict[str, str], originals: dict[str,
             continue
         problems.extend(_guard(path, originals[path], after).problems)
     return problems
+
+
+def check_candidate_files(files: Mapping[str, str], base_files: Mapping[str, str]) -> list[str]:
+    """Every problem the never-check-less guard finds in ``files`` against the real ``base_files``.
+
+    The dispatcher calls this with file text fetched at the candidate's base commit, so the verdict
+    never depends on the `original_files` the agent supplied. Only files that exist at the base are
+    compared: a new file cannot drop a check that was never there.
+    """
+    return [
+        problem
+        for path, after in sorted(files.items())
+        if path in base_files
+        for problem in _guard(path, base_files[path], after).problems
+    ]
 
 
 def _guard(path: str, before: str, after: str) -> GuardReport:
