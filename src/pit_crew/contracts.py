@@ -17,6 +17,9 @@ PLAYBOOK_SKILLS: tuple[str, ...] = (
     "affected-tests",
 )
 
+BUCKETS: tuple[str, ...] = ("waiting", "setup", "running")  # where a job's time goes; see lanes/analysis/buckets.py
+RISKS: tuple[str, ...] = ("low", "medium", "high")
+
 _MIN_GITHUB_PATH_PARTS = 2
 
 _ALLOWED_CONFIG_NAMES: frozenset[str] = frozenset(
@@ -40,6 +43,30 @@ _ALLOWED_CONFIG_PREFIXES: tuple[str, ...] = (
 )
 
 _FORBIDDEN_DIRS: frozenset[str] = frozenset({"src", "app", "lib", "tests", "test", "spec", "specs", "e2e", "__tests__"})
+
+
+class InvalidHypothesisError(ValueError):
+    """Raised when a Hypothesis names an unknown skill, bucket or risk, or a confidence outside 0..1."""
+
+    @classmethod
+    def unknown_skill(cls, skill: str) -> "InvalidHypothesisError":
+        """Build error for a skill outside PLAYBOOK_SKILLS."""
+        return cls(f"Hypothesis.skill must be one of {PLAYBOOK_SKILLS}, got {skill!r}")
+
+    @classmethod
+    def unknown_bucket(cls, bucket: str) -> "InvalidHypothesisError":
+        """Build error for a bucket outside BUCKETS."""
+        return cls(f"Hypothesis.bucket must be one of {BUCKETS} or empty, got {bucket!r}")
+
+    @classmethod
+    def unknown_risk(cls, risk: str) -> "InvalidHypothesisError":
+        """Build error for a risk outside RISKS."""
+        return cls(f"Hypothesis.risk must be one of {RISKS} or empty, got {risk!r}")
+
+    @classmethod
+    def bad_confidence(cls, confidence: float) -> "InvalidHypothesisError":
+        """Build error for a confidence outside 0..1."""
+        return cls(f"Hypothesis.confidence must be between 0 and 1, got {confidence!r}")
 
 
 class InvalidBugCaseError(ValueError):
@@ -89,15 +116,37 @@ def is_allowed_candidate_path(path: str) -> bool:
 
 @dataclass(frozen=True)
 class Hypothesis:
-    """Analysis lane output: one bottleneck worth trying to fix."""
+    """Analysis lane output: one bottleneck worth trying to fix.
+
+    `workflow_path`, `job` and `step` say where the Optimizer should make its change, so it does
+    not have to parse `description`. `evidence` holds the measured numbers behind the claim
+    (for example step_p50_seconds, max_saving_seconds, runs_sampled) as plain JSON values.
+    """
 
     repo: str
     description: str
-    skill: str  # which playbook skill should fix it, e.g. "dep-cache"
+    skill: str  # which playbook skill should fix it: one of PLAYBOOK_SKILLS
     expected_savings_seconds: float
     id: str = field(default_factory=_id)
     base_sha: str = ""
     workflow_path: str = ""
+    job: str = ""  # job id under `jobs:` in workflow_path, e.g. "test"
+    step: str = ""  # step name within the job, e.g. "Install dependencies"; empty for job-level changes
+    bucket: str = ""  # which part of the job's time it shrinks: one of BUCKETS, or "" if unknown
+    evidence: dict[str, float | str] = field(default_factory=dict)
+    confidence: float | None = None  # 0..1: how sure Analysis is that the saving is real
+    risk: str = ""  # how likely the change is to weaken what CI catches: one of RISKS, or "" if unknown
+
+    def __post_init__(self) -> None:
+        """Reject values outside the shared vocabularies so typos fail when written, not downstream."""
+        if self.skill not in PLAYBOOK_SKILLS:
+            raise InvalidHypothesisError.unknown_skill(self.skill)
+        if self.bucket and self.bucket not in BUCKETS:
+            raise InvalidHypothesisError.unknown_bucket(self.bucket)
+        if self.risk and self.risk not in RISKS:
+            raise InvalidHypothesisError.unknown_risk(self.risk)
+        if self.confidence is not None and not 0 <= self.confidence <= 1:
+            raise InvalidHypothesisError.bad_confidence(self.confidence)
 
 
 @dataclass(frozen=True)

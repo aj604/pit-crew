@@ -168,11 +168,7 @@ class SqliteLedger(_QueryMixin):
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        """A connection that commits on success, rolls back on error, and always closes.
-
-        ``with sqlite3.connect(...)`` alone only commits; the connection stays open until garbage
-        collection, which raises ResourceWarning (an error under this repo's pytest settings).
-        """
+        """Yield a connection inside a transaction, then close it (``with conn`` alone never closes)."""
         conn = sqlite3.connect(self.path, timeout=5.0)
         try:
             conn.execute("PRAGMA busy_timeout=5000")

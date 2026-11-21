@@ -1,3 +1,5 @@
+import gc
+import warnings
 from pathlib import Path
 
 import pytest
@@ -134,3 +136,28 @@ def test_bug_case_validates_required_fields() -> None:
         BugCase(kind="mutation")
     with pytest.raises(ValueError, match=r"BugCase\.kind"):
         BugCase(kind="unknown", commit_sha="abc")
+
+
+def test_sqlite_ledger_closes_every_connection(tmp_path: Path) -> None:
+    ledger = SqliteLedger(tmp_path / "pit_crew.db")
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="installs miss uv cache",
+        skill="dep-cache",
+        expected_savings_seconds=80.0,
+        base_sha="sha0",
+    )
+    cand = Candidate(hypothesis_id=hyp.id, branch="pc/h1", summary="enable cache", repo="org/repo")
+    verdict = Verdict(candidate_id=cand.id, keep=True, speedup=2.0, p_value=0.01, reason="faster")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        ledger.add(hyp)
+        ledger.add(cand)
+        ledger.add(verdict)
+        assert ledger.get(Hypothesis, hyp.id) == hyp
+        assert ledger.all(Candidate) == [cand]
+        assert ledger.hypotheses_for_repo("org/repo") == [hyp]
+        assert len(ledger.prior_attempts("org/repo")) == 1
+        assert ledger.latest_kept_candidate("org/repo") == cand
+        gc.collect()

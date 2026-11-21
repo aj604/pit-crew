@@ -11,7 +11,6 @@ setup and running (see `buckets.py`) so the biggest bucket can be fixed first.
 """
 
 import json
-import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -21,9 +20,7 @@ from typing import Any
 from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, job_buckets
 from pit_crew.lanes.analysis.history import JobRun, WorkflowRun
 from pit_crew.lanes.analysis.stats import percentile
-from pit_crew.lanes.analysis.workflow import Workflow, topological_order
-
-_SHA = re.compile(r"\b[0-9a-f]{40}\b")
+from pit_crew.lanes.analysis.workflow import SHA, Workflow, topological_order
 
 
 @dataclass(frozen=True)
@@ -79,7 +76,7 @@ class CIProfile:
 
     workflow: str
     runs_analyzed: int
-    runs_excluded: dict[str, int]  # conclusion -> count, for runs left out of the timings
+    runs_excluded: dict[str, int]  # reason (a conclusion, or "workflow_changed") -> runs left out
     retried_runs: int  # runs that needed more than one attempt: a flake signal
     wall_clock_median_seconds: float
     wall_clock_p95_seconds: float
@@ -158,18 +155,25 @@ def max_saving(workflow: Workflow, seconds: Mapping[str, float], job_id: str) ->
 def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...] = ("success",)) -> CIProfile:
     """Profile the runs whose conclusion is in `include`.
 
-    Failed and cancelled runs stop early, so their timings would understate the pipeline.
+    Failed and cancelled runs stop early, so their timings would understate the pipeline. Runs
+    with a job the current workflow file does not have ran an older version of the pipeline,
+    so they are left out too, counted as "workflow_changed".
     """
-    kept = [r for r in runs if r.conclusion in include]
+    finished = [r for r in runs if r.conclusion in include]
     excluded = Counter(str(r.conclusion) for r in runs if r.conclusion not in include)
 
     per_job: dict[str, list[JobTiming]] = defaultdict(list)
     critical_counts: Counter[str] = Counter()
     critical_buckets: list[Buckets] = []
     unmatched: set[str] = set()
-    for run in kept:
+    kept = []
+    for run in finished:
         timings, missing = job_timings(run, workflow)
-        unmatched.update(missing)
+        if missing or not timings:
+            unmatched.update(missing)
+            excluded["workflow_changed"] += 1
+            continue
+        kept.append(run)
         for job_id, timing in timings.items():
             per_job[job_id].append(timing)
         path = critical_path(workflow, {j: t.seconds for j, t in timings.items()})
@@ -228,7 +232,7 @@ def step_profiles(workflow: Workflow, runs: list[WorkflowRun]) -> list[StepProfi
                 continue
             for step in job.steps:
                 if step.conclusion != "skipped":
-                    samples[(job_id, _SHA.sub("<sha>", step.name))].append(step.seconds)
+                    samples[(job_id, SHA.sub("<sha>", step.name))].append(step.seconds)
     steps = [
         StepProfile(job_id, name, median(values), percentile(values, 95), len(values))
         for (job_id, name), values in samples.items()

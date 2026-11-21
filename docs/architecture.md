@@ -100,7 +100,7 @@ All cross-lane state is represented by five frozen dataclasses:
 
 | Record | Producer | Consumers | Key Fields |
 |---|---|---|---|
-| `Hypothesis` | Analysis | Dispatcher, Optimizer | `repo`, `description`, `skill`, `expected_savings_seconds`, `id` |
+| `Hypothesis` | Analysis | Dispatcher, Optimizer | `repo`, `description`, `skill` (one of `PLAYBOOK_SKILLS`), `expected_savings_seconds`, `id`, `base_sha`, `workflow_path`, `job`, `step`, `bucket` (`waiting`/`setup`/`running`), `evidence`, `confidence`, `risk` |
 | `Candidate` | Optimizer | Dispatcher, Proof | `hypothesis_id`, `branch`, `summary`, `id` |
 | `ReplayPlan` | Proof | Dispatcher | `candidate_id`, `bug_shas`, `id` |
 | `Evidence` | Dispatcher (code) | Rater | `candidate_id`, `baseline_seconds`, `candidate_seconds`, `bugs_total`, `bugs_caught`, `id` |
