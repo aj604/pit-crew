@@ -104,9 +104,8 @@ def test_rows_that_gain_a_shard_key_still_count() -> None:
         "mkdir -p coverage",
         "ls -la coverage",
         "git clone https://github.com/hyperium/hyper.git",
-        "DISABLE_CEXT=1 uv pip install --no-binary sqlalchemy sqlalchemy",
         "pnpm playwright install chromium",
-        "pnpm runtime set node 22 -g",
+        "set -x",
         'done > "$RUNNER_TEMP/changed"',
     ],
 )
@@ -115,10 +114,31 @@ def test_lines_that_decide_nothing_can_be_removed(line: str) -> None:
     assert _problems(head, head + f"      - run: {line}\n") == []
 
 
-@pytest.mark.parametrize("line", ["git diff --exit-code", "test -f dist/index.js", "exit 1", "pytest"])
+@pytest.mark.parametrize(
+    "line",
+    [
+        "git diff --exit-code",
+        "test -f dist/index.js",
+        "exit 1",
+        "pytest",
+        "pnpm runtime set node 22 -g",
+        "DISABLE_CEXT=1 uv pip install --no-binary sqlalchemy sqlalchemy",
+        'echo "found=true" >> "$GITHUB_OUTPUT"',
+        "set -o pipefail",
+        "set -e",
+    ],
+)
 def test_lines_that_decide_pass_or_fail_stay_checks(line: str) -> None:
     head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: make\n"
     assert _problems(head, head + f"      - run: {line}\n")
+
+
+def test_dropping_rust_toolchain_action_is_rejected() -> None:
+    head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n"
+    toolchain = "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.75.0\n"
+    after = head + "      - run: cargo test\n"
+    before = head + toolchain + "      - run: cargo test\n"
+    assert _problems(after, before)
 
 
 def test_semicolons_inside_quotes_do_not_split_commands() -> None:

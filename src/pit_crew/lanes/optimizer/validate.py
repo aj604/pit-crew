@@ -37,10 +37,9 @@ MAX_FILE_CHARS = 200_000
 MAX_MATRIX_COMBINATIONS = 256
 
 _SETUP_COMMAND = re.compile(
-    r"^(?:\w+=\S*\s+)*(?:sudo\s+)?(?:"
+    r"^(?:sudo\s+)?(?:"
     r"(?:npx\s+|pnpm\s+(?:exec\s+)?|yarn\s+|bunx\s+)?playwright\s+install\b"
-    r"|(?:npm|pnpm|yarn)\s+(?:env\s+use|runtime\s+set)\b|"
-    r"(?:npm|pnpm|yarn|bun)\s+(?:install|ci|i)\b"
+    r"|(?:npm|pnpm|yarn|bun)\s+(?:install|ci|i)\b"
     r"|(?:python3?\s+-m\s+)?pip3?\s+install\b"
     r"|uv\s+(?:sync|venv|pip\s+install|python\s+install)\b"
     r"|poetry\s+install\b"
@@ -51,7 +50,7 @@ _SETUP_COMMAND = re.compile(
     r")"
 )
 _SETUP_ACTION = re.compile(
-    r"(?:^actions/checkout$|setup|cache|toolchain|install-action|^actions/download-artifact$)", re.IGNORECASE
+    r"(?:^actions/checkout$|setup|cache|install-action|^actions/download-artifact$)", re.IGNORECASE
 )
 _UPLOAD_ACTION = "actions/upload-artifact"
 _RETRY_ACTION = re.compile(r"retry", re.IGNORECASE)
@@ -73,7 +72,7 @@ _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "d
 # dropping one is not dropping a check. `exit 1`, `test`, `[ ... ]` and real tools stay checks.
 _NOT_A_CHECK = re.compile(
     r"^(?:"
-    r"(?:echo|printf)\b"  # output, including >> $GITHUB_ENV / _OUTPUT / _STEP_SUMMARY
+    r"(?:echo|printf)\b(?!.*\bGITHUB_OUTPUT\b)"  # console/summary/env output; GITHUB_OUTPUT may gate later checks
     r"|(?:ls|mv|cp|rm|touch|chmod|ln)\s"  # moving files around
     r"|git\s+(?:clone|fetch|checkout|switch|config|apply|submodule|remote)\b"  # getting code; `git diff` stays a check
     r"|export\s+\w+="
@@ -81,7 +80,7 @@ _NOT_A_CHECK = re.compile(
     r"|\w+=(?:\S*|\"[^\"]*\"|'[^']*')$"  # a bare shell assignment, X=... with no command after it
     r"|\w+=[\"']?\$\(.*\)[\"']?$"  # X="$(...)": capturing output to a variable
     r"|(?:done|fi|esac)\b"  # closing a block, maybe redirecting its output
-    r"|cd\s|pushd\s|popd\b|mkdir\s|set\s+[-+][a-z]+(?:\s+\w+)?$"
+    r"|cd\s|pushd\s|popd\b|mkdir\s|set\s+(?:[-+][xv]+|[-+]o\s+(?:xtrace|verbose))$"
     r"|(?:if|elif|while|until|for|case)\b.*(?:then|do|in)$"  # control-flow headers; their bodies are lines too
     r")"
 )
