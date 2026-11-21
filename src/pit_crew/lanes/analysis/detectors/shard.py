@@ -34,7 +34,8 @@ _NON_TEST_COMMANDS = _STATIC_TOOLS | frozenset(
     {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir", "gh"}
 )  # `gh` downloads artifacts and cuts releases; it never runs a suite
 _UPLOAD_COMMANDS = frozenset({"codecov", "coveralls"})
-_UPLOAD_MARKERS = ("upload", "publish")  # `junit-upload`, `./publish.sh`: they ship results, not run tests
+_UPLOAD_PREFIXES = ("upload", "publish")  # `upload-results.sh`, `publish.sh`: they ship results, not run tests
+_UPLOAD_PARTS = ("-upload", "_upload", "-publish", "_publish")  # `junit-upload`, `ci_publish`
 _QUOTES = ("'", '"')
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
@@ -95,14 +96,23 @@ def _is_static_check(segment: str) -> bool:
     return _first_command(segment) in _STATIC_TOOLS
 
 
+def _is_upload_tool(token: str) -> bool:
+    """Whether the command token's basename (past the last `/`) is itself an upload/publish tool.
+
+    Only the basename counts, so `python tests/test_upload.py` and `./scripts/test-publish.sh`, which are
+    tests living in a path with the word, stay tests. A basename starting with `test` is such a test too.
+    """
+    base = token.rpartition("/")[2].lower()
+    if _word(base) in _UPLOAD_COMMANDS:
+        return True
+    if base.startswith("test"):
+        return False
+    return base.startswith(_UPLOAD_PREFIXES) or any(part in base for part in _UPLOAD_PARTS)
+
+
 def _is_non_test_command(segment: str) -> bool:
     """Whether the segment's command is a static check or a file-moving/printing tool, never a test runner."""
-    token = _first_token(segment).lower()
-    return (
-        _first_command(segment) in _NON_TEST_COMMANDS
-        or _word(token) in _UPLOAD_COMMANDS
-        or any(marker in token for marker in _UPLOAD_MARKERS)
-    )
+    return _first_command(segment) in _NON_TEST_COMMANDS or _is_upload_tool(_first_token(segment))
 
 
 def _step_is_sharded(step: StepSpec) -> bool:

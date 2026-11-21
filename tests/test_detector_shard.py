@@ -238,6 +238,8 @@ def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
         ("Run tests", "gh release upload v1 dist/*"),
         ("Upload test report", "npx junit-upload report.xml"),
         ("Upload test report", "codecov --file coverage.xml"),
+        ("Upload test report", "./codecov --file coverage.xml"),
+        ("Run tests", "./upload-results.sh"),
         ("Upload test report", "xargs coveralls"),
         ("Lint tests", '"ruff" check tests/'),
         ("Typecheck tests", "'mypy' tests/"),
@@ -246,6 +248,12 @@ def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
 def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str) -> None:
     prof, wf = build([(name, 240.0)], runs={name: f"|\n          {command}"})
     assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize("command", ["python tests/test_upload.py", "./scripts/test-publish.sh", "pytest tests/upload"])
+def test_shard_keeps_tests_whose_path_merely_mentions_upload_or_publish(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
 
 
 @pytest.mark.parametrize(
