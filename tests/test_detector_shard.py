@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
-from pit_crew.lanes.analysis.detectors.shard import _is_static_check, detect_shard_by_timing
+from pit_crew.lanes.analysis.detectors.shard import CONFIDENT_RUNS, _is_static_check, detect_shard_by_timing
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -82,8 +82,17 @@ def test_shard_flags_a_long_test_step() -> None:
     assert finding.expected_savings_seconds == 210.0
     assert finding.evidence["step_p50_seconds"] == 240.0
     assert finding.evidence["runs_sampled"] == 3.0
-    assert (finding.bucket, finding.risk, finding.confidence) == ("running", "low", 0.6)
+    assert (finding.bucket, finding.risk, finding.confidence) == ("running", "low", 0.4)
     assert "every test file" in finding.description
+
+
+@pytest.mark.parametrize(("runs", "confidence"), [(CONFIDENT_RUNS - 1, 0.4), (CONFIDENT_RUNS, 0.6)])
+def test_shard_confidence_scales_with_runs_analysed(runs: int, confidence: float) -> None:
+    wf = parse_workflow(workflow_yaml(["Run npm test"]))
+    prof = profile(wf, parse_runs([raw_run(i, [("Run npm test", 240.0)]) for i in range(1, runs + 1)]))
+    assert prof.runs_analyzed == runs
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert finding.confidence == confidence
 
 
 def test_shard_respects_existing_shard_matrix() -> None:
@@ -218,3 +227,91 @@ def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
     assert not _is_static_check("FOO= BAR=1 pytest")
     prof, wf = build([("Unit", 240.0)], runs={"Unit": "FOO= BAR=1 pytest"})
     assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Unit"]
+
+
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        ("Run tests", "sudo aws s3 cp test-results s3://x"),
+        ("Run tests", "env AWS_PROFILE=x time nice nohup aws s3 cp test-results s3://x"),
+        ("Run tests", "gh run download && ./publish.sh"),
+        ("Run tests", "gh release upload v1 dist/*"),
+        ("Upload test report", "npx junit-upload report.xml"),
+        ("Upload test report", "codecov --file coverage.xml"),
+        ("Upload test report", "./codecov --file coverage.xml"),
+        ("Run tests", "./upload-results.sh"),
+        ("Upload test report", "xargs coveralls"),
+        ("Lint tests", '"ruff" check tests/'),
+        ("Typecheck tests", "'mypy' tests/"),
+    ],
+)
+def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str) -> None:
+    prof, wf = build([(name, 240.0)], runs={name: f"|\n          {command}"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize("command", ["python tests/test_upload.py", "./scripts/test-publish.sh", "pytest tests/upload"])
+def test_shard_keeps_tests_whose_path_merely_mentions_upload_or_publish(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npx playwright test --shard=1/4",
+        "npx playwright test --shard 1/4",
+        "npx jest --shard=2/3",
+        "pytest --splits 4 --group 1",
+        "pytest --splits=4 --group=1",
+        "pytest --num-shards 4 --shard-id 0",
+        "pytest --num-shards=4",
+        "./run-tests --partition 1/3",
+        "pytest -n auto --splits 3 --group 2",
+        "pytest tests/ --shard-id=2",
+        'pytest "--group" 1',
+        "pytest -k $CI_NODE_INDEX",
+        "pytest --total $CI_NODE_TOTAL",
+        'pytest --part "${SHARD_INDEX}"',
+        "pytest --part $SPLIT_INDEX",
+    ],
+)
+def test_shard_skips_steps_whose_command_already_shards(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize("command", ["pytest -n auto", "pytest -n 4 tests/", "pytest --numprocesses=4"])
+def test_shard_still_flags_xdist_parallelism_alone(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
+
+
+@pytest.mark.parametrize("variable", ["CI_NODE_INDEX", "CI_NODE_TOTAL", "SHARD_INDEX", "SPLIT_INDEX"])
+def test_shard_skips_steps_that_take_the_shard_from_env(variable: str) -> None:
+    wf = parse_workflow(
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: x\n    steps:\n"
+        f"      - name: Run tests\n        run: pytest\n        env:\n          {variable}: ${{{{ matrix.i }}}}\n"
+    )
+    prof = profile(wf, parse_runs([raw_run(i, [("Run tests", 240.0)]) for i in range(1, 4)]))
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tox -e py312",
+        "./scripts/ci.sh",
+        "uv run pytest tests/",
+        "python -m pytest",
+        "cargo test",
+        "make test",
+        "npx tsc -p tests && npm test",
+        "npx playwright test",
+        "sudo -E pytest",
+        '"pytest" tests/',
+    ],
+)
+def test_shard_keeps_real_test_commands_positive(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
