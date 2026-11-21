@@ -378,7 +378,7 @@ def _ledger_from_records(records: dict[str, list[dict[str, Any]]]) -> InMemoryLe
     for c in records["candidates"]:
         ledger.add(Candidate(**{**c, "changed_files": tuple(c["changed_files"])}))
     for p in records["replay_plans"]:
-        cases = tuple(BugCase(**case) for case in p["cases"])
+        cases = tuple(BugCase(**{**case, "expected_checks": tuple(case["expected_checks"])}) for case in p["cases"])
         ledger.add(ReplayPlan(p["candidate_id"], tuple(p["bug_shas"]), id=p["id"], cases=cases))
     for e in records["evidence"]:
         ledger.add(_evidence(e))
