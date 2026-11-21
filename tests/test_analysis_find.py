@@ -62,7 +62,7 @@ def run(run_id: int) -> Raw:
     return {
         "id": run_id,
         "path": ".github/workflows/ci.yml",
-        "event": "pull_request",
+        "event": "push",
         "head_branch": "main",
         "head_sha": "a" * 40,
         "conclusion": "success",
@@ -114,6 +114,7 @@ def test_find_bottlenecks_ranks_findings() -> None:
         "biggest_bucket",
         "biggest_bucket_p95",
         "runs_excluded_revision",
+        "runs_excluded_event",
     }
 
 

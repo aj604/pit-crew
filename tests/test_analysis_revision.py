@@ -3,6 +3,7 @@
 import io
 import json
 import urllib.error
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ def make_run(run_id: int, head_sha: str, day: int, checks_seconds: float) -> dic
     return {
         "id": run_id,
         "path": ".github/workflows/ci.yml",
-        "event": "pull_request",
+        "event": "push",
         "head_branch": "main",
         "head_sha": head_sha,
         "conclusion": "success",
@@ -196,3 +197,76 @@ def test_a_run_whose_file_is_missing_at_its_commit_is_excluded(monkeypatch: pyte
 
     assert result["runs_analyzed"] == 1
     assert result["runs_excluded_revision"] == 1
+
+
+def with_event(run: dict[str, Any], event: str) -> dict[str, Any]:
+    return {**run, "event": event}
+
+
+@pytest.mark.usefixtures("checkout")
+def test_only_runs_that_execute_the_workflow_at_head_sha_are_profiled(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [
+        make_run(1, MATCH_NEW, 1, 100),
+        with_event(make_run(2, OTHER_NEWEST, 2, 200), "pull_request"),
+        make_run(3, MATCH_OLD, 3, 110),
+        with_event(make_run(4, GONE, 4, 200), "pull_request_target"),
+    ]
+    asked: list[str] = []
+
+    def blobs(_repo: str, _path: str, refs: Iterable[str], **_k: object) -> dict[str, str | None]:
+        asked.extend(refs)
+        return dict.fromkeys(refs, local)
+
+    monkeypatch.setattr(history, "fetch_history", lambda *_a, **_k: raw)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", blobs)
+
+    ci = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+    found = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert ci["runs_analyzed"] == 2
+    assert ci["runs_excluded_event"] == 2
+    assert ci["runs_excluded_revision"] == 0
+    assert found["profile_summary"]["runs_excluded_event"] == 2
+    assert set(asked) == {MATCH_NEW, MATCH_OLD}  # no blob fetch for the pull-request runs
+
+
+@pytest.mark.usefixtures("checkout")
+def test_only_pull_request_runs_gives_no_findings_and_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [with_event(make_run(i, MATCH_NEW, i, 100), "pull_request") for i in range(1, 4)]
+    monkeypatch.setattr(history, "fetch_history", lambda *_a, **_k: raw)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda *_a, **_k: pytest.fail("must not fetch"))
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["runs_analyzed"] == 0
+    assert result["profile_summary"]["runs_excluded_event"] == 3
+    assert len(result["uncovered"]) == 1
+    assert "Only pull-request runs" in result["uncovered"][0]
+    assert "branch=<default>" in result["uncovered"][0]
+
+
+@pytest.mark.usefixtures("checkout")
+@pytest.mark.parametrize("event", ["pull_request", "pull_request_target", "repository_dispatch", "", "made_up"])
+def test_other_and_unknown_events_are_excluded(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [make_run(1, MATCH_NEW, 1, 100), with_event(make_run(2, MATCH_OLD, 2, 100), event)]
+    patch_history(monkeypatch, raw, {MATCH_NEW: local, MATCH_OLD: local})
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["runs_analyzed"] == 1
+    assert result["runs_excluded_event"] == 1
+
+
+@pytest.mark.usefixtures("checkout")
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "schedule", "merge_group"])
+def test_events_that_execute_the_workflow_at_head_sha_are_trusted(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    patch_history(monkeypatch, [with_event(make_run(1, MATCH_NEW, 1, 100), event)], {MATCH_NEW: local})
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["runs_analyzed"] == 1
+    assert result["runs_excluded_event"] == 0
