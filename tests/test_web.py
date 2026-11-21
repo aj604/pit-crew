@@ -499,6 +499,8 @@ const fed = store.getState();
 log.fed = [fed.repo, fed.status, fed.attempts.length, fed.selectedAttemptIndex, fed.selectedAttempt, fed.fetchError,
   fed.records.verdicts];
 store.selectAttempt(0); log.feedSelect = store.getState().selectedAttempt;
+store.selectAttempt(1); store.setLiveData({ attempts: [{ id: 3 }] });
+log.clamped = store.getState().selectedAttemptIndex;
 store.setFetchError(); log.clearedError = store.getState().fetchError;
 store.setMode("demo"); log.backToDemo = [...pick(store.getState()), store.getState().attempts.length];
 store.play(); store.step(); store.reset();
@@ -551,6 +553,7 @@ def test_boot_and_store_transitions() -> None:
     assert log["fetchError"] == "boom"
     assert log["fed"] == ["owner/name", {"repo": "owner/name"}, 2, 1, {"id": 2}, None, []]
     assert log["feedSelect"] == {"id": 1}
+    assert log["clamped"] == 0
     assert log["clearedError"] is None
     assert log["backToDemo"] == ["demo", "noise_reject", 0, "analysis", False, 1]
     assert log["resetStops"] == ["demo", "noise_reject", 0, "analysis", False, True]
@@ -563,19 +566,20 @@ _SWITCHER_SCRIPT = (
     + """
 const m = await import(process.argv[1]);
 const view = (d, pw) => ({
-  sha: d.ids["base-sha-value"].textContent, median: d.ids["sla-median"].textContent,
-  p95: d.ids["sla-p95"].textContent, badgeHidden: d.ids["sla-badge"].hidden, running: d.ids["run-pit-stop"].disabled,
-  slotHidden: d.ids["demo-switcher"].hidden, stage: pw.store.getState().stage,
-  stages: pw.switcher.stageItems.map((n) => n.dataset.state).join(","),
-  scenario: pw.switcher.scenarioButtons.filter((n) => n.attrs["aria-pressed"] === "true").map((n) => n.textContent),
-  play: pw.switcher.playButton.textContent, stepOff: pw.switcher.stepButton.disabled,
-  resetOff: pw.switcher.resetButton.disabled,
+  hdr: [d.ids["base-sha-value"].textContent, d.ids["sla-median"].textContent, d.ids["sla-p95"].textContent,
+    d.ids["sla-badge"].hidden, d.ids["run-pit-stop"].disabled],
+  ui: [d.ids["demo-switcher"].hidden, pw.store.getState().stage,
+    pw.switcher.stageItems.map((n) => `${n.dataset.state}:${n.attrs["aria-current"]}`).join(","),
+    pw.switcher.scenarioButtons.filter((n) => n.attrs["aria-pressed"] === "true").map((n) => n.textContent).join(),
+    pw.switcher.playButton.textContent, pw.switcher.playButton.attrs["aria-pressed"],
+    pw.switcher.stepButton.disabled, pw.switcher.resetButton.disabled],
+  repo: d.ids["repo-input"].value,
 });
 const d = fakeDocument("complete");
 const pw = m.bootPitWall(d.doc, "");
 const sw = pw.switcher;
 const out = { boot: view(d, pw), labels: sw.stageItems.map((n) => n.textContent),
-  slotKids: d.ids["demo-switcher"].kids.length, ariaCurrent: sw.stageItems[4].attrs["aria-current"] };
+  slotKids: d.ids["demo-switcher"].kids.length };
 sw.resetButton.click(); out.analysis = view(d, pw);
 const walk = [];
 for (let i = 0; i < 4; i += 1) { sw.stepButton.click(); walk.push(view(d, pw)); }
@@ -588,8 +592,7 @@ d.live.click(); out.live = view(d, pw);
 d.demo.click(); out.demo = view(d, pw);
 const l = fakeDocument("complete");
 const lpw = m.bootPitWall(l.doc, "?repo=owner/name");
-out.liveBoot = { ...view(l, lpw), mode: lpw.store.getState().mode, repo: l.ids["repo-input"].value,
-  pressed: pressed(l) };
+out.liveBoot = { ...view(l, lpw), mode: lpw.store.getState().mode, pressed: pressed(l) };
 l.ids["run-pit-stop"].click(); out.liveRunIgnored = lpw.store.getState().isPlaying;
 console.log(JSON.stringify(out));
 """
@@ -599,51 +602,35 @@ console.log(JSON.stringify(out));
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 def test_demo_switcher_drives_header_through_stages() -> None:
     out = _node(_SWITCHER_SCRIPT, APP_JS.as_uri())
-    kept = {"sha": "e9b17d3", "median": "48.0", "p95": "82.0", "badgeHidden": False, "running": False}
-    pending = {"sha": "4f1c9e2", "median": "--", "p95": "--", "badgeHidden": True, "running": True}
-    assert out["boot"] == {
-        **kept,
-        "slotHidden": False,
-        "stage": "rater",
-        "stages": "done,done,done,done,current",
-        "scenario": ["Proven Speedup"],
-        "play": "Play",
-        "stepOff": True,
-        "resetOff": False,
-    }
+    kept = ["e9b17d3", "48.0", "82.0", False, False]
+    pending = ["4f1c9e2", "--", "--", True, True]
+    rater = "done:false,done:false,done:false,done:false,current:step"
+    analysis = "current:step,pending:false,pending:false,pending:false,pending:false"
+    assert out["boot"]["hdr"] == kept
+    assert out["boot"]["ui"] == [False, "rater", rater, "Proven Speedup", "Play", "false", True, False]
+    assert out["boot"]["repo"] == "pit-crew-demo/checkout-api"
     assert out["labels"] == ["Analysis", "Optimizer", "Proof", "CI", "Rater"]
     assert out["slotKids"] == 4
-    assert out["ariaCurrent"] == "step"
-    assert out["analysis"] == {
-        **pending,
-        "slotHidden": False,
-        "stage": "analysis",
-        "stages": "current,pending,pending,pending,pending",
-        "scenario": ["Proven Speedup"],
-        "play": "Play",
-        "stepOff": False,
-        "resetOff": True,
-    }
-    assert [w["stage"] for w in out["walk"]] == ["optimizer", "proof", "ci", "rater"]
-    assert [w["stages"].count("done") for w in out["walk"]] == [1, 2, 3, 4]
-    for w in out["walk"][:3]:
-        assert {k: w[k] for k in pending} == pending
-    assert {k: out["walk"][3][k] for k in kept} == kept
-    assert out["unsafe"]["scenario"] == ["Fast but Unsafe"]
-    assert {k: out["unsafe"][k] for k in kept} == {
-        "sha": "4f1c9e2",
-        "median": "62.5",
-        "p95": "72.4",
-        "badgeHidden": True,
-        "running": False,
-    }
-    assert (out["playing"]["play"], out["playing"]["stage"], out["playing"]["running"]) == ("Pause", "analysis", True)
-    assert (out["paused"]["play"], out["paused"]["stage"]) == ("Play", "analysis")
+    assert out["analysis"]["hdr"] == pending
+    assert out["analysis"]["ui"] == [False, "analysis", analysis, "Proven Speedup", "Play", "false", False, True]
+    assert [w["ui"][1] for w in out["walk"]] == ["optimizer", "proof", "ci", "rater"]
+    assert [w["ui"][2].count("done:false") for w in out["walk"]] == [1, 2, 3, 4]
+    assert [w["hdr"] for w in out["walk"]] == [pending, pending, pending, kept]
+    assert out["unsafe"]["ui"][3] == "Fast but Unsafe"
+    assert out["unsafe"]["hdr"] == ["4f1c9e2", "62.5", "72.4", True, False]
+    assert out["playing"]["ui"][1:] == [
+        "analysis", analysis, "Fast but Unsafe", "Pause", "true", False, False
+    ]  # fmt: skip
+    assert out["playing"]["hdr"][4] is True
+    assert out["paused"]["ui"][4:6] == ["Play", "false"]
     assert out["runPlays"] is True
-    assert (out["live"]["slotHidden"], out["live"]["sha"], out["live"]["median"]) == (True, "-------", "--")
-    assert (out["demo"]["slotHidden"], out["demo"]["scenario"]) == (False, ["Fast but Unsafe"])
-    assert out["liveBoot"]["mode"] == "live"
-    assert out["liveBoot"]["slotHidden"] is True
-    assert out["liveBoot"]["repo"] == "owner/name"
+    assert (out["live"]["ui"][0], out["live"]["hdr"], out["live"]["repo"]) == (
+        True,
+        ["-------", "--", "--", True, False],
+        "",
+    )
+    assert (out["demo"]["ui"][0], out["demo"]["ui"][3]) == (False, "Fast but Unsafe")
+    assert (out["liveBoot"]["mode"], out["liveBoot"]["ui"][0], out["liveBoot"]["repo"]) == ("live", True, "owner/name")
     assert out["liveBoot"]["pressed"] == ["true", "false"]
     assert out["liveRunIgnored"] is False
+    assert '<section id="demo-switcher" class="pit-wall__slot demo-switcher"' in (WEB_DIR / "index.html").read_text()

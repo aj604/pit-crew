@@ -137,7 +137,6 @@ export function createDemoSwitcher(root, slot, store) {
   stages.append(...stageItems);
   const controls = make("div", "demo-switcher__controls");
   controls.append(playButton, stepButton, resetButton);
-  slot.classList?.add("demo-switcher");
   slot.replaceChildren(make("span", "demo-switcher__label", "Demo"), scenarios, stages, controls);
 
   const render = (state) => {
@@ -148,8 +147,7 @@ export function createDemoSwitcher(root, slot, store) {
     stageItems.forEach((node, index) => {
       const step = index < state.stageIndex ? "done" : index === state.stageIndex ? "current" : "pending";
       node.dataset.state = step;
-      if (step === "current") node.setAttribute("aria-current", "step");
-      else node.setAttribute("aria-current", "false");
+      node.setAttribute("aria-current", step === "current" ? "step" : "false");
     });
     playButton.textContent = state.isPlaying ? "Pause" : "Play";
     playButton.setAttribute("aria-pressed", String(state.isPlaying));
@@ -166,7 +164,7 @@ export function createDemoSwitcher(root, slot, store) {
 export function bindHeaderToStore(header, modeToggle, store) {
   const render = (state) => {
     if (header.mode !== state.mode) header.setMode(state.mode);
-    if (state.repo && state.mode === "live") header.setRepo(state.repo);
+    if (state.mode === "live") header.setRepo(state.repo);
     header.applyStatus(state.status);
   };
   modeToggle.addEventListener("pitwall:mode", (event) => {
@@ -182,8 +180,7 @@ export function bootPitWall(root, search) {
   const header = createHeaderBar(root);
   const store = createPitWallStore(resolveInitialBoot(search));
   bindHeaderToStore(header, root.getElementById("mode-toggle"), store);
-  const slot = root.getElementById("demo-switcher");
-  const switcher = slot === null ? null : createDemoSwitcher(root, slot, store);
+  const switcher = createDemoSwitcher(root, root.getElementById("demo-switcher"), store);
   return { header, store, switcher };
 }
 

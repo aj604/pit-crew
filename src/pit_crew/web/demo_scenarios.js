@@ -161,23 +161,17 @@ export function getScenario(id) {
   return DEMO_SCENARIOS[id];
 }
 
+const VERDICT_KEYS = ["keep", "speedup", "p_value", "median_seconds", "p95_seconds", "sla_met", "reason"];
+
 function attemptFor(s, stageIndex) {
   const { hypothesis: h, candidate: c } = s;
-  const v = stageIndex >= 4 ? s.verdict : null;
-  const pick = (key) => (v === null ? null : v[key]);
-  if (stageIndex < 1) {
-    return {
-      hypothesis_id: h.id, skill: h.skill, description: h.description, candidate_id: null, branch: null,
-      base_sha: h.base_sha, head_sha: null, summary: null, changed_files: [], rated: false, keep: null,
-      speedup: null, p_value: null, median_seconds: null, p95_seconds: null, sla_met: null, reason: null,
-    };
-  }
+  const v = stageIndex >= 4 ? s.verdict : {};
+  const cand = stageIndex >= 1 ? c : { base_sha: h.base_sha, changed_files: [] };
   return {
-    hypothesis_id: h.id, skill: h.skill, description: h.description, candidate_id: c.id, branch: c.branch,
-    base_sha: c.base_sha, head_sha: c.head_sha, summary: c.summary, changed_files: [...c.changed_files],
-    rated: v !== null, keep: pick("keep"), speedup: pick("speedup"), p_value: pick("p_value"),
-    median_seconds: pick("median_seconds"), p95_seconds: pick("p95_seconds"), sla_met: pick("sla_met"),
-    reason: pick("reason"),
+    hypothesis_id: h.id, skill: h.skill, description: h.description, candidate_id: cand.id ?? null,
+    branch: cand.branch ?? null, base_sha: cand.base_sha, head_sha: cand.head_sha ?? null,
+    summary: cand.summary ?? null, changed_files: [...cand.changed_files], rated: stageIndex >= 4,
+    ...Object.fromEntries(VERDICT_KEYS.map((key) => [key, v[key] ?? null])),
   };
 }
 
