@@ -117,7 +117,90 @@ def test_compound_install_keeps_its_chained_check() -> None:
     report = check_change(CI, before, head + "      - run: npm ci && npm test\n")
     assert report.ok
     assert report.warnings == [f"{CI}: changes the install command `npm install`"]
-    assert _problems(head + "      - run: npm ci\n", before) == [f"{CI}: drops the check `npm test` on x"]
+    assert _problems(head + "      - run: npm ci\n", before) == [f"{CI}: drops the check `<install> && npm test` on x"]
+
+
+SIMPLE = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n"
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("npm test && npm run coverage", "npm test || npm run coverage"),
+        ("npm test", "npm test || npm run coverage"),
+        ("npm test", "npm test | tee log.txt"),
+    ],
+)
+def test_rewiring_how_checks_chain_is_rejected(before: str, after: str) -> None:
+    problems = _problems(SIMPLE + f"      - run: {after}\n", SIMPLE + f"      - run: {before}\n")
+    assert any(f"drops the check `{before}`" in p for p in problems), problems
+
+
+GATED_OLD = "on: push\njobs:\n  check:\n    runs-on: x\n    steps:\n      - run: npm run lint\n      - run: npm test\n"
+LINT_JOB = "  lint:\n    runs-on: x\n    steps:\n      - run: npm run lint\n"
+JQ = "echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == \"success\")'"
+
+
+def _gate(condition: str, step: str) -> str:
+    return (
+        "on: push\njobs:\n  check:\n    needs: [lint]\n"
+        f"    if: {condition}\n    runs-on: x\n    steps:\n      - run: npm test\n{step}" + LINT_JOB
+    )
+
+
+@pytest.mark.parametrize(
+    ("condition", "step", "ok"),
+    [
+        ("always()", f"      - run: {JQ}\n", True),
+        (
+            "${{ always() }}",
+            "      - uses: re-actors/alls-green@v1\n        with:\n          jobs: ${{ toJSON(needs) }}\n",
+            True,
+        ),
+        ("always()", "      - run: echo '${{ toJSON(needs) }}'\n", False),  # only prints the results
+        ("always()", f"      - run: {JQ} || true\n", False),
+        ("always()", f"      - if: github.event_name == 'push'\n        run: {JQ}\n", False),
+        ("always() && github.event_name == 'push'", f"      - run: {JQ}\n", False),
+        ("success()", f"      - run: {JQ}\n", False),
+    ],
+)
+def test_gate_must_fail_when_a_needed_job_fails(condition: str, step: str, *, ok: bool) -> None:
+    problems = _problems(_gate(condition, step), GATED_OLD)
+    assert (problems == []) is ok, problems
+
+
+def test_check_moved_into_a_matrix_job_still_needs_a_gate() -> None:
+    after = (
+        "on: push\njobs:\n  check:\n    runs-on: x\n    steps:\n      - run: npm test\n"
+        "  matrix-checks:\n    runs-on: x\n    strategy:\n      matrix:\n        command: [lint]\n"
+        "    steps:\n      - run: npm run ${{ matrix.command }}\n"
+    )
+    assert any("job `check` no longer runs `npm run lint`" in p for p in _problems(after, GATED_OLD))
+
+
+def test_include_entries_merge_into_matching_rows() -> None:
+    node = "      - uses: actions/setup-node@v4\n        with:\n          node-version: ${{ matrix.node }}\n"
+    with_include = (
+        "  a:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        node: [20, 22]\n"
+        f"        include:\n          - os: ubuntu-latest\n    steps:\n{node}      - run: npm test\n"
+    )
+    literal = (
+        "  b:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: [20, 22]\n"
+        f"    steps:\n{node}      - run: npm test\n"
+    )
+    head = "on: push\njobs:\n"
+    assert _problems(head + literal, head + with_include + literal) == []
+
+
+def test_toolchain_follows_step_order() -> None:
+    def setup(version: int) -> str:
+        return f"      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n"
+
+    before = f"on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n{setup(20)}      - run: npm run lint\n"
+    before += f"{setup(22)}      - run: npm test\n"
+    after = f"on: push\njobs:\n  lint:\n    runs-on: x\n    steps:\n{setup(20)}      - run: npm run lint\n"
+    after += f"  test:\n    runs-on: x\n    steps:\n{setup(22)}      - run: npm test\n"
+    assert _problems(after, before) == []
 
 
 def test_removing_a_trailing_or_true_is_allowed() -> None:

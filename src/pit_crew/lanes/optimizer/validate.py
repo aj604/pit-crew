@@ -16,8 +16,9 @@ A change fails the guard when, compared with the original workflow, it:
 - uploads fewer artifacts (the Proof lane needs failure screenshots and videos).
 
 Standalone install commands and setup or cache actions may change freely: they check nothing,
-and if one breaks, the checks after it fail. An install chained to a check (``npm ci && npm
-test``) is split, and the check part must survive.
+and if one breaks, the checks after it fail. In a chained line (``npm ci && npm test``) the
+install becomes ``<install>`` and the operators stay, so the checks and how they chain must
+survive. A gate job must use a recognized assertion that fails unless every needed job succeeded.
 """
 
 import json
@@ -54,7 +55,12 @@ _DISABLED_IF = re.compile(r"^\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*$", re.IGNOREC
 _SHELL_SEPARATOR = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "do", "done", "esac", "{", "}"})
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
-_READS_NEEDS = re.compile(r"\bneeds\b")
+_SHELL_OPERATOR = re.compile(r"\s*(&&|\|\||;)\s*")
+_MASKING_TAIL = re.compile(r"\s*\|\|\s*(?:true|:|exit\s+0)\s*$")
+_EXTENSION_OPERATOR = re.compile(r"[;&|]")
+_ALWAYS = re.compile(r"^\s*(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?\s*$")
+_JQ_GATE = re.compile(r'toJSON\(needs\).*\|\s*jq\s+-e\b.*\ball\(.*\.result\s*==\s*"success"')
+_GATE_ACTION = "re-actors/alls-green"
 _PUSH_REF_FILTERS = frozenset({"branches", "branches-ignore", "tags", "tags-ignore"})
 _NARROWING_FILTERS = ("paths", "paths-ignore", "branches-ignore", "tags-ignore")
 
@@ -232,10 +238,25 @@ def _command_lines(workflow: Workflow) -> list[str]:
     return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in _lines(step["run"])]
 
 
+def _check_line(line: str) -> str:
+    """A run line as a check: install commands become `<install>`, shell operators are kept.
+
+    Keeping `&&`, `||` and `;` means rewiring how two checks chain is a change. Returns "" for a
+    line that only installs. A trailing `|| true` is dropped: removing one makes CI stricter, and
+    adding one is caught by WEAKENING_FLAGS.
+    """
+    parts = _SHELL_OPERATOR.split(_MASKING_TAIL.sub("", line))
+    commands, operators = parts[0::2], parts[1::2]
+    if all(c in _NO_OP_SEGMENTS or _SETUP_COMMAND.match(c) for c in commands):
+        return ""
+    normalized = ["<install>" if _SETUP_COMMAND.match(c) else c for c in commands]
+    return normalized[0] + "".join(f" {op} {cmd}" for op, cmd in zip(operators, normalized[1:], strict=True))
+
+
 def _step_checks(step: Workflow) -> list[str]:
     run, uses = step.get("run"), step.get("uses")
     if isinstance(run, str):
-        return [seg for seg in _segments(run) if not _SETUP_COMMAND.match(seg)]
+        return [check for line in _lines(run) if (check := _check_line(line))]
     if isinstance(uses, str):
         name = uses.split("@", 1)[0]
         if not _SETUP_ACTION.search(name) and name != _UPLOAD_ACTION:
@@ -243,16 +264,15 @@ def _step_checks(step: Workflow) -> list[str]:
     return []
 
 
-def _job_checks(job: Workflow) -> list[str]:
-    checks = [check for step in _job_steps(job) for check in _step_checks(step)]
-    if isinstance(job.get("uses"), str):  # a job that calls a reusable workflow
-        checks.append(f"uses {job['uses'].split('@', 1)[0]} {_text(job.get('with'))}".rstrip())
-    return checks
-
-
 def _covered(check: str, candidates: Iterable[str]) -> bool:
-    """True when a candidate runs ``check`` exactly or with arguments added (as sharding does)."""
-    return any(c == check or c.startswith(check + " ") for c in candidates)
+    """True when a candidate runs ``check`` exactly, or with plain arguments added (as sharding does).
+
+    Added text may not chain another command: `npm test || npm run coverage` does not cover `npm test`.
+    """
+    return any(
+        c == check or (c.startswith(check + " ") and not _EXTENSION_OPERATOR.search(c[len(check) :]))
+        for c in candidates
+    )
 
 
 def _actions(workflow: Workflow) -> list[str]:
@@ -278,34 +298,43 @@ def _entries(value: object) -> list[dict[str, str]]:
 
 
 def _combinations(job_id: str, job: Workflow) -> list[dict[str, str]]:
+    """The matrix rows GitHub runs: the product of the axes, minus `exclude`, plus `include`."""
     spec = _matrix_spec(job)
     axes = {str(k): v for k, v in spec.items() if k not in ("include", "exclude") and isinstance(v, list)}
-    combos: list[dict[str, str]] = [{}] if axes or not spec.get("include") else []
+    base: list[dict[str, str]] = [{}] if axes or not spec.get("include") else []
     for key, values in axes.items():
-        combos = [{**combo, key: _text(value)} for combo in combos for value in values]
-        if len(combos) > MAX_MATRIX_COMBINATIONS:
+        base = [{**row, key: _text(value)} for row in base for value in values]
+        if len(base) > MAX_MATRIX_COMBINATIONS:
             raise MatrixTooLargeError(job_id)
     excluded = _entries(spec.get("exclude"))
-    combos = [c for c in combos if not any(all(c.get(k) == v for k, v in e.items()) for e in excluded)]
-    combos += _entries(spec.get("include"))
-    if len(combos) > MAX_MATRIX_COMBINATIONS:
+    base = [row for row in base if not any(all(row.get(k) == v for k, v in e.items()) for e in excluded)]
+    extra = [entry for entry in _entries(spec.get("include")) if not _merge_include(base, entry, set(axes))]
+    if len(base) + len(extra) > MAX_MATRIX_COMBINATIONS:
         raise MatrixTooLargeError(job_id)
-    return combos
+    return base + extra
+
+
+def _merge_include(rows: list[dict[str, str]], entry: dict[str, str], axes: set[str]) -> bool:
+    """Add ``entry``'s new keys to every row it does not contradict. False if it fits none."""
+    merged = False
+    for row in rows:
+        if all(row.get(k) == v for k, v in entry.items() if k in axes):
+            row.update({k: v for k, v in entry.items() if k not in axes})
+            merged = True
+    return merged
 
 
 def _substitute(text: str, combo: dict[str, str]) -> str:
     return _MATRIX_EXPRESSION.sub(lambda m: combo.get(m.group(1), m.group(0)), text)
 
 
-def _toolchain(job: Workflow) -> str:
-    """Versions pinned by setup actions, e.g. ``actions/setup-node:node-version=20``."""
-    parts = []
-    for step in _job_steps(job):
-        uses, inputs = step.get("uses"), step.get("with")
-        if isinstance(uses, str) and "setup" in uses.lower() and isinstance(inputs, dict):
-            name = uses.split("@", 1)[0]
-            parts += [f"{name}:{k}={_text(v)}" for k, v in sorted(inputs.items(), key=str) if "version" in str(k)]
-    return ";".join(parts)
+def _setup_versions(step: Workflow) -> dict[str, str]:
+    """Versions a setup step pins, e.g. ``{"actions/setup-node:node-version": "20"}``."""
+    uses, inputs = step.get("uses"), step.get("with")
+    if not (isinstance(uses, str) and "setup" in uses.lower() and isinstance(inputs, dict)):
+        return {}
+    name = uses.split("@", 1)[0]
+    return {f"{name}:{k}": _text(v) for k, v in inputs.items() if "version" in str(k)}
 
 
 def _default_directory(job: Workflow) -> str:
@@ -314,26 +343,38 @@ def _default_directory(job: Workflow) -> str:
     return _text(run.get("working-directory")) if isinstance(run, dict) else ""
 
 
-def _units(workflow: Workflow) -> set[_Unit]:
-    units: set[_Unit] = set()
-    for job_id, job in _jobs(workflow).items():
-        for combo in _combinations(job_id, job):
-            units.update(_job_units(job, combo))
-    return units
+def _units_by_job(workflow: Workflow) -> dict[str, set[_Unit]]:
+    return {
+        job_id: {unit for combo in _combinations(job_id, job) for unit in _job_units(job, combo)}
+        for job_id, job in _jobs(workflow).items()
+    }
 
 
 def _job_units(job: Workflow, combo: dict[str, str]) -> Iterator[_Unit]:
     runner = _substitute(_text(job.get("runs-on")), combo)
     container = _substitute(_text(job.get("container")), combo)
-    toolchain = _substitute(_toolchain(job), combo)
     directory = _default_directory(job)
+    active: dict[str, str] = {}  # setup versions installed so far; steps run in order
     for step in _job_steps(job):
+        active.update(_setup_versions(step))
+        toolchain = _substitute(";".join(f"{k}={v}" for k, v in sorted(active.items())), combo)
         context = (runner, container, toolchain, _text(step.get("working-directory")) or directory)
         for check in _step_checks(step):
             yield _Unit(_substitute(check, combo), context)
-    if isinstance(job.get("uses"), str):
-        for check in _job_checks({"uses": job["uses"], "with": job.get("with")}):
-            yield _Unit(_substitute(check, combo), (runner, container, toolchain, directory))
+    if isinstance(job.get("uses"), str):  # a job that calls a reusable workflow
+        check = f"uses {job['uses'].split('@', 1)[0]} {_text(job.get('with'))}".rstrip()
+        yield _Unit(_substitute(check, combo), (runner, container, "", directory))
+
+
+def _index(units: Iterable[_Unit]) -> dict[Context, list[str]]:
+    index: dict[Context, list[str]] = {}
+    for unit in units:
+        index.setdefault(unit.context, []).append(unit.check)
+    return index
+
+
+def _runs(unit: _Unit, index: dict[Context, list[str]]) -> bool:
+    return _covered(unit.check, index.get(unit.context, ()))
 
 
 def _describe(context: Context) -> str:
@@ -369,33 +410,33 @@ def _narrowed(event: str, before: Workflow, after: Workflow) -> list[str]:
 
 def _checks_kept(old: Workflow, new: Workflow) -> list[str]:
     """Every check must still run in every context it ran in, exactly or with arguments added."""
-    after: dict[Context, list[str]] = {}
-    for unit in _units(new):
-        after.setdefault(unit.context, []).append(unit.check)
+    after = _index(unit for units in _units_by_job(new).values() for unit in units)
     missing: dict[str, set[str]] = {}
-    for unit in _units(old):
-        if not _covered(unit.check, after.get(unit.context, ())):
-            missing.setdefault(unit.check, set()).add(_describe(unit.context))
+    for units in _units_by_job(old).values():
+        for unit in units:
+            if not _runs(unit, after):
+                missing.setdefault(unit.check, set()).add(_describe(unit.context))
     return [f"drops the check `{check}` on {'; '.join(sorted(missing[check]))}" for check in sorted(missing)]
 
 
 def _kept_jobs_still_gate(old: Workflow, new: Workflow) -> list[str]:
-    """A job that keeps its id but hands its checks to other jobs must wait on them and fail with them."""
+    """A job that keeps its id but hands checks to other jobs must wait on them and fail with them."""
     problems = []
-    new_jobs = _jobs(new)
-    for job_id, job in _jobs(old).items():
-        if job_id not in new_jobs:
+    old_units, new_units, new_jobs = _units_by_job(old), _units_by_job(new), _jobs(new)
+    for job_id, units in old_units.items():
+        if job_id not in new_units:
             continue
-        kept = new_jobs[job_id]
-        elsewhere = [check for other, j in new_jobs.items() if other != job_id for check in _job_checks(j)]
+        here = _index(new_units[job_id])
+        elsewhere = _index(u for other, us in new_units.items() if other != job_id for u in us)
         # A check that runs nowhere any more is reported by _checks_kept; here, only moved ones.
-        moved = [c for c in _job_checks(job) if not _covered(c, _job_checks(kept)) and _covered(c, elsewhere)]
-        needed = [_job_checks(new_jobs[n]) for n in _needs(kept) if n in new_jobs]
-        gated = all(any(_covered(c, checks) for checks in needed) for c in moved)
-        if moved and not (gated and _aggregates(kept)):
+        moved = [u for u in units if not _runs(u, here) and _runs(u, elsewhere)]
+        if not moved:
+            continue
+        needed = _index(u for n in _needs(new_jobs[job_id]) for u in new_units.get(n, ()))
+        if not (all(_runs(u, needed) for u in moved) and _aggregates(new_jobs[job_id])):
             problems.append(
-                f"job `{job_id}` no longer runs `{moved[0]}` itself; it must `needs:` the job that does, "
-                "run with `if: always()`, and fail unless every needed job succeeded"
+                f"job `{job_id}` no longer runs `{min(u.check for u in moved)}` itself; it must `needs:` "
+                "every job that does, run with `if: always()`, and fail unless every needed job succeeded"
             )
     return problems
 
@@ -408,11 +449,25 @@ def _needs(job: Workflow) -> list[str]:
 
 
 def _aggregates(job: Workflow) -> bool:
-    """True for a job that always runs and has a step reading its dependencies' results."""
+    """True for a gate job that always runs and has an unconditional step failing on any bad result."""
     condition = job.get("if")
-    always = isinstance(condition, str) and "always()" in condition
-    reads_needs = any(isinstance(s.get("run"), str) and _READS_NEEDS.search(s["run"]) for s in _job_steps(job))
-    return always and reads_needs
+    if not (isinstance(condition, str) and _ALWAYS.match(condition)):
+        return False
+    return any(_asserts_needs(step) for step in _job_steps(job))
+
+
+def _asserts_needs(step: Workflow) -> bool:
+    """A recognized step that fails unless every needed job succeeded (skipped and cancelled fail too)."""
+    if "if" in step or _continues_on_error(step):
+        return False
+    run, uses = step.get("run"), step.get("uses")
+    if isinstance(run, str):
+        masks = WEAKENING_FLAGS[0][1]
+        return any(_JQ_GATE.search(line) and not masks.search(line) for line in _lines(run))
+    if isinstance(uses, str) and uses.split("@", 1)[0] == _GATE_ACTION:
+        inputs = step.get("with")
+        return isinstance(inputs, dict) and "toJSON(needs)" in _text(inputs.get("jobs"))
+    return False
 
 
 def _actions_kept(old: Workflow, new: Workflow) -> list[str]:
