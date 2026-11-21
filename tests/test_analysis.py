@@ -1,10 +1,11 @@
 import base64
 import gzip
+import io
 import json
-import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from email.message import Message
+from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
 
@@ -367,6 +368,19 @@ def test_http_getter_only_sends_the_token_to_the_github_api() -> None:
     get = history._http_getter("secret-token")  # noqa: SLF001
     with pytest.raises(ValueError, match="refusing"):
         get("https://evil.example/repos/o/r")
+
+
+def test_redirect_handler_refuses_a_foreign_host_and_follows_the_api() -> None:
+    handler = history._NoForeignRedirect()  # noqa: SLF001
+    request = urllib.request.Request(  # noqa: S310  https-only
+        f"{history.API}/repos/o/r/actions/runs", headers={"Authorization": "Bearer t"}
+    )
+    headers = HTTPMessage()
+    with pytest.raises(ValueError, match="refusing to follow"):
+        handler.redirect_request(request, io.BytesIO(), 302, "Found", headers, "https://other.example/x")
+    followed = handler.redirect_request(request, io.BytesIO(), 302, "Found", headers, f"{history.API}/other")
+    assert followed is not None
+    assert followed.full_url == f"{history.API}/other"
 
 
 # Real history: FastAPI's test.yml, 12 pushes to master (Nov 2026).

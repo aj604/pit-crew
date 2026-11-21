@@ -198,6 +198,24 @@ def test_install_regex_accepts_installs(command: str) -> None:
     assert INSTALL_COMMANDS.search(command) is not None
 
 
+def test_dep_cache_setup_go_caches_by_default() -> None:
+    yaml_text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/setup-go@v5\n      - run: go mod download\n"
+    )
+    wf, prof = make_profile(yaml_text, [job("test", 200, (("Run go mod download", 100),))])
+    assert detect_dep_cache(prof, wf, PATH) == []
+
+
+def test_dep_cache_npm_node_modules_cache_does_not_cover_npm_ci() -> None:
+    nm = "      - uses: actions/cache@v4\n        with: {path: node_modules, key: k}\n"
+    wf, prof = make_profile(BASE.format(extra=nm), [NPM_JOB])
+    assert [f.step for f in detect_dep_cache(prof, wf, PATH)] == ["Run npm ci"]
+    pnpm = BASE.format(extra=nm).replace("npm ci", "pnpm install")
+    wf, prof = make_profile(pnpm, [job("test", 200, (("Run pnpm install", 120), ("Run npm test", 60)))])
+    assert detect_dep_cache(prof, wf, PATH) == []
+
+
 def test_dep_cache_setup_go_cache_false_is_flagged() -> None:
     yaml_text = (
         "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
@@ -274,3 +292,14 @@ def test_step_label_and_occurrences() -> None:
     assert step_label("Build", 3) == "Build [3]"
     wf = parse_workflow("jobs:\n  t:\n    steps:\n      - run: a\n      - run: b\n      - run: a\n")
     assert step_occurrences(wf.jobs["t"].steps) == [1, 1, 2]
+
+
+def test_occurrences_fold_commit_shas_like_measured_names() -> None:
+    text = f"""
+jobs:
+  t:
+    steps:
+      - uses: x/y@{"a" * 40}
+      - uses: x/y@{"b" * 40}
+"""
+    assert step_occurrences(parse_workflow(text).jobs["t"].steps) == [1, 2]

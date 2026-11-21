@@ -7,7 +7,7 @@ from typing import Any
 
 from pit_crew.contracts import BUCKETS, PLAYBOOK_SKILLS, RISKS
 from pit_crew.lanes.analysis.critical_path import CIProfile, JobProfile, StepProfile
-from pit_crew.lanes.analysis.workflow import StepSpec, match_step_name
+from pit_crew.lanes.analysis.workflow import SHA, StepSpec, match_step_name
 
 MIN_SAVING_SECONDS = 10.0  # findings worth less than this are noise
 
@@ -71,17 +71,26 @@ def job_profile(profile: CIProfile, job_id: str) -> JobProfile | None:
 
 
 def step_occurrences(steps: Sequence[StepSpec]) -> list[int]:
-    """For each step, how many steps up to and including it share its name: 1 for the first, 2 for the next."""
+    """For each step, how many steps up to and including it share its name: 1 for the first, 2 for the next.
+
+    Names are folded like the measured ones (commit SHAs become `<sha>`), so `uses: x@<sha1>` and `x@<sha2>`
+    count as one name and get occurrences 1 and 2 on both the YAML and the measured side.
+    """
     seen: Counter[str] = Counter()
     occurrences = []
     for step in steps:
-        seen[step.name] += 1
-        occurrences.append(seen[step.name])
+        name = SHA.sub("<sha>", step.name)
+        seen[name] += 1
+        occurrences.append(seen[name])
     return occurrences
 
 
 def step_label(name: str, occurrence: int) -> str:
-    """The name a finding carries for a step: the plain name for the first of its name, `name [n]` after that."""
+    """The name a finding carries for a step: the plain name for the first of its name, `name [n]` after that.
+
+    A step whose real name already ends in ` [n]` could collide with a generated label; the label is only an
+    identity for the ledger and the colliding finding is hidden, never a check removed, so this is left as is.
+    """
     return name if occurrence == 1 else f"{name} [{occurrence}]"
 
 

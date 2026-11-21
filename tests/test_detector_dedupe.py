@@ -366,6 +366,11 @@ def test_dedupe_ignores_jobs_that_differ_in_step_settings(field_a: str, field_b:
     assert _findings(_pair(step_a=step + field_a, step_b=step + field_a)) == 1
 
 
+def test_dedupe_skips_jobs_with_non_scalar_with_values() -> None:
+    step = "- uses: some/action@v1\n        with: {paths: [a]}"
+    assert _findings(_pair(step_a=step, step_b=step)) == 0
+
+
 def test_dedupe_skips_jobs_with_oversized_env() -> None:
     big = "    env: {X: " + "A" * 70_000 + "}\n"
     assert _findings(_pair(big, big)) == 0

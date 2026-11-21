@@ -126,6 +126,46 @@ def test_find_bottlenecks_hides_recorded_findings() -> None:
     assert [f["skill"] for f in find(ledger)["findings"]] == ["dep-cache"]
 
 
+TWO_INSTALLS = """
+name: CI
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: cd frontend && npm ci
+      - name: Install dependencies
+        run: cd dashboard && npm ci
+"""
+
+
+def test_recording_the_second_same_named_step_hides_only_that_finding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_text(TWO_INSTALLS)
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    steps = [("Install dependencies", 120.0), ("Install dependencies", 60.0)]
+    raw = [{**run(i), "jobs": [job("test", 200, steps)]} for i in range(1, 6)]
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    same_revision(monkeypatch, TWO_INSTALLS)
+    build_request("analysis", "")
+    ledger = InMemoryLedger()
+
+    def installs() -> list[dict[str, Any]]:
+        return [f for f in find(ledger)["findings"] if f["skill"] == "dep-cache"]
+
+    assert [f["step"] for f in sorted(installs(), key=lambda f: f["step"])] == [
+        "Install dependencies",
+        "Install dependencies [2]",
+    ]
+    second = next(f for f in installs() if f["step"] == "Install dependencies [2]")
+    tools.call("record_hypothesis", ledger, {"repo": REPO, **second})
+
+    assert [f["step"] for f in installs()] == ["Install dependencies"]
+
+
 def test_find_bottlenecks_reports_waiting_as_uncovered(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
     (tmp_path / ".github" / "workflows" / "test.yml").write_text((FIXTURES / "fastapi" / "test.yml").read_text())

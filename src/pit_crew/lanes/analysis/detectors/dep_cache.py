@@ -31,7 +31,7 @@ _CACHE_INPUT_VALUES = {  # `cache:` values of setup actions whose value names th
 }
 # Directories (as consecutive path components) a generic `actions/cache` must include to cover a manager.
 _CACHE_DIRS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "npm": ((".npm",), ("node_modules",)),
+    "npm": ((".npm",),),  # `npm ci` deletes node_modules, so caching it saves nothing
     "pnpm": (("pnpm-store",), (".pnpm-store",), ("node_modules",)),
     "yarn": ((".yarn",), ("yarn",), ("node_modules",)),
     "bun": ((".bun",), ("node_modules",)),
@@ -74,7 +74,7 @@ def _setup_covered(name: str, with_: dict[str, str]) -> set[str]:
         managers.add(cache)
     elif name == "setup-uv" and with_.get("enable-cache", "").strip().lower() == "true":
         managers.add("uv")
-    elif name == "setup-go" and cache not in {"", "false"}:
+    elif name == "setup-go" and cache != "false":  # setup-go v4+ caches by default
         managers.add("go")
     elif name == "setup-ruby" and with_.get("bundler-cache", "").strip().lower() == "true":
         managers.add("bundle")

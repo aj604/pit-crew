@@ -17,7 +17,8 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from http.client import HTTPMessage
+from typing import IO, Any, override
 from urllib.parse import quote, urlencode
 
 API = "https://api.github.com"
@@ -232,17 +233,38 @@ def _parse_job(j: dict[str, Any], default_attempt: int) -> JobRun:
     )
 
 
+class _NoForeignRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect that leaves the GitHub API: urllib would copy the Authorization header to the new host."""
+
+    @override
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if not newurl.startswith(f"{API}/"):
+            message = f"refusing to follow a redirect to {newurl!r}: not under {API}"
+            raise ValueError(message)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _http_getter(token: str | None) -> Getter:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "pit-crew"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    opener = urllib.request.build_opener(_NoForeignRedirect)
 
     def get(url: str) -> tuple[Any, str | None]:
         if not url.startswith(f"{API}/"):  # the token must only ever go to the GitHub API
             msg = f"refusing to fetch {url!r}: not under {API}"
             raise ValueError(msg)
         request = urllib.request.Request(url, headers=headers)  # noqa: S310  https-only, checked above
-        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        with opener.open(request, timeout=30) as response:
             return json.load(response), next_link(response.headers.get("Link"))
 
     return get
