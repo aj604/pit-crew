@@ -35,13 +35,28 @@ NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "a
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
 
+def _is_assignment(token: str) -> bool:
+    """Whether a token is a shell `NAME=value` prefix: what precedes the first `=` must be a valid variable name.
+
+    That keeps `ruff>"out/run=1.json"` (a command with a redirection) from reading as an assignment.
+    """
+    name, equals, _ = token.partition("=")
+    return (
+        bool(equals)
+        and bool(name)
+        and name.isascii()
+        and (name[0].isalpha() or name[0] == "_")
+        and all(c.isalnum() or c == "_" for c in name)
+    )
+
+
 def _first_command(segment: str) -> str:
     """The command word of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
 
     A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
     """
     for token in segment.split():
-        if token in _WRAPPERS or token.startswith("-") or ("=" in token and not token.startswith("=")):
+        if token in _WRAPPERS or token.startswith("-") or _is_assignment(token):
             continue
         word = _WORD.match(token)
         return word.group() if word is not None else token

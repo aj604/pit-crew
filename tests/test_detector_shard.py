@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
-from pit_crew.lanes.analysis.detectors.shard import detect_shard_by_timing
+from pit_crew.lanes.analysis.detectors.shard import _is_static_check, detect_shard_by_timing
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -198,3 +198,23 @@ def test_shard_name_fallback_skips_known_non_test_commands() -> None:
         runs={"Upload test results": "aws s3 cp test-results s3://x", "Run tests": "mypy tests/"},
     )
     assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'ruff>"$REPORT_DIR/run=$GITHUB_RUN_ID.json" check --output-format json tests/',
+        "CI=true ruff check tests/",
+        "FOO= BAR=1 ruff check tests/",
+    ],
+)
+def test_shard_treats_lint_commands_as_static_checks(command: str) -> None:
+    assert _is_static_check(command)
+    prof, wf = build([("Lint tests", 240.0)], runs={"Lint tests": f"'{command}'"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
+    assert not _is_static_check("FOO= BAR=1 pytest")
+    prof, wf = build([("Unit", 240.0)], runs={"Unit": "FOO= BAR=1 pytest"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Unit"]
