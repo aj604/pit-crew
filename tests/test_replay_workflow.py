@@ -1044,6 +1044,9 @@ jobs:
     masks_path = runner_temp / "pit-crew-masks" / "test.masks"
     assert masks_path.is_file()
     assert (masks_path.stat().st_mode & 0o777) == 0o600
+    masks_text = masks_path.read_text(encoding="utf-8")
+    assert "cross-step-masked-555" not in masks_text
+    assert "early-step-secret-888" not in masks_text
 
     # Step 2 does NOT have EARLY_VALUE in its environment, yet still scrubs both secrets from its .cast.
     proc2 = subprocess.run(  # noqa: S603

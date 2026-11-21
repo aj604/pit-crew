@@ -18,12 +18,15 @@ Standard library only, so a replay job can run this file without installing pit-
 import argparse
 import codecs
 import fcntl
+import hmac
 import json
 import os
 import pty
 import re
+import secrets
 import select
 import shlex
+import stat
 import struct
 import subprocess
 import sys
@@ -32,7 +35,7 @@ import termios
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
-from typing import BinaryIO, TextIO
+from typing import BinaryIO, NamedTuple, TextIO
 
 WIDTH, HEIGHT = 120, 36
 # Gemini samples video at one frame a second; hold the last screen, where test runners
@@ -67,6 +70,23 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+_MASK_FILE_VERSION = 1
+_MASK_SALT_BYTES = 32
+_MASK_DIGEST_BYTES = 32
+_MAX_MASK_FILE_BYTES = 65_536
+_MAX_MASK_BYTES = 4096
+_MAX_MASK_ENTRIES = 256
+_MAX_HASH_WINDOW_CHECKS = 2_000_000
+_UTF8_CONT_MASK = 0xC0
+_UTF8_CONT_VAL = 0x80
+_TOKEN_RE = re.compile(r"[^\s=:\"',;&()\[\]{}<>\x1b]+")
+
+
+class _HashedMasks(NamedTuple):
+    salt: bytes
+    by_byte_len: dict[int, set[bytes]]
+
+
 def record(
     argv: list[str],
     cast_path: str | Path,
@@ -77,9 +97,8 @@ def record(
     """Run argv in a pseudo-terminal, write a secret-scrubbed asciicast v2 recording, and return its exit code."""
     out = echo if echo is not None else sys.stdout.buffer
     masks_path = Path(masks_file) if masks_file is not None else None
-    persisted_masks = _load_masks_file(masks_path) if masks_path is not None else set()
+    hashed_masks = _load_masks_file(masks_path) if masks_path is not None else None
     masks, explicit_masks = _collect_env_secrets_with_explicit(os.environ)
-    masks |= persisted_masks
     dynamic_masks: set[str] = set()
     env = {**os.environ, "TERM": "xterm-256color", "COLUMNS": str(WIDTH), "LINES": str(HEIGHT)}
     env.pop(SECRET_ENV_VARS_KEY, None)
@@ -96,7 +115,16 @@ def record(
                 start = time.monotonic()
                 proc = _start(argv, slave, env)
                 try:
-                    _copy(master, proc, out, cast, start, masks=masks, dynamic_masks=dynamic_masks)
+                    _copy(
+                        master,
+                        proc,
+                        out,
+                        cast,
+                        start,
+                        masks=masks,
+                        dynamic_masks=dynamic_masks,
+                        hashed_masks=hashed_masks,
+                    )
                 except BaseException:
                     proc.kill()  # the recording broke: stop the check rather than leave it running unseen
                     proc.wait()
@@ -106,9 +134,9 @@ def record(
         code = proc.wait()
     finally:
         if scrub_needed and path.exists():
-            _scrub_cast_file(path, masks)
+            _scrub_cast_file(path, masks, hashed_masks=hashed_masks)
         if masks_path is not None:
-            _append_masks_file(masks_path, (dynamic_masks | explicit_masks) - persisted_masks)
+            _append_masks_file(masks_path, dynamic_masks | explicit_masks, hashed_masks)
     return _SIGNAL_EXIT_BASE - code if code < 0 else code
 
 
@@ -182,6 +210,7 @@ def _copy(  # noqa: PLR0913  internal stream loop passing recording handles and 
     *,
     masks: set[str],
     dynamic_masks: set[str] | None = None,
+    hashed_masks: _HashedMasks | None = None,
 ) -> None:
     """Stream raw check output to the job log while writing secret-masked events to the recording."""
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -191,10 +220,10 @@ def _copy(  # noqa: PLR0913  internal stream loop passing recording handles and 
         out.flush()
         text = decoder.decode(data)
         raw_tail = _track_raw_add_masks(raw_tail, text, masks, dynamic_masks)
-        _event(cast, start, _redact_text(text, masks))
+        _event(cast, start, _redact_text(text, masks, hashed_masks=hashed_masks))
     tail = decoder.decode(b"", final=True)  # a character cut off by the check exiting
     _track_raw_add_masks(raw_tail, tail, masks, dynamic_masks, final=True)
-    _event(cast, start, _redact_text(tail, masks))
+    _event(cast, start, _redact_text(tail, masks, hashed_masks=hashed_masks))
 
 
 def _track_raw_add_masks(
@@ -240,29 +269,109 @@ def _collect_env_secrets_with_explicit(environ: Mapping[str, str]) -> tuple[set[
     return masks, explicit_masks
 
 
-def _load_masks_file(path: Path) -> set[str]:
-    if not path.is_file() or path.is_symlink():
-        return set()
-    masks: set[str] = set()
+def _read_nofollow_text(path: Path, max_bytes: int) -> str | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        fd = os.open(path, flags)
     except OSError:
-        return masks
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, str) and item:
-            masks.add(item)
-    return masks
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        return handle.read(max_bytes).decode("utf-8", errors="ignore")
 
 
-def _append_masks_file(path: Path, new_masks: Iterable[str]) -> None:
-    items = sorted({m for m in new_masks if m})
-    if not items:
+def _parse_masks_header(line: str) -> bytes | None:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or parsed.get("v") != _MASK_FILE_VERSION:
+        return None
+    raw_salt = parsed.get("salt")
+    if not isinstance(raw_salt, str):
+        return None
+    try:
+        salt = bytes.fromhex(raw_salt)
+    except ValueError:
+        return None
+    return salt if len(salt) == _MASK_SALT_BYTES else None
+
+
+def _parse_mask_entry(line: str) -> tuple[int, bytes] | None:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    byte_len = parsed.get("b")
+    raw_digest = parsed.get("h")
+    if type(byte_len) is not int or not (_MIN_AUTO_SECRET_LEN <= byte_len <= _MAX_MASK_BYTES):
+        return None
+    if not isinstance(raw_digest, str):
+        return None
+    try:
+        digest = bytes.fromhex(raw_digest)
+    except ValueError:
+        return None
+    return (byte_len, digest) if len(digest) == _MASK_DIGEST_BYTES else None
+
+
+def _load_masks_file(path: Path) -> _HashedMasks | None:
+    content = _read_nofollow_text(path, _MAX_MASK_FILE_BYTES)
+    if not content:
+        return None
+    lines = [line for line in content.splitlines() if line.strip()]
+    if not lines:
+        return None
+    salt = _parse_masks_header(lines[0])
+    if salt is None:
+        return None
+    by_byte_len: dict[int, set[bytes]] = {}
+    count = 0
+    for line in lines[1:]:
+        if count >= _MAX_MASK_ENTRIES:
+            break
+        entry = _parse_mask_entry(line)
+        if entry is None:
+            continue
+        byte_len, digest = entry
+        by_byte_len.setdefault(byte_len, set()).add(digest)
+        count += 1
+    return _HashedMasks(salt=salt, by_byte_len=by_byte_len)
+
+
+def _persistable_mask_bytes(candidates: Iterable[str]) -> list[bytes]:
+    seen: set[bytes] = set()
+    out: list[bytes] = []
+    for item in candidates:
+        if len(item) < _MIN_AUTO_SECRET_LEN or item.strip().lower() in _TRIVIAL_ENV_VALUES:
+            continue
+        raw = item.encode("utf-8")
+        if _MIN_AUTO_SECRET_LEN <= len(raw) <= _MAX_MASK_BYTES and raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
+
+
+def _append_masks_file(path: Path, new_masks: Iterable[str], existing: _HashedMasks | None) -> None:
+    raw_items = _persistable_mask_bytes(new_masks)
+    if not raw_items:
+        return
+    salt = existing.salt if existing is not None else secrets.token_bytes(_MASK_SALT_BYTES)
+    known = existing.by_byte_len if existing is not None else {}
+    entries: list[str] = []
+    for raw in raw_items:
+        digest = hmac.digest(salt, raw, "sha256")
+        if digest not in known.get(len(raw), ()):
+            entries.append(json.dumps({"b": len(raw), "h": digest.hex()}) + "\n")
+    if not entries:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,12 +381,18 @@ def _append_masks_file(path: Path, new_masks: Iterable[str]) -> None:
         try:
             if hasattr(os, "fchmod"):
                 os.fchmod(fd, 0o600)
+            size = os.fstat(fd).st_size
             handle = os.fdopen(fd, "ab")
         except BaseException:
             os.close(fd)
             raise
         with handle:
-            handle.write("".join(f"{json.dumps(item)}\n" for item in items).encode("utf-8"))
+            if size == 0:
+                header = json.dumps({"v": _MASK_FILE_VERSION, "salt": salt.hex()}) + "\n"
+                handle.write(header.encode("utf-8"))
+            elif existing is None:
+                return
+            handle.write("".join(entries).encode("utf-8"))
     except OSError:
         return
 
@@ -329,16 +444,88 @@ def _register_add_masks(text: str, masks: set[str], *, dynamic_masks: set[str] |
         dynamic_masks.update(discovered)
 
 
-def _find_secret_spans(text: str, masks: Iterable[str]) -> list[tuple[int, int]]:
+def _find_secret_spans(
+    text: str,
+    masks: Iterable[str],
+    *,
+    hashed_masks: _HashedMasks | None = None,
+) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = [(m.start(1), m.end(1)) for m in _ADD_MASK_RE.finditer(text)]
     mask_list = sorted({m for m in masks if m}, key=len, reverse=True)
     if mask_list:
         literal_re = re.compile("|".join(re.escape(item) for item in mask_list))
         spans.extend((m.start(), m.end()) for m in literal_re.finditer(text))
+    if hashed_masks is not None and hashed_masks.by_byte_len:
+        spans.extend(_find_hashed_secret_spans(text, hashed_masks))
     for pattern in _SECRET_PATTERNS:
         group_idx = 1 if pattern.groups else 0
         spans.extend((m.start(group_idx), m.end(group_idx)) for m in pattern.finditer(text))
     return _merge_spans(spans)
+
+
+def _find_hashed_secret_spans(text: str, hashed: _HashedMasks) -> list[tuple[int, int]]:
+    raw = text.encode("utf-8")
+    raw_len = len(raw)
+    lengths = sorted((b_len for b_len in hashed.by_byte_len if b_len <= raw_len), reverse=True)
+    if not lengths:
+        return []
+    if raw_len * len(lengths) > _MAX_HASH_WINDOW_CHECKS:
+        return _scan_hashed_tokens(text, hashed.salt, hashed.by_byte_len)
+    byte_spans = _scan_hashed_windows(memoryview(raw), hashed.salt, hashed.by_byte_len, lengths)
+    if not byte_spans:
+        return []
+    if raw_len == len(text):
+        return byte_spans
+    return _byte_spans_to_char_spans(raw, byte_spans)
+
+
+def _scan_hashed_windows(
+    buf: memoryview,
+    salt: bytes,
+    by_byte_len: Mapping[int, set[bytes]],
+    lengths: list[int],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    raw_len = len(buf)
+    for byte_len in lengths:
+        targets = by_byte_len[byte_len]
+        for pos in range(raw_len - byte_len + 1):
+            if (buf[pos] & _UTF8_CONT_MASK) == _UTF8_CONT_VAL:
+                continue
+            if hmac.digest(salt, buf[pos : pos + byte_len], "sha256") in targets:
+                spans.append((pos, pos + byte_len))
+    return spans
+
+
+def _scan_hashed_tokens(
+    text: str,
+    salt: bytes,
+    by_byte_len: Mapping[int, set[bytes]],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in _TOKEN_RE.finditer(text):
+        token_bytes = match.group(0).encode("utf-8")
+        targets = by_byte_len.get(len(token_bytes))
+        if targets and hmac.digest(salt, token_bytes, "sha256") in targets:
+            spans.append((match.start(), match.end()))
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        line_bytes = stripped.encode("utf-8")
+        targets = by_byte_len.get(len(line_bytes))
+        if targets and hmac.digest(salt, line_bytes, "sha256") in targets:
+            spans.append((offset, offset + len(stripped)))
+        offset += len(line)
+    return spans
+
+
+def _byte_spans_to_char_spans(raw: bytes, byte_spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for b_start, b_end in byte_spans:
+        c_start = len(raw[:b_start].decode("utf-8", errors="replace"))
+        c_end = c_start + len(raw[b_start:b_end].decode("utf-8", errors="replace"))
+        out.append((c_start, c_end))
+    return out
 
 
 def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -355,10 +542,10 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def _redact_text(text: str, masks: set[str]) -> str:
+def _redact_text(text: str, masks: set[str], *, hashed_masks: _HashedMasks | None = None) -> str:
     if not text:
         return text
-    spans = _find_secret_spans(text, masks)
+    spans = _find_secret_spans(text, masks, hashed_masks=hashed_masks)
     if not spans:
         return text
     out: list[str] = []
@@ -371,7 +558,7 @@ def _redact_text(text: str, masks: set[str]) -> str:
     return "".join(out)
 
 
-def _scrub_cast_file(cast_path: Path, masks: set[str]) -> None:
+def _scrub_cast_file(cast_path: Path, masks: set[str], *, hashed_masks: _HashedMasks | None = None) -> None:
     lines = cast_path.read_text(encoding="utf-8").splitlines()
     if len(lines) <= 1:
         return
@@ -390,7 +577,7 @@ def _scrub_cast_file(cast_path: Path, masks: set[str]) -> None:
     if not combined:
         return
     _register_add_masks(combined, masks)
-    spans = _find_secret_spans(combined, masks)
+    spans = _find_secret_spans(combined, masks, hashed_masks=hashed_masks)
     if not spans:
         return
     _apply_spans_to_events(events, boundaries, spans)

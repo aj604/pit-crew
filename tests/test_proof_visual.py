@@ -125,11 +125,21 @@ def test_record_persists_masks_file_across_steps_with_private_permissions(tmp_pa
         "time.sleep(0.05)\n"
         "sys.stdout.write('secret-42\\n'); sys.stdout.flush()\n"
     )
-    step2 = "print('leaked=cross-step-secret-42'); raise SystemExit(2)"
+    step2 = (
+        "import sys, time\n"
+        "sys.stdout.write('caf\\xe9 leaked=cross-step-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-42\\n'); sys.stdout.flush()\n"
+        "raise SystemExit(2)\n"
+    )
     assert record.record([sys.executable, "-c", step1], step1_cast, io.BytesIO(), masks_file=masks_file) == 0
     assert masks_file.is_file()
     assert (masks_file.stat().st_mode & 0o777) == 0o600
     assert (masks_file.parent.stat().st_mode & 0o777) == 0o700
+    # Masks file stores only salted HMAC-SHA256 digests, never plaintext secrets.
+    masks_raw = masks_file.read_text(encoding="utf-8")
+    assert "cross-step-secret-42" not in masks_raw
+    assert '"salt"' in masks_raw
 
     assert (
         record.main(
@@ -149,7 +159,7 @@ def test_record_persists_masks_file_across_steps_with_private_permissions(tmp_pa
     _, *events = [json.loads(line) for line in step2_cast.read_text(encoding="utf-8").splitlines()]
     recorded = "".join(text for _, kind, text in events if kind == "o")
     assert "cross-step-secret-42" not in recorded
-    assert "leaked=***" in recorded
+    assert "caf\xe9 leaked=***" in recorded
 
 
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
