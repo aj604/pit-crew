@@ -6,14 +6,17 @@ to a SQLite ledger. It is the Milestone 2 check that a lane works end to end; se
 
 import argparse
 import json
+import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from pit_crew import managed_agent
 from pit_crew.contracts import Candidate, Hypothesis, Record, ReplayPlan
-from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.ledger import Ledger, SqliteLedger, normalize_repo
 
 LANES = ("analysis", "optimizer", "proof")
 EXPECTED_RECORD: dict[str, type[Record]] = {
@@ -21,6 +24,21 @@ EXPECTED_RECORD: dict[str, type[Record]] = {
     "optimizer": Candidate,
     "proof": ReplayPlan,
 }
+
+
+WORKSPACE_ENV = "PIT_CREW_WORKSPACE"
+DEFAULT_WORKSPACE = "/workspace"
+
+
+class MissingWorkspaceError(FileNotFoundError):
+    """Raised when the analysis lane's local checkout (read by profile_ci) is not a directory."""
+
+    def __init__(self, path: Path) -> None:
+        """Name the missing path and how to point the CLI at a checkout."""
+        super().__init__(
+            f"analysis reads the workflow from a local checkout, but {str(path)!r} is not a directory; "
+            f"pass --workspace <path> or set {WORKSPACE_ENV}"
+        )
 
 
 class MissingPrerequisiteError(LookupError):
@@ -49,7 +67,8 @@ def default_task(lane: str, repo: str, ledger: Ledger) -> str:
             f"Hypothesis id: {hypotheses[-1].id}\n"
             "Implement this hypothesis and report it with report_candidate."
         )
-    candidates = [c for c in ledger.all(Candidate) if c.repo == repo]
+    repo_key = normalize_repo(repo)
+    candidates = [c for c in ledger.all(Candidate) if normalize_repo(c.repo) == repo_key]
     if not candidates:
         raise MissingPrerequisiteError(lane, "Candidate", repo)
     candidate = candidates[-1]
@@ -64,28 +83,66 @@ def default_task(lane: str, repo: str, ledger: Ledger) -> str:
     )
 
 
-def smoke_lane(
+@contextmanager
+def _workspace_env(workspace: str | None) -> Iterator[None]:
+    """Set ``PIT_CREW_WORKSPACE`` to ``workspace`` for the block and restore the previous value after."""
+    if workspace is None:
+        yield
+        return
+    previous = os.environ.get(WORKSPACE_ENV)
+    os.environ[WORKSPACE_ENV] = workspace
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(WORKSPACE_ENV, None)
+        else:
+            os.environ[WORKSPACE_ENV] = previous
+
+
+def _check_workspace(lane: str, workspace: str | None) -> None:
+    """Fail fast when ``analysis`` would read its workflow from a checkout that is not there."""
+    if lane != "analysis":
+        return
+    path = Path(workspace if workspace is not None else os.environ.get(WORKSPACE_ENV, DEFAULT_WORKSPACE))
+    if not path.is_dir():
+        raise MissingWorkspaceError(path)
+
+
+def smoke_lane(  # noqa: PLR0913  each keyword mirrors one smoke-lane flag
     lane: str,
     repo: str,
-    ledger: Ledger,
+    ledger: Ledger | str | Path,
     task: str | None = None,
     *,
+    workspace: str | None = None,
     client: managed_agent.InteractionsClientLike | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Run ``lane`` once and return its JSON summary and whether it passed."""
+    """Run ``lane`` once and return its JSON summary and whether it passed.
+
+    ``ledger`` is a Ledger or the path of a SQLite ledger to open. Opening and reading it happen inside
+    the same error boundary as the run, so a bad ledger is reported in the summary like any other failure.
+    ``workspace`` is the local checkout the analysis tools read (``PIT_CREW_WORKSPACE`` while the lane runs).
+    """
     kind = EXPECTED_RECORD[lane]
-    before = len(ledger.all(kind))
     started = time.monotonic()
     summary: dict[str, Any] = {"lane": lane, "interaction_id": None, "status": "error"}
+    records_written = 0
     try:
-        prompt = task if task is not None else default_task(lane, repo, ledger)
-        interaction = managed_agent.run_lane(lane, prompt, ledger, repo=repo, client=client)
+        opened = SqliteLedger(ledger) if isinstance(ledger, (str, Path)) else ledger
+        before = len(opened.all(kind))
+        try:
+            _check_workspace(lane, workspace)
+            prompt = task if task is not None else default_task(lane, repo, opened)
+            with _workspace_env(workspace):
+                interaction = managed_agent.run_lane(lane, prompt, opened, repo=repo, client=client)
+        finally:
+            records_written = len(opened.all(kind)) - before
     except Exception as exc:  # noqa: BLE001  a smoke check reports every failure as JSON instead of a traceback
         summary["error"] = f"{type(exc).__name__}: {exc}"
     else:
         summary["interaction_id"] = interaction.id
         summary["status"] = interaction.status
-    records_written = len(ledger.all(kind)) - before
     summary["expected_record"] = kind.__name__
     summary["records_written"] = records_written
     summary["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -100,6 +157,10 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--repo", required=True, help="repository to mount, e.g. owner/name")
     smoke.add_argument("--ledger", required=True, help="path to the SQLite ledger (created if missing)")
     smoke.add_argument("--task", help="prompt to send instead of the lane's built-in default")
+    smoke.add_argument(
+        "--workspace",
+        help=f"local checkout of --repo that analysis tools read (default: ${WORKSPACE_ENV} or {DEFAULT_WORKSPACE})",
+    )
     return parser
 
 
@@ -110,7 +171,7 @@ def main(
 ) -> int:
     """Run the CLI and return its exit code: 0 when the lane completed and wrote its record."""
     args = _parser().parse_args(argv)
-    summary, passed = smoke_lane(args.lane, args.repo, SqliteLedger(args.ledger), args.task, client=client)
+    summary, passed = smoke_lane(args.lane, args.repo, args.ledger, args.task, workspace=args.workspace, client=client)
     sys.stdout.write(json.dumps(summary) + "\n")
     return 0 if passed else 1
 

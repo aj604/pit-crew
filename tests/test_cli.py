@@ -1,4 +1,6 @@
+import gzip
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -7,7 +9,16 @@ import pytest
 
 from pit_crew import cli, managed_agent
 from pit_crew.contracts import Candidate, Hypothesis, ReplayPlan
+from pit_crew.lanes.analysis import history
 from pit_crew.ledger import SqliteLedger
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Analysis smoke runs need a local checkout; default every test to an empty temp one."""
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
 
 
 @dataclass
@@ -243,10 +254,167 @@ def test_invalid_arguments_exit_with_usage_error(argv: list[str], capsys: pytest
     assert "usage:" in capsys.readouterr().err
 
 
+def _profile_then_record_client() -> _FakeClient:
+    profile_call = _FakeStep(
+        type="function_call",
+        id="call-1",
+        name="profile_ci",
+        arguments={"repo": "org/fork", "workflow": "test.yml"},
+    )
+    record_call = _FakeStep(type="function_call", id="call-2", name="record_hypothesis", arguments=_hypothesis_args())
+    return _FakeClient(
+        _FakeInteraction(id="int-1", status="requires_action", steps=[profile_call]),
+        _FakeInteraction(id="int-2", status="requires_action", steps=[record_call]),
+        _FakeInteraction(id="int-3", status="completed"),
+    )
+
+
+def _fork_checkout(root: Path) -> Path:
+    workflows = root / "fork" / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "test.yml").write_text((FIXTURES / "fastapi" / "test.yml").read_text())
+    return root / "fork"
+
+
+@pytest.fixture
+def fastapi_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    with gzip.open(FIXTURES / "fastapi" / "runs.json.gz") as f:
+        raw = json.load(f)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+
+
+@pytest.mark.usefixtures("fastapi_history")
+def test_workspace_flag_lets_analysis_profile_ci_read_a_local_checkout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "elsewhere"))
+    checkout = _fork_checkout(tmp_path)
+    client = _profile_then_record_client()
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db", "--workspace", str(checkout)), client, capsys)
+
+    assert (code, summary["status"], summary["records_written"]) == (0, "completed", 1)
+    profile_result = client.interactions.calls[1]["input"][0]  # type: ignore[index]
+    assert profile_result["name"] == "profile_ci"
+    assert "is_error" not in profile_result
+    assert profile_result["result"]["critical_path"]["jobs"][0] == "changes"
+    assert os.environ["PIT_CREW_WORKSPACE"] == str(tmp_path / "elsewhere")  # restored after the run
+
+
+@pytest.mark.usefixtures("fastapi_history")
+def test_analysis_honors_pit_crew_workspace_env(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(_fork_checkout(tmp_path)))
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db"), _profile_then_record_client(), capsys)
+
+    assert (code, summary["status"], summary["records_written"]) == (0, "completed", 1)
+
+
+def test_workspace_flag_unsets_env_again_when_it_was_unset(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
+    seen: list[str | None] = []
+
+    def fake_run_lane(*_args: object, **_kwargs: object) -> _FakeInteraction:
+        seen.append(os.environ.get("PIT_CREW_WORKSPACE"))
+        return _FakeInteraction(id="int-1", status="completed")
+
+    monkeypatch.setattr(managed_agent, "run_lane", fake_run_lane)
+
+    _run(_argv("analysis", tmp_path / "l.db", "--workspace", str(tmp_path)), _FakeClient(), capsys)
+
+    assert seen == [str(tmp_path)]
+    assert "PIT_CREW_WORKSPACE" not in os.environ
+
+
+@pytest.mark.parametrize("use_flag", [True, False])
+def test_analysis_with_missing_workspace_fails_before_calling_the_api(
+    use_flag: bool,  # noqa: FBT001
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "no-such-checkout"
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path if use_flag else missing))
+    extra = ["--workspace", str(missing)] if use_flag else []
+    client = _FakeClient()
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db", *extra), client, capsys)
+
+    assert code == 1
+    assert summary["error"].startswith("MissingWorkspaceError")
+    assert "--workspace" in summary["error"]
+    assert client.interactions.calls == []
+
+
+def test_proof_matches_candidate_repo_case_insensitively_and_picks_newest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ledger_path = tmp_path / "l.db"
+    ledger = SqliteLedger(ledger_path)
+    older = Candidate("h1", "pc/older", "older change", repo="Org/Fork")
+    newest = Candidate("h2", "pc/newest", "newest change", repo="ORG/fork")
+    ledger.add(older)
+    ledger.add(Candidate("h3", "pc/other", "other repo", repo="org/forked"))
+    ledger.add(newest)
+    ledger.add(Candidate("h4", "pc/elsewhere", "elsewhere", repo="Other/Repo"))
+    client = _calling("plan_replays", {"candidate_id": newest.id, "bug_shas": ["abc123"]})
+
+    argv = ["smoke-lane", "--lane", "proof", "--repo", "org/FORK", "--ledger", str(ledger_path)]
+    code, summary = _run(argv, client, capsys)
+
+    assert code == 0
+    assert summary["records_written"] == 1
+    prompt = str(client.interactions.calls[0]["input"])
+    assert f"Candidate id: {newest.id}\n" in prompt
+    assert older.id not in prompt
+    assert "pc/other" not in prompt
+    assert "pc/elsewhere" not in prompt
+
+
+def test_proof_ignores_candidates_for_other_repos(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    ledger_path = tmp_path / "l.db"
+    SqliteLedger(ledger_path).add(Candidate("h1", "pc/x", "x", repo="Other/Repo"))
+    client = _FakeClient()
+
+    code, summary = _run(_argv("proof", ledger_path), client, capsys)
+
+    assert code == 1
+    assert "needs a Candidate" in summary["error"]
+    assert client.interactions.calls == []
+
+
+@pytest.mark.parametrize("make_ledger", ["directory", "garbage"])
+def test_unusable_ledger_is_reported_as_one_json_line(
+    make_ledger: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if make_ledger == "directory":
+        ledger_path = tmp_path / "ledger-dir"
+        ledger_path.mkdir()
+    else:
+        ledger_path = tmp_path / "garbage.db"
+        ledger_path.write_bytes(b"this is not a sqlite database" * 100)
+    client = _FakeClient()
+
+    code, summary = _run(_argv("optimizer", ledger_path), client, capsys)
+
+    assert code == 1
+    assert summary["status"] == "error"
+    assert summary["interaction_id"] is None
+    assert summary["records_written"] == 0
+    assert summary["error"]
+    assert client.interactions.calls == []
+
+
 def test_parser_accepts_every_lane_and_optional_task() -> None:
     parser = cli._parser()  # noqa: SLF001
     for lane in cli.LANES:
         args = parser.parse_args(["smoke-lane", "--lane", lane, "--repo", "o/r", "--ledger", "l.db"])
-        assert (args.lane, args.repo, args.ledger, args.task) == (lane, "o/r", "l.db", None)
-    args = parser.parse_args(["smoke-lane", "--lane", "proof", "--repo", "o/r", "--ledger", "l.db", "--task", "t"])
-    assert args.task == "t"
+        assert (args.lane, args.repo, args.ledger, args.task, args.workspace) == (lane, "o/r", "l.db", None, None)
+    args = parser.parse_args(
+        ["smoke-lane", "--lane", "proof", "--repo", "o/r", "--ledger", "l.db", "--task", "t", "--workspace", "w"]
+    )
+    assert (args.task, args.workspace) == ("t", "w")

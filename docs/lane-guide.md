@@ -53,22 +53,23 @@ Add tests under `tests/` (e.g., `tests/test_<lane>.py`) covering:
 
 `python -m pit_crew.cli smoke-lane` runs one lane against the live Managed Agents API and checks that it wrote its record to a SQLite ledger. It prints one JSON line (`lane`, `interaction_id`, `status`, `expected_record`, `records_written`, `elapsed_seconds`, plus `error` on failure). It exits 0 only when the interaction ends `completed` **and** at least one new expected record (`Hypothesis`, `Candidate` or `ReplayPlan`) was written.
 
-The default prompts chain the lanes: `optimizer` targets the newest `Hypothesis` for `--repo` in the ledger, and `proof` targets the newest `Candidate`. Run them in order against one ledger. Pass `--task "..."` to send your own prompt instead (this skips the lookup).
+The default prompts chain the lanes: `optimizer` targets the newest `Hypothesis` for `--repo` in the ledger, and `proof` targets the newest `Candidate` (repo names match case-insensitively, as on GitHub). Run them in order against one ledger. Pass `--task "..."` to send your own prompt instead (this skips the lookup).
 
 Manual M2 verification checklist:
 
 1. Use a fork you own as `--repo`, and keep the ledger outside the repo (for example under `~/pit-crew-smoke/`).
 2. `export GEMINI_API_KEY=...`
-3. Analysis:
+3. Analysis. Its `profile_ci` tool reads the workflow file on the machine running the CLI, not in the sandbox, so clone the fork locally and point the CLI at it with `--workspace <path>` (or `export PIT_CREW_WORKSPACE=<path>`; the default is `/workspace`). The command fails fast with `MissingWorkspaceError` if that directory does not exist.
    ```sh
-   uv run python -m pit_crew.cli smoke-lane --lane analysis --repo <owner/name> --ledger ~/pit-crew-smoke/ledger.db
+   git clone https://github.com/<owner/name> ~/pit-crew-smoke/fork
+   uv run python -m pit_crew.cli smoke-lane --lane analysis --repo <owner/name> --ledger ~/pit-crew-smoke/ledger.db --workspace ~/pit-crew-smoke/fork
    ```
    Check: exit code 0, `"status": "completed"`, `"records_written"` ≥ 1.
 4. Optimizer, same ledger: `--lane optimizer`. Check the same three things. The `Candidate` is recorded only. Nothing is pushed.
 5. Proof, same ledger: `--lane proof`. Check the same three things.
 6. Note each `interaction_id` and `elapsed_seconds` in the PR or issue that records the M2 run.
 
-If you re-run analysis on the same ledger, the agent can hit the duplicate-hypothesis refusal and write nothing (non-zero exit). Use a fresh ledger path to start over. Without `GEMINI_API_KEY`, the command fails fast with `"error": "KeyError: 'GEMINI_API_KEY'"`.
+If you re-run analysis on the same ledger, the agent can hit the duplicate-hypothesis refusal and write nothing (non-zero exit). Use a fresh ledger path to start over. A ledger path that is a directory or not a SQLite file is reported the same way, as one JSON line with `"status": "error"`. Without `GEMINI_API_KEY`, the command fails fast with `"error": "KeyError: 'GEMINI_API_KEY'"`.
 
 ---
 
