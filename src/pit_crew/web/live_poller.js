@@ -151,6 +151,8 @@ export function createLivePoller(root, header, store, options = {}) {
     return input;
   };
 
+  const isStaleTrigger = (ctx) => destroyed || ctx !== contextGen || store.getState().mode !== "live";
+
   const triggerCycle = async () => {
     const s = store.getState();
     if (destroyed || s.mode !== "live" || typeof fetchFn !== "function" || triggerInFlight || s.status?.active === true) return false;
@@ -164,8 +166,9 @@ export function createLivePoller(root, header, store, options = {}) {
         method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ repo, until_sla: false }),
       });
-      if (destroyed || ctx !== contextGen || store.getState().mode !== "live") { triggerInFlight = false; return false; }
+      if (isStaleTrigger(ctx)) return false;
       const detail = extractErrorDetail(await readJsonSafe(response));
+      if (isStaleTrigger(ctx)) return false;
       triggerInFlight = false;
       if (response?.status === 202 || response?.ok) {
         assumedActive = true;
@@ -187,8 +190,8 @@ export function createLivePoller(root, header, store, options = {}) {
       syncRunButton(store.getState());
       return false;
     } catch (error) {
+      if (isStaleTrigger(ctx)) return false;
       triggerInFlight = false;
-      if (destroyed || ctx !== contextGen || store.getState().mode !== "live") return false;
       store.setFetchError(`Failed to trigger Pit Stop: ${error instanceof Error && error.message ? error.message : "network error"}`);
       syncRunButton(store.getState());
       return false;
@@ -217,9 +220,9 @@ export function createLivePoller(root, header, store, options = {}) {
     }
     syncPill(s);
     if (s.mode !== "live") { if (modeChanged) { resetCycle(); lastPollDelayMs = null; } return; }
+    if (modeChanged || repoChanged) resetCycle();
     syncRunButton(s);
     if (modeChanged || repoChanged) {
-      resetCycle();
       if (isRepoSlug(s.repo) && !isHidden() && typeof fetchFn === "function") void refresh();
       else lastPollDelayMs = null;
     }

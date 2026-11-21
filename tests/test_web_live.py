@@ -1,8 +1,12 @@
+import contextlib
 import json
+import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -130,7 +134,7 @@ def test_live_api_endpoints_and_trigger_statuses() -> None:
         assert (unavail.status_code, unavail.json()["detail"]) == (503, "Dispatcher is not configured")
 
 
-_LIVE_NODE_SCRIPT = """
+_NODE_HARNESS = """
 const flush = async (n = 8) => { for (let i = 0; i < n; i += 1) await Promise.resolve(); };
 const jr = (status, body) => ({ ok: status >= 200 && status < 300, status, async json() { return body; } });
 const makeTimer = () => {
@@ -192,7 +196,11 @@ const fakeDoc = () => {
 const pillText = (p) => p.querySelectorAll(".live-status-pill__text")[0]?.textContent ?? "";
 const btnOf = (d) => [d.ids["run-pit-stop"].disabled, d.ids["run-pit-stop"].attrs["aria-busy"],
   d.ids["run-pit-stop"].textContent];
+"""
 
+_LIVE_NODE_SCRIPT = (
+    _NODE_HARNESS
+    + """
 const app = await import(process.argv[1]), lp = await import(process.argv[2]), seed = JSON.parse(process.argv[3]);
 const helpers = {
   intervals: [
@@ -330,6 +338,245 @@ console.log(JSON.stringify({
   syncedFromInput,
 }));
 """
+)
+
+
+_LIVE_EDGE_NODE_SCRIPT = (
+    _NODE_HARNESS
+    + """
+const app = await import(process.argv[1]), seed = JSON.parse(process.argv[2]);
+const idleGet = (url, repoOverride = null) => {
+  const statusBody = { ...seed.status, ...(repoOverride ? { repo: repoOverride } : {}), active: false };
+  if (url.endsWith("/status")) return jr(200, statusBody);
+  return jr(200, url.endsWith("/attempts") ? seed.attempts : seed.records);
+};
+
+// 1) Stale POST resolves before readJsonSafe after repo switch + new trigger
+const dA = fakeDoc(), tA = makeTimer(), postResolversA = [];
+const pwA = app.bootPitWall(dA.doc, "?repo=org/first", {
+  live: {
+    fetch: (url, init = {}) => init.method === "POST"
+      ? new Promise((resolve, reject) => postResolversA.push({ resolve, reject }))
+      : Promise.resolve(idleGet(url)),
+    timer: tA, doc: dA.doc,
+  },
+});
+await flush();
+dA.ids["run-pit-stop"].click();
+dA.ids["repo-input"].value = "org/second";
+dA.ids["repo-input"].dispatchEvent({ type: "change" });
+await flush();
+dA.ids["run-pit-stop"].click();
+let staleJsonCalled = false;
+postResolversA[0].resolve({
+  ok: false, status: 503,
+  async json() { staleJsonCalled = true; return { detail: "stale repo A 503" }; },
+});
+await flush();
+const stalePostBeforeJson = {
+  staleJsonCalled,
+  inFlight: pwA.livePoller.getState().triggerInFlight,
+  btn: btnOf(dA),
+  error: pwA.store.getState().fetchError,
+  pillHidden: pwA.livePoller.statusPill.hidden,
+};
+postResolversA[1].resolve(jr(202, { status: "started", repo: "org/second" }));
+await flush();
+pwA.livePoller.destroy();
+
+// 2) Stale POST rejects in catch after repo switch + new trigger
+const dB = fakeDoc(), tB = makeTimer(), postResolversB = [];
+const pwB = app.bootPitWall(dB.doc, "?repo=org/first", {
+  live: {
+    fetch: (url, init = {}) => init.method === "POST"
+      ? new Promise((resolve, reject) => postResolversB.push({ resolve, reject }))
+      : Promise.resolve(idleGet(url)),
+    timer: tB, doc: dB.doc,
+  },
+});
+await flush();
+dB.ids["run-pit-stop"].click();
+pwB.store.setRepo("org/second");
+await flush();
+dB.ids["run-pit-stop"].click();
+postResolversB[0].reject(new Error("stale network drop"));
+await flush();
+const stalePostReject = {
+  inFlight: pwB.livePoller.getState().triggerInFlight,
+  btn: btnOf(dB),
+  error: pwB.store.getState().fetchError,
+  pillHidden: pwB.livePoller.statusPill.hidden,
+};
+postResolversB[1].resolve(jr(202, { status: "started", repo: "org/second" }));
+await flush();
+pwB.livePoller.destroy();
+
+// 3a) Mode switch to Demo while response.json() is pending
+const dC1 = fakeDoc(), tC1 = makeTimer();
+let resolveJsonC1;
+const pwC1 = app.bootPitWall(dC1.doc, "?repo=org/first", {
+  live: {
+    fetch: (url, init = {}) => init.method === "POST"
+      ? Promise.resolve({ ok: false, status: 503, json: () => new Promise((r) => { resolveJsonC1 = r; }) })
+      : Promise.resolve(idleGet(url)),
+    timer: tC1, doc: dC1.doc,
+  },
+});
+await flush();
+dC1.ids["run-pit-stop"].click();
+await flush();
+pwC1.store.setMode("demo");
+resolveJsonC1({ detail: "late 503" });
+await flush();
+const staleJsonDemo = {
+  mode: pwC1.store.getState().mode,
+  error: pwC1.store.getState().fetchError,
+  pillHidden: pwC1.livePoller.statusPill.hidden,
+};
+pwC1.livePoller.destroy();
+
+// 3b) Repo switch + new trigger while Repo A's response.json() is pending
+const dC2 = fakeDoc(), tC2 = makeTimer();
+let resolveJsonC2, postCountC2 = 0, resolvePostB2;
+const pwC2 = app.bootPitWall(dC2.doc, "?repo=org/first", {
+  live: {
+    fetch: (url, init = {}) => {
+      if (init.method === "POST") {
+        postCountC2 += 1;
+        if (postCountC2 === 1) {
+          return Promise.resolve({ ok: false, status: 503, json: () => new Promise((r) => { resolveJsonC2 = r; }) });
+        }
+        return new Promise((r) => { resolvePostB2 = r; });
+      }
+      return Promise.resolve(idleGet(url));
+    },
+    timer: tC2, doc: dC2.doc,
+  },
+});
+await flush();
+dC2.ids["run-pit-stop"].click();
+await flush();
+pwC2.store.setRepo("org/second");
+await flush();
+dC2.ids["run-pit-stop"].click();
+resolveJsonC2({ detail: "late repo A 503" });
+await flush();
+const staleJsonRepo = {
+  inFlight: pwC2.livePoller.getState().triggerInFlight,
+  btn: btnOf(dC2),
+  error: pwC2.store.getState().fetchError,
+  pillHidden: pwC2.livePoller.statusPill.hidden,
+};
+resolvePostB2(jr(202, { status: "started", repo: "org/second" }));
+await flush();
+pwC2.livePoller.destroy();
+
+// 4) resetCycle() runs before syncRunButton(s) on repoChanged (for both triggerInFlight and assumedActive)
+const dD1 = fakeDoc(), tD1 = makeTimer();
+const pwD1 = app.bootPitWall(dD1.doc, "?repo=org/first", {
+  live: {
+    fetch: (url, init = {}) => init.method === "POST" ? new Promise(() => {}) : Promise.resolve(idleGet(url)),
+    timer: tD1, doc: dD1.doc,
+  },
+});
+await flush();
+dD1.ids["run-pit-stop"].click();
+const beforeClearBtn = btnOf(dD1);
+dD1.ids["repo-input"].value = "";
+dD1.ids["repo-input"].dispatchEvent({ type: "change" });
+const afterClearInFlight = {
+  beforeClearBtn,
+  btn: btnOf(dD1),
+  inFlight: pwD1.livePoller.getState().triggerInFlight,
+  repo: pwD1.store.getState().repo,
+  activeTimers: tD1.active.size,
+};
+pwD1.livePoller.destroy();
+
+const dD2 = fakeDoc(), tD2 = makeTimer();
+let failGetsD2 = false;
+const pwD2 = app.bootPitWall(dD2.doc, "?repo=org/first", {
+  live: {
+    fetch: async (url, init = {}) => {
+      if (init.method === "POST") { failGetsD2 = true; return jr(202, { status: "started", repo: "org/first" }); }
+      if (failGetsD2) return jr(500, { detail: "transient" });
+      return idleGet(url);
+    },
+    timer: tD2, doc: dD2.doc,
+  },
+});
+await flush();
+dD2.ids["run-pit-stop"].click();
+await flush();
+const beforeSwitchAssumed = { btn: btnOf(dD2), assumedActive: pwD2.livePoller.getState().assumedActive };
+dD2.doc.hidden = true;
+pwD2.store.setRepo("org/other");
+const afterSwitchAssumed = {
+  beforeSwitchAssumed,
+  btn: btnOf(dD2),
+  assumedActive: pwD2.livePoller.getState().assumedActive,
+};
+pwD2.livePoller.destroy();
+
+// 5) 409 immediately followed by idle status (active: false) clears pill and re-enables button
+const dE = fakeDoc(), tE = makeTimer();
+const pwE = app.bootPitWall(dE.doc, "?repo=org/first", {
+  live: {
+    fetch: async (url, init = {}) => init.method === "POST"
+      ? jr(409, { detail: "Cycle already active for org/first" })
+      : idleGet(url, "org/first"),
+    timer: tE, doc: dE.doc,
+  },
+});
+await flush();
+dE.ids["run-pit-stop"].click();
+await flush();
+const conflictImmediateIdle = {
+  pillHidden: pwE.livePoller.statusPill.hidden,
+  error: pwE.store.getState().fetchError,
+  btn: btnOf(dE),
+  delay: tE.scheduled.at(-1),
+};
+pwE.livePoller.destroy();
+
+// 6) repoInput change with valid slug + unchanged change (no refetch) + Enter on unchanged slug (refreshes)
+const dF = fakeDoc(), tF = makeTimer(), callsF = [];
+const pwF = app.bootPitWall(dF.doc, "?repo=org/first", {
+  live: {
+    fetch: async (url) => { callsF.push(url); return idleGet(url); },
+    timer: tF, doc: dF.doc,
+  },
+});
+await flush();
+const callsAfterInit = callsF.length;
+dF.ids["repo-input"].value = "org/from-change";
+dF.ids["repo-input"].dispatchEvent({ type: "change" });
+await flush();
+const afterValidChange = {
+  repo: pwF.store.getState().repo,
+  newUrls: callsF.slice(callsAfterInit),
+};
+const callsBeforeUnchangedChange = callsF.length;
+dF.ids["repo-input"].dispatchEvent({ type: "change" });
+await flush();
+const unchangedChangeNewCalls = callsF.length - callsBeforeUnchangedChange;
+let enterPrevented = false;
+const callsBeforeEnter = callsF.length;
+dF.ids["repo-input"].dispatchEvent({ type: "keydown", key: "Enter", preventDefault() { enterPrevented = true; } });
+await flush();
+const afterEnterUnchanged = {
+  enterPrevented,
+  newUrls: callsF.slice(callsBeforeEnter),
+};
+pwF.livePoller.destroy();
+
+console.log(JSON.stringify({
+  stalePostBeforeJson, stalePostReject, staleJsonDemo, staleJsonRepo,
+  afterClearInFlight, afterSwitchAssumed, conflictImmediateIdle,
+  afterValidChange, unchangedChangeNewCalls, afterEnterUnchanged,
+}));
+"""
+)
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -393,6 +640,61 @@ def test_live_poller_hydration_polling_resilience_and_trigger() -> None:
     ]
     assert "owner/name" in out["syncedFromInput"]["emptyRunErr"]
     assert "owner/name" in out["syncedFromInput"]["invalidSlugErr"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_live_poller_stale_post_preserve_notice_and_repo_input() -> None:
+    client = TestClient(create_app(_seed_ledger("aj604/pit-crew")))
+    seed = {k: client.get(f"/api/repos/aj604/pit-crew/{k}").json() for k in ("status", "attempts", "records")}
+    out = _node(_LIVE_EDGE_NODE_SCRIPT, APP_JS.as_uri(), json.dumps(seed))
+
+    assert out["stalePostBeforeJson"] == {
+        "staleJsonCalled": False,
+        "inFlight": True,
+        "btn": [True, "true", "Pit Stop Running"],
+        "error": None,
+        "pillHidden": True,
+    }
+    assert out["stalePostReject"] == {
+        "inFlight": True,
+        "btn": [True, "true", "Pit Stop Running"],
+        "error": None,
+        "pillHidden": True,
+    }
+    assert out["staleJsonDemo"] == {"mode": "demo", "error": None, "pillHidden": True}
+    assert out["staleJsonRepo"] == {
+        "inFlight": True,
+        "btn": [True, "true", "Pit Stop Running"],
+        "error": None,
+        "pillHidden": True,
+    }
+    assert out["afterClearInFlight"] == {
+        "beforeClearBtn": [True, "true", "Pit Stop Running"],
+        "btn": [False, "false", "Run Pit Stop"],
+        "inFlight": False,
+        "repo": "",
+        "activeTimers": 0,
+    }
+    assert out["afterSwitchAssumed"] == {
+        "beforeSwitchAssumed": {"btn": [True, "true", "Pit Stop Running"], "assumedActive": True},
+        "btn": [False, "false", "Run Pit Stop"],
+        "assumedActive": False,
+    }
+    assert out["conflictImmediateIdle"] == {
+        "pillHidden": True,
+        "error": None,
+        "btn": [False, "false", "Run Pit Stop"],
+        "delay": 15000,
+    }
+    assert out["afterValidChange"] == {
+        "repo": "org/from-change",
+        "newUrls": [f"/api/repos/org/from-change/{k}" for k in ("status", "attempts", "records")],
+    }
+    assert out["unchangedChangeNewCalls"] == 0
+    assert out["afterEnterUnchanged"] == {
+        "enterPrevented": True,
+        "newUrls": [f"/api/repos/org/from-change/{k}" for k in ("status", "attempts", "records")],
+    }
 
 
 _CDP_VERIFY_SCRIPT = """
@@ -461,14 +763,32 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _terminate_process_group(proc: subprocess.Popen[bytes], *, timeout: float = 5.0) -> None:
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=timeout)
+
+
 def _run_cdp_against(app_port: int) -> dict[str, Any]:
     assert CHROME is not None
     cdp_port = _free_port()
-    with tempfile.TemporaryDirectory() as user_data:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as user_data:
         proc = subprocess.Popen(  # noqa: S603
             [CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
              f"--remote-debugging-port={cdp_port}", f"--user-data-dir={user_data}", "about:blank"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )  # fmt: skip
         try:
             ws_url, deadline = "", time.monotonic() + 10
@@ -483,8 +803,28 @@ def _run_cdp_against(app_port: int) -> dict[str, Any]:
             assert ws_url, "Chrome CDP endpoint did not start"
             return _node(_CDP_VERIFY_SCRIPT, ws_url, f"http://127.0.0.1:{app_port}")
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
+            _terminate_process_group(proc)
+
+
+def test_terminate_process_group_falls_back_to_sigkill() -> None:
+    script = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(30)"
+    )
+    with subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as proc:
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == b"ready"
+            _terminate_process_group(proc, timeout=0.1)
+            assert proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 @pytest.mark.skipif(NODE is None or CHROME is None, reason="node or Chrome is not installed")
