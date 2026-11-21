@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from pit_crew import tools
-from pit_crew.contracts import Hypothesis
+from pit_crew.contracts import Candidate, Hypothesis, Verdict
+from pit_crew.lanes.analysis import tools as analysis_tools
 from pit_crew.lanes.analysis.dedupe_ledger import hypothesis_key, recorded_keys
 from pit_crew.ledger import SqliteLedger
 
@@ -26,7 +27,7 @@ _FULL: dict[str, object] = {
 
 
 def _record(ledger: SqliteLedger, **overrides: object) -> str:
-    return tools.call("record_hypothesis", ledger, {**_FULL, **overrides})  # type: ignore[no-any-return]
+    return analysis_tools.record_hypothesis(ledger, **{**_FULL, **overrides})  # type: ignore[no-any-return]
 
 
 def test_record_fills_every_field(tmp_path: Path) -> None:
@@ -97,3 +98,23 @@ def test_keys_cover_every_recorded_hypothesis(tmp_path: Path) -> None:
         hypothesis_key("dep-cache", ".github/workflows/ci.yml", "test", "Install dependencies")
     }
     assert recorded_keys(ledger, "other/repo") == set()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_numbers_are_rejected(tmp_path: Path, bad: float) -> None:
+    ledger = SqliteLedger(tmp_path / "l.db")
+    with pytest.raises(ValueError, match="finite"):
+        _record(ledger, expected_savings_seconds=bad)
+    with pytest.raises(ValueError, match="finite"):
+        _record(ledger, evidence={"max_saving_seconds": bad})
+    assert ledger.hypotheses_for_repo("o/r") == []
+
+
+def test_rejected_hypothesis_still_blocks_a_repeat(tmp_path: Path) -> None:
+    ledger = SqliteLedger(tmp_path / "l.db")
+    hypothesis_id = _record(ledger)
+    ledger.add(Candidate(hypothesis_id=hypothesis_id, branch="pc/cache", summary="cache deps", repo="o/r"))
+    candidate_id = ledger.all(Candidate)[0].id
+    ledger.add(Verdict(candidate_id=candidate_id, keep=False, speedup=1.0, p_value=None, reason="slower"))
+    with pytest.raises(ValueError, match="already recorded"):
+        _record(ledger)

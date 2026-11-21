@@ -4,6 +4,7 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 `critical_path.py` (profiling). This module only wraps it as agent tools.
 """
 
+import math
 import os
 import re
 from pathlib import Path
@@ -91,6 +92,16 @@ class InvalidRecordError(ValueError):
         return cls(f"expected_savings_seconds must be greater than 0, got {value!r}")
 
     @classmethod
+    def non_finite_savings(cls, value: float) -> "InvalidRecordError":
+        """Build error for a nan or infinite expected saving."""
+        return cls(f"expected_savings_seconds must be a finite number, got {value!r}")
+
+    @classmethod
+    def non_finite_max(cls, value: float) -> "InvalidRecordError":
+        """Build error for a nan or infinite evidence max_saving_seconds."""
+        return cls(f"evidence max_saving_seconds must be a finite number, got {value!r}")
+
+    @classmethod
     def savings_above_max(cls, value: float, maximum: float) -> "InvalidRecordError":
         """Build error for an expected saving larger than the job can give."""
         return cls(f"expected_savings_seconds {value!r} exceeds evidence max_saving_seconds {maximum!r}")
@@ -99,9 +110,13 @@ class InvalidRecordError(ValueError):
 def _check_record(workflow_path: str, expected_savings_seconds: float, evidence: dict[str, float | str]) -> None:
     if workflow_path and not _WORKFLOW_PATH.fullmatch(workflow_path):
         raise InvalidRecordError.bad_workflow_path(workflow_path)
+    if not math.isfinite(expected_savings_seconds):
+        raise InvalidRecordError.non_finite_savings(expected_savings_seconds)
     if expected_savings_seconds <= 0:
         raise InvalidRecordError.non_positive_savings(expected_savings_seconds)
     maximum = evidence.get("max_saving_seconds")
+    if isinstance(maximum, int | float) and not math.isfinite(maximum):
+        raise InvalidRecordError.non_finite_max(maximum)
     if isinstance(maximum, int | float) and expected_savings_seconds > maximum:
         raise InvalidRecordError.savings_above_max(expected_savings_seconds, maximum)
 
