@@ -10,22 +10,30 @@ _UPLOAD = "actions/upload-artifact"
 _DOWNLOAD = "actions/download-artifact"
 _CONFIDENCE = 0.6
 _TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
-_SPACE = " \t\r\f\v"
+_SPACE = " \t"  # the only blanks bash recognises; \r, \f and \v are word characters
 
 
 def _opaque(c: str, nxt: str, *, quoted: bool) -> bool:
-    """True where the script can run something this scan cannot see: substitutions, heredocs, process substitution."""
+    """True where the script can run something this scan cannot see: substitutions, heredocs, process substitution.
+
+    `$'` (ANSI-C quoting, where a backslash escapes a quote) is opaque too: it is treated as real work, not parsed.
+    """
     if c == "`" or (c == "$" and nxt == "("):
         return True
-    return not quoted and ((c in "<>" and nxt == "(") or (c == "<" and nxt == "<"))
+    if quoted:
+        return False
+    return (c in "<>" and nxt == "(") or (c == "<" and nxt == "<") or (c == "$" and nxt == "'")
 
 
-def _is_separator(run: str, i: int) -> bool:
-    """Whether an unquoted `;`, `|`, `&` or newline at i ends a command (an `&` in a redirect does not)."""
+def _is_separator(run: str, i: int, prev: str) -> bool:
+    r"""Whether an unquoted `;`, `|`, `&` or newline at i ends a command (an `&` in a redirect does not).
+
+    `prev` is the last token scanned: an escaped `\>` is a two-character token, so it never reads as a redirect.
+    """
     if run[i] != "&":
         return True
     nxt = run[i + 1 : i + 2]
-    return not (run[i - 1 : i] in {">", "<"} or nxt == ">")  # `>&2`, `2>&1`, `&>file`
+    return not (prev in {">", "<"} or nxt == ">")  # `>&2`, `2>&1`, `&>file`
 
 
 def _segments(run: str) -> list[str] | None:
@@ -56,7 +64,7 @@ def _segments(run: str) -> list[str] | None:
         elif c == "#" and (not current or current[-1] in _SPACE):
             end = run.find("\n", i)
             step = (len(run) if end == -1 else end) - i
-        elif c in "\n;|&" and _is_separator(run, i):
+        elif c in "\n;|&" and _is_separator(run, i, current[-1] if current else ""):
             segments.append("".join(current))
             current = []
             step = 2 if nxt == c and c in "|&" else 1  # `&&` and `||` are one separator

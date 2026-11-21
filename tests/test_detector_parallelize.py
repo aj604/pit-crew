@@ -354,6 +354,17 @@ def test_parallelize_logging_prefix_does_not_hide_real_work() -> None:
         ("cat <<EOF\nit's\nEOF\ncurl x", False),
         ("echo <(curl x)", False),
         ("echo Starting tests && npm test", False),
+        ("echo $VAR", True),
+        ("echo ok # ; npm test", True),
+        ('echo "a" ; npm test', False),
+        ("echo \\>& curl x", False),  # an escaped `>` is a literal: the `&` after it ends the command
+        ("echo \\<& curl x", False),
+        ("echo a\r# ; curl x", False),  # bash treats only space and tab as blanks, so this `#` is no comment
+        ("echo a\f# ; curl x", False),
+        ("echo a\v# ; curl x", False),
+        ("echo a\t# ; curl x", True),
+        ("echo $'\\'' ; curl x ; echo 'z'", False),  # ANSI-C quoting: a backslash escapes the quote
+        ("echo $'a' ; curl x", False),
     ],
 )
 def test_trivial_run_checks_every_segment(script: str, *, trivial: bool) -> None:
@@ -375,3 +386,19 @@ jobs:
 """
     p, wf = profiled(wf_yaml, {"a": (0, 50), "b": (0, 100), "gate": (100, 125)})
     assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "echo \\>& curl x",
+        "echo a\r# ; curl x",
+        "echo a\f# ; curl x",
+        "echo a\v# ; curl x",
+        "echo $'\\'' ; curl x ; echo 'z'",
+    ],
+)
+def test_parallelize_does_not_treat_tokenizer_edge_cases_as_wait_only(script: str) -> None:
+    steps = f"    steps:\n      - run: {json.dumps(script)}"
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert [f.job for f in detect_parallelize_dag(p, wf, PATH)] == ["test"]
