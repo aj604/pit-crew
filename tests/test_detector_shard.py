@@ -53,9 +53,7 @@ def raw_run(run_id: int, steps: Sequence[tuple[str, float]], job_name: str = "te
 
 def workflow_yaml(step_names: Sequence[str], matrix: str = "", runs: dict[str, str] | None = None) -> str:
     commands = runs or {}
-    steps = "\n".join(
-        f"      - name: {n}\n        run: {commands.get(n, f'echo {i}')}" for i, n in enumerate(step_names)
-    )
+    steps = "\n".join(f"      - name: {n}\n        run: {commands.get(n, n)}" for i, n in enumerate(step_names))
     strategy = f"    strategy:\n      matrix:\n        {matrix}\n" if matrix else ""
     return f"name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n{strategy}    steps:\n{steps}\n"
 
@@ -131,3 +129,41 @@ def test_shard_fastapi() -> None:
     max_saving = next(j.max_saving_seconds for j in prof.jobs if j.job_id == "test")
     assert 0 < finding.expected_savings_seconds <= max_saving
     assert finding.evidence["step_p50_seconds"] == 129.0
+
+
+def test_shard_matches_the_command_not_the_step_name() -> None:
+    prof, wf = build(
+        [("Upload test results", 240.0), ("Typecheck", 240.0)],
+        runs={"Upload test results": "aws upload results.xml", "Typecheck": "mypy tests/"},
+    )
+    # neither an upload nor mypy over the tests directory runs the tests
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == []
+
+
+def test_shard_ignores_artifact_uploads_named_after_tests() -> None:
+    wf = parse_workflow(
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: x\n    steps:\n"
+        "      - name: Upload test results\n        uses: actions/upload-artifact@v4\n"
+    )
+    prof = profile(wf, parse_runs([raw_run(i, [("Upload test results", 240.0)]) for i in range(1, 4)]))
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+def test_shard_uses_the_step_samples() -> None:
+    prof, wf = build([("Run npm test", 240.0)])
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert finding.evidence["runs_sampled"] == next(s.samples for s in prof.steps if s.name == "Run npm test")
+
+
+def test_shard_drops_findings_the_job_cap_pushes_under_ten_seconds() -> None:
+    wf = parse_workflow(
+        "name: CI\non: [push]\njobs:\n"
+        "  test:\n    runs-on: x\n    steps:\n      - name: Run tests\n        run: pytest\n"
+        "  other:\n    runs-on: x\n    steps:\n      - run: sleep 1\n"
+    )
+    raw = raw_run(1, [("Run tests", 240.0)])
+    slow = {**raw["jobs"][0], "name": "other", "id": 2, "completed_at": at(245), "steps": []}
+    raw["jobs"].append(slow)
+    prof = profile(wf, parse_runs([{**raw, "id": i} for i in (1, 2, 3)]))
+    assert next(j.max_saving_seconds for j in prof.jobs if j.job_id == "test") < 10
+    assert detect_shard_by_timing(prof, wf, PATH) == []

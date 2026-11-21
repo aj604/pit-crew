@@ -81,6 +81,7 @@ jobs:
     assert float(f.evidence["max_saving_seconds"]) > 10
     assert f.expected_savings_seconds == f.evidence["max_saving_seconds"]
     assert "keep one" in f.description.lower()
+    assert "drop 'test-b' and keep test-a" in f.description
     assert "never remove the check" in f.description.lower()
 
 
@@ -198,3 +199,26 @@ def test_dedupe_known_limitation_flags_different_dynamic_matrices_on_same_key() 
     other = DYNAMIC.replace("needs.x.outputs.v", "needs.y.outputs.w")
     p, wf = profiled(_pair(DYNAMIC, other), {"a": 100, "b": 200})
     assert len(detect_dedupe_jobs(p, wf, PATH)) == 1
+
+
+TWINS = """
+jobs:
+  test-a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q
+  test-b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q
+"""
+
+
+def test_dedupe_drops_savings_under_ten_seconds() -> None:
+    p, wf = profiled(TWINS, {"test-a": 3.0, "test-b": 5.0})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_drops_zero_savings() -> None:
+    p, wf = profiled(TWINS, {"test-a": 30.0, "test-b": 30.0})
+    assert detect_dedupe_jobs(p, wf, PATH) == []

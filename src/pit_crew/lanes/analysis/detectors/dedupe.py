@@ -3,7 +3,7 @@
 from collections import defaultdict
 
 from pit_crew.lanes.analysis.critical_path import CIProfile
-from pit_crew.lanes.analysis.detectors.base import Finding, job_profile
+from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
 StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
@@ -44,7 +44,8 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
                 description=(
                     f"Job '{target}' runs the same steps on the same runner as {others}. "
                     f"They were found identical in runner, matrix and every step's command and inputs. "
-                    f"Confirm they are equivalent, then keep one of these jobs and drop the redundant copy; "
+                    f"Confirm they are equivalent, then keep one copy: drop '{target}' and keep {others}, "
+                    f"since the saving assumes '{target}' is the one removed; "
                     f"never remove the check itself, since the job that stays still runs it."
                 ),
                 expected_savings_seconds=saving,
@@ -53,4 +54,4 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
                 risk="medium",
             )
         )
-    return findings
+    return keep_worthwhile(findings)

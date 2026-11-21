@@ -5,8 +5,8 @@ import re
 
 from pit_crew.lanes.analysis.buckets import is_setup_step
 from pit_crew.lanes.analysis.critical_path import CIProfile
-from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, step_profile
-from pit_crew.lanes.analysis.workflow import Workflow
+from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
+from pit_crew.lanes.analysis.workflow import StepSpec, Workflow
 
 SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
 TARGET_SHARD_SECONDS = 30.0  # the brief: tests under 30 seconds per shard
@@ -14,7 +14,23 @@ MAX_SHARDS = 8
 TEST_STEP = re.compile(
     r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test)\b", re.IGNORECASE
 )
+STATIC_CHECK = re.compile(
+    r"(?:(?:uv|poetry|pipenv|npx|pnpm|yarn|python3?|-m|run|exec|dlx|--?[\w-]+|\S+=\S+)\s+)*"
+    r"(?:mypy|ruff|pyright|tsc|eslint|flake8|black|isort|pylint|prettier|biome)\b"
+)  # linters and type checkers take `tests/` as a path to read, not a suite to run
+_SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
+NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
+
+
+def _runs_tests(step: StepSpec) -> bool:
+    """Whether the step runs a test suite: judged by its command, or by its name when it has none (a `uses:` step)."""
+    if step.run is not None:
+        segments = (seg.strip() for seg in _SEGMENTS.split(step.run))
+        return any(TEST_STEP.search(seg) and not STATIC_CHECK.match(seg) for seg in segments)
+    if (step.uses or "").startswith(NO_COMMAND_ACTIONS):
+        return False  # moving files around, however the step is named
+    return TEST_STEP.search(step.name) is not None
 
 
 def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
@@ -29,7 +45,7 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
         for step in spec.steps:
             if is_setup_step(step.name):
                 continue
-            if not (TEST_STEP.search(step.name) or (step.run and TEST_STEP.search(step.run))):
+            if not _runs_tests(step):
                 continue
             timing = step_profile(profile, job_id, step)
             if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:
@@ -55,10 +71,10 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
                         "step_p95_seconds": timing.p95_seconds,
                         "shards": float(shards),
                         "max_saving_seconds": measured.max_saving_seconds,
-                        "runs_sampled": float(profile.runs_analyzed),
+                        "runs_sampled": timing.samples,
                     },
                     confidence=0.6,
                     risk="low",
                 )
             )
-    return findings
+    return keep_worthwhile(findings)
