@@ -1,6 +1,8 @@
 import gzip
+import io
 import json
 import os
+import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -8,8 +10,10 @@ from typing import Any
 import pytest
 
 from pit_crew import cli, managed_agent
+from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Candidate, Hypothesis, ReplayPlan
 from pit_crew.lanes.analysis import history
+from pit_crew.lanes.analysis import tools as analysis_tools
 from pit_crew.ledger import SqliteLedger
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -102,7 +106,7 @@ def test_analysis_success_prints_summary_and_exits_zero(tmp_path: Path, capsys: 
     )
     assert "record_hypothesis" in str(request["input"])
     sources = request["environment"]["sources"]  # type: ignore[index]
-    assert managed_agent.repository_source("org/fork") in sources
+    assert {"type": "repository", "source": "https://github.com/org/fork", "target": "/workspace"} in sources
 
 
 def test_task_override_replaces_default_prompt(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -210,7 +214,8 @@ def test_failed_lane_exits_nonzero_even_with_a_record(tmp_path: Path, capsys: py
     code, summary = _run(_argv("analysis", tmp_path / "l.db"), client, capsys)
 
     assert code == 1
-    assert summary["status"] == "failed"
+    assert summary["status"] == "error"
+    assert summary["error"] == "InteractionFailedError: lane 'analysis' interaction 'int-2' ended with status 'failed'"
     assert summary["records_written"] == 1
 
 
@@ -299,7 +304,8 @@ def test_workspace_flag_lets_analysis_profile_ci_read_a_local_checkout(
     assert profile_result["name"] == "profile_ci"
     assert "is_error" not in profile_result
     assert profile_result["result"]["critical_path"]["jobs"][0] == "changes"
-    assert os.environ["PIT_CREW_WORKSPACE"] == str(tmp_path / "elsewhere")  # restored after the run
+    assert os.environ["PIT_CREW_WORKSPACE"] == str(tmp_path / "elsewhere")  # never overwritten
+    assert host_workspace.configured_workspace() == tmp_path / "elsewhere"  # the flag's binding was reset
 
 
 @pytest.mark.usefixtures("fastapi_history")
@@ -313,22 +319,150 @@ def test_analysis_honors_pit_crew_workspace_env(
     assert (code, summary["status"], summary["records_written"]) == (0, "completed", 1)
 
 
-def test_workspace_flag_unsets_env_again_when_it_was_unset(
+def test_workspace_flag_binds_the_context_without_touching_the_environment(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
-    seen: list[str | None] = []
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "from-env"))
+    environ_before = dict(os.environ)
+    seen: list[tuple[Path, dict[str, str]]] = []
 
     def fake_run_lane(*_args: object, **_kwargs: object) -> _FakeInteraction:
-        seen.append(os.environ.get("PIT_CREW_WORKSPACE"))
+        seen.append((analysis_tools.workspace(), dict(os.environ)))
         return _FakeInteraction(id="int-1", status="completed")
 
     monkeypatch.setattr(managed_agent, "run_lane", fake_run_lane)
 
     _run(_argv("analysis", tmp_path / "l.db", "--workspace", str(tmp_path)), _FakeClient(), capsys)
 
-    assert seen == [str(tmp_path)]
+    assert seen == [(tmp_path, environ_before)]
+    assert dict(os.environ) == environ_before
+    assert host_workspace.configured_workspace() == tmp_path / "from-env"
+
+
+def _tarball(files: dict[str, str]) -> bytes:
+    """A gzipped tarball shaped like GitHub's: every member under one ``owner-repo-sha/`` folder."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        top = tarfile.TarInfo("org-fork-abc123")
+        top.type = tarfile.DIRTYPE
+        tar.addfile(top)
+        for name, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(f"org-fork-abc123/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+class _FakeDownload:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.urls: list[str] = []
+        self.tokens: list[str | None] = []
+
+    def factory(self, token: str | None) -> host_workspace.Download:
+        self.tokens.append(token)
+
+        def download(url: str, dest: Path) -> None:
+            self.urls.append(url)
+            dest.write_bytes(self.body)
+
+        return download
+
+
+@pytest.mark.usefixtures("fastapi_history")
+def test_analysis_downloads_the_repo_tarball_when_no_workspace_is_configured(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    workflow = (FIXTURES / "fastapi" / "test.yml").read_text()
+    fake = _FakeDownload(_tarball({".github/workflows/test.yml": workflow}))
+    monkeypatch.setattr(host_workspace, "http_download", fake.factory)
+    seen: list[Path] = []
+    real_run_lane = managed_agent.run_lane
+
+    def spying_run_lane(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401  pass-through spy
+        seen.append(analysis_tools.workspace())
+        return real_run_lane(*args, **kwargs)
+
+    monkeypatch.setattr(managed_agent, "run_lane", spying_run_lane)
+    client = _profile_then_record_client()
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db"), client, capsys)
+
+    assert (code, summary["status"], summary["records_written"]) == (0, "completed", 1)
+    assert fake.urls == ["https://api.github.com/repos/org/fork/tarball"]
+    assert fake.tokens == ["tok"]
+    profile_result = client.interactions.calls[1]["input"][0]  # type: ignore[index]
+    assert "is_error" not in profile_result
+    assert profile_result["result"]["critical_path"]["jobs"][0] == "changes"
+    assert len(seen) == 1
+    assert seen[0].name == "repo"
+    assert seen[0].parent.name.startswith("pit-crew-workspace-")
+    assert not seen[0].exists()  # deleted after the run
     assert "PIT_CREW_WORKSPACE" not in os.environ
+    assert host_workspace.configured_workspace() is None
+
+
+def test_tarball_workspace_is_deleted_when_the_lane_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
+    fake = _FakeDownload(_tarball({"README.md": "hi"}))
+    monkeypatch.setattr(host_workspace, "http_download", fake.factory)
+    seen: list[Path] = []
+
+    def failing_run_lane(*_args: object, **_kwargs: object) -> _FakeInteraction:
+        seen.append(analysis_tools.workspace())
+        assert (seen[0] / "README.md").read_text() == "hi"
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(managed_agent, "run_lane", failing_run_lane)
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db"), _FakeClient(), capsys)
+
+    assert code == 1
+    assert summary["error"] == "RuntimeError: boom"
+    assert len(seen) == 1
+    assert not seen[0].parent.exists()
+
+
+def test_tarball_download_failure_is_reported_before_calling_the_api(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
+
+    def failing_factory(_token: str | None) -> host_workspace.Download:
+        def download(_url: str, _dest: Path) -> None:
+            msg = "offline"
+            raise OSError(msg)
+
+        return download
+
+    monkeypatch.setattr(host_workspace, "http_download", failing_factory)
+    client = _FakeClient()
+
+    code, summary = _run(_argv("analysis", tmp_path / "l.db"), client, capsys)
+
+    assert code == 1
+    assert summary["error"] == "OSError: offline"
+    assert client.interactions.calls == []
+
+
+@pytest.mark.parametrize("lane", ["optimizer", "proof"])
+def test_lanes_that_do_not_read_the_checkout_never_download_it(
+    lane: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIT_CREW_WORKSPACE", raising=False)
+    monkeypatch.setattr(host_workspace, "http_download", lambda _token: pytest.fail("must not download"))
+    monkeypatch.setattr(managed_agent, "run_lane", lambda *_a, **_k: _FakeInteraction(id="int-1", status="completed"))
+
+    code, summary = _run(_argv(lane, tmp_path / "l.db", "--task", "t"), _FakeClient(), capsys)
+
+    assert summary["status"] == "completed"
+    assert code == 1  # the fake lane wrote no record
 
 
 @pytest.mark.parametrize("use_flag", [True, False])

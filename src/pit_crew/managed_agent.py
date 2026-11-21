@@ -26,6 +26,9 @@ MODELS = {
 }
 POLL_INTERVAL_SECONDS = 1.0
 MAX_TOOL_TURNS = 25
+PENDING_STATUSES = frozenset({"in_progress", "queued", "starting"})
+FAILED_STATUSES = frozenset({"failed", "cancelled", "expired"})
+GITHUB_URL = "https://github.com/"
 
 _ROOT = Path(__file__).resolve().parents[2]
 _LANES = Path(__file__).parent / "lanes"
@@ -113,6 +116,17 @@ class MaxTurnsExceededError(RuntimeError):
         super().__init__(f"lane {lane!r} exceeded {max_turns} tool-call turns")
 
 
+class InteractionFailedError(RuntimeError):
+    """Raised when a lane interaction ends in a terminal failure status (failed, cancelled, expired)."""
+
+    def __init__(self, lane: str, interaction_id: str, status: str) -> None:
+        """Format error for ``lane`` whose interaction ``interaction_id`` ended with ``status``."""
+        super().__init__(f"lane {lane!r} interaction {interaction_id!r} ended with status {status!r}")
+        self.lane = lane
+        self.interaction_id = interaction_id
+        self.status = status
+
+
 def build_request(
     lane: str,
     task: str,
@@ -172,14 +186,29 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
     allowed_tool_names = {t["name"] for t in request["tools"]}
 
     interaction = active_client.interactions.create(**request)
+    # Follow-up turns resume the same sandbox, so remember the first environment ID the API assigns.
+    environment_id: str | None = None
     for _ in range(MAX_TOOL_TURNS):
-        while interaction.status in ("in_progress", "queued", "starting"):
+        environment_id = environment_id or _environment_id(interaction)
+        while interaction.status in PENDING_STATUSES:
             time.sleep(POLL_INTERVAL_SECONDS)
             interaction = active_client.interactions.get(interaction.id)
+            environment_id = environment_id or _environment_id(interaction)
+
+        if interaction.status is not None and interaction.status in FAILED_STATUSES:
+            raise InteractionFailedError(lane, interaction.id, interaction.status)
+
+        follow_up = {
+            "agent": BASE_AGENT,
+            "previous_interaction_id": interaction.id,
+            "agent_config": request["agent_config"],
+            "environment": _environment_id(interaction) or environment_id or request["environment"],
+            "tools": request["tools"],
+        }
 
         if interaction.status == "requires_continuation" and interaction.continuation_token:
             interaction = active_client.interactions.create(
-                **_follow_up_request(request, interaction, continuation_token=interaction.continuation_token),
+                **follow_up, continuation_token=interaction.continuation_token
             )
             continue
 
@@ -191,40 +220,9 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
             return interaction
 
         results = [_execute_tool_step(lane, allowed_tool_names, active_ledger, step) for step in call_steps]
-        interaction = active_client.interactions.create(
-            **_follow_up_request(request, interaction, input=results),
-        )
+        interaction = active_client.interactions.create(**follow_up, input=results)
 
     raise MaxTurnsExceededError(lane, MAX_TOOL_TURNS)
-
-
-def _follow_up_request(
-    request: Mapping[str, Any],
-    interaction: InteractionLike,
-    **extra: object,
-) -> dict[str, Any]:
-    environment = (
-        {"type": "remote", "environment_id": interaction.environment_id}
-        if interaction.environment_id
-        else request["environment"]
-    )
-    return {
-        "agent": request["agent"],
-        "agent_config": request["agent_config"],
-        "environment": environment,
-        "tools": request["tools"],
-        "previous_interaction_id": interaction.id,
-        **extra,
-    }
-
-
-def _serialize_tool_result(output: object) -> str | dict[str, Any]:
-    """Coerce a tool return value into a payload accepted by ``FunctionResultStep``."""
-    if isinstance(output, (str, dict)):
-        return output
-    if isinstance(output, (list, tuple, int, float, bool)) or output is None:
-        return json.dumps(output, default=str)
-    return str(output)
 
 
 def _execute_tool_step(
@@ -255,8 +253,21 @@ def _execute_tool_step(
         "type": "function_result",
         "call_id": step.id,
         "name": step.name,
-        "result": _serialize_tool_result(output),
+        "result": _serialize_result(output),
     }
+
+
+def _serialize_result(output: object) -> str | dict[str, Any]:
+    """Pass ``str`` and ``dict`` through; JSON-encode everything else (the SDK rejects bare lists and scalars)."""
+    if isinstance(output, (str, dict)):
+        return output
+    return json.dumps(output, default=str)
+
+
+def _environment_id(interaction: InteractionLike) -> str | None:
+    """The remote environment ID the API assigned, absent on fakes and on interactions without one."""
+    environment_id = getattr(interaction, "environment_id", None)
+    return environment_id if isinstance(environment_id, str) and environment_id else None
 
 
 def inline_text_source(target: str, content: str) -> dict[str, str]:
@@ -275,8 +286,19 @@ def inline_bytes_source(target: str, data: bytes) -> dict[str, str]:
 
 
 def repository_source(repo: str, target: str = "/workspace") -> dict[str, str]:
-    """Mount a GitHub repository into the remote sandbox."""
-    return {"type": "repository", "source": repo, "target": target}
+    """Mount a GitHub repository into the remote sandbox.
+
+    ``repo`` is a full URL or a bare ``owner/name``, which becomes ``https://github.com/owner/name``.
+    """
+    return {"type": "repository", "source": normalize_repository_url(repo), "target": target}
+
+
+def normalize_repository_url(repo: str) -> str:
+    """Expand a bare ``owner/name`` to its GitHub HTTPS URL; leave URLs (anything with a scheme) unchanged."""
+    stripped = repo.strip()
+    if "://" in stripped:
+        return stripped
+    return GITHUB_URL + stripped.strip("/")
 
 
 class GenerateContentResponseLike(Protocol):

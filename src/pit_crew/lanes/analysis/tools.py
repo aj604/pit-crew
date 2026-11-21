@@ -5,12 +5,12 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 """
 
 import math
-import os
 import re
 import urllib.error
 from pathlib import Path
 from typing import Any
 
+from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Hypothesis
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.critical_path import profile
@@ -45,8 +45,8 @@ class WorkflowNotFoundError(FileNotFoundError):
 
 
 def workspace() -> Path:
-    """Where the fork is checked out: /workspace in the managed-agent sandbox."""
-    return Path(os.environ.get("PIT_CREW_WORKSPACE", "/workspace"))
+    """Where the fork is checked out: the context's workspace, else PIT_CREW_WORKSPACE, else /workspace."""
+    return host_workspace.active_workspace()
 
 
 def workflow_path(workflow: str) -> Path:
