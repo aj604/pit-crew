@@ -6,13 +6,15 @@ from pit_crew.lanes.analysis.critical_path import CIProfile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
-Signature = tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]]
+StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
+Signature = tuple[str, tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...]]
 
 
 def _signature(job: JobSpec) -> Signature:
-    """What a job does and where: step names and `with:` inputs are ignored."""
-    steps = tuple((s.uses or "", " ".join((s.run or "").split())) for s in job.steps)
-    return (job.runs_on, job.matrix_keys, steps)
+    """What a job does and where: runner, matrix values, and each step's command and inputs. Step names are ignored."""
+    steps = tuple((s.uses or "", " ".join((s.run or "").split()), tuple(sorted(s.with_.items()))) for s in job.steps)
+    matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
+    return (job.runs_on, matrix, steps)
 
 
 def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
@@ -41,8 +43,9 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
                 bucket="running",
                 description=(
                     f"Job '{target}' runs the same steps on the same runner as {others}. "
-                    f"Keep one of these jobs and drop the redundant copy; never remove the check itself, "
-                    f"since the job that stays still runs it."
+                    f"They were found identical in runner, matrix and every step's command and inputs. "
+                    f"Confirm they are equivalent, then keep one of these jobs and drop the redundant copy; "
+                    f"never remove the check itself, since the job that stays still runs it."
                 ),
                 expected_savings_seconds=saving,
                 evidence={"duplicate_of": others, "max_saving_seconds": saving},

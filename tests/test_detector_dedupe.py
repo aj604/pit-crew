@@ -20,7 +20,7 @@ def at(seconds: float) -> str:
 
 def job(name: str, seconds: float) -> dict[str, Any]:
     return {
-        "id": hash(name),
+        "id": sum(ord(c) for c in name),
         "name": name,
         "run_attempt": 1,
         "conclusion": "success",
@@ -138,3 +138,49 @@ def test_dedupe_fastapi_has_no_duplicates() -> None:
     with gzip.open(FIXTURES / "fastapi" / "runs.json.gz") as fh:
         p = profile(wf, parse_runs(json.load(fh)))
     assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def _pair(extra_a: str = "", extra_b: str = "", step_a: str = "- run: make", step_b: str = "- run: make") -> str:
+    return f"""
+jobs:
+  a:
+    runs-on: ubuntu-latest
+{extra_a}    steps:
+      {step_a}
+  b:
+    runs-on: ubuntu-latest
+{extra_b}    steps:
+      {step_b}
+"""
+
+
+def test_dedupe_ignores_jobs_that_differ_only_in_with() -> None:
+    def step(version: str) -> str:
+        return f"- uses: actions/setup-python@v5\n        with:\n          python-version: '{version}'"
+
+    p, wf = profiled(_pair(step_a=step("3.11"), step_b=step("3.12")), {"a": 100, "b": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_jobs_with_different_matrix_values() -> None:
+    a = "    strategy:\n      matrix:\n        py: ['3.11']\n"
+    b = "    strategy:\n      matrix:\n        py: ['3.12']\n"
+    p, wf = profiled(_pair(a, b), {"a (3.11)": 100, "b (3.12)": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_matches_when_only_step_names_differ() -> None:
+    p, wf = profiled(
+        _pair(step_a="- name: One\n        run: make", step_b="- name: Two\n        run: make"),
+        {"a": 100, "b": 200},
+    )
+    assert len(detect_dedupe_jobs(p, wf, PATH)) == 1
+
+
+def test_dedupe_group_of_three() -> None:
+    text = "jobs:\n" + "".join(f"  {n}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n" for n in "abc")
+    p, wf = profiled(text, {"a": 100, "b": 300, "c": 200})
+    findings = detect_dedupe_jobs(p, wf, PATH)
+    assert len(findings) == 1
+    assert findings[0].job == "b"
+    assert findings[0].evidence["duplicate_of"] == "a, c"
