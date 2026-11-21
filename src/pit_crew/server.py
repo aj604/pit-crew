@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
+from pit_crew.demo import DemoEngine, create_demo_router
 from pit_crew.ledger import Ledger, SqliteLedger
 from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
@@ -156,6 +157,7 @@ def create_app(
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
     tracker = run_tracker if run_tracker is not None else RunTracker()
+    engine = DemoEngine()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
@@ -163,8 +165,10 @@ def create_app(
     app.state.api_token = api_token
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
+    app.state.demo_engine = engine
 
     api_auth_dependencies = [Depends(_make_api_token_dependency(api_token))] if api_token is not None else []
+    app.include_router(create_demo_router(engine, dependencies=api_auth_dependencies))
 
     @app.get("/health")
     def health() -> dict[str, str]:
