@@ -28,13 +28,16 @@ INSTALL_MARKERS = ("npm ci", "pnpm install", "yarn install", "cargo fetch", "Ins
 
 class Ecosystem(NamedTuple):
     slug: str
-    tolerance_seconds: float  # allowed gap between critical path and measured wall clock
+    known_drift: frozenset[str]  # job names the newest workflow no longer produces, see test_jobs_all_match
+    min_clean_runs: int  # successful runs with every job matched, the ones profile() keeps
 
 
-# Tokio's wasm32-wasip1 job is a 15-way matrix; the critical path adds the slowest instance's run
-# time to the longest queue wait of any instance, which overshoots wall clock by 13 s in one run.
-ECOSYSTEMS = [Ecosystem("vite", 10), Ecosystem("tokio", 15)]
+ECOSYSTEMS = [
+    Ecosystem("vite", frozenset(), 10),
+    Ecosystem("tokio", frozenset({"test tokio for wasm32-wasip2"}), 4),
+]
 IDS = [e.slug for e in ECOSYSTEMS]
+TOLERANCE_SECONDS = 10
 
 
 def load(slug: str) -> tuple[Workflow, list[WorkflowRun]]:
@@ -51,24 +54,41 @@ def successful(runs: list[WorkflowRun]) -> list[WorkflowRun]:
 
 @pytest.mark.parametrize("eco", ECOSYSTEMS, ids=IDS)
 def test_jobs_all_match(eco: Ecosystem) -> None:
+    """Every job name matches a job id, except known drift.
+
+    The workflow file is the newest one, but older captured runs ran older versions: tokio renamed
+    "test tokio for wasm32-wasip2" afterwards, so older runs report a name the file no longer has.
+    Each allowed name must really occur unmatched, so the allowance cannot go stale silently.
+    """
     wf, runs = load(eco.slug)
+    unmatched_seen: set[str] = set()
     for r in successful(runs):
         timings, unmatched = job_timings(r, wf)
-        assert unmatched == [], f"run {r.id}"
         assert timings
+        unmatched_seen.update(unmatched)
+    assert unmatched_seen <= eco.known_drift
+    assert eco.known_drift <= unmatched_seen
+
+
+def clean_runs(wf: Workflow, runs: list[WorkflowRun]) -> list[WorkflowRun]:
+    """Successful runs where every job matched."""
+    return [r for r in successful(runs) if not job_timings(r, wf)[1]]
 
 
 @pytest.mark.parametrize("eco", ECOSYSTEMS, ids=IDS)
 def test_critical_path_matches_wall_clock(eco: Ecosystem) -> None:
     wf, runs = load(eco.slug)
-    for r in successful(runs):
+    clean = clean_runs(wf, runs)
+    assert len(clean) >= eco.min_clean_runs
+    for r in clean:
         timings, _ = job_timings(r, wf)
         path = critical_path(wf, {j: t.seconds for j, t in timings.items()})
-        assert abs(path.seconds - r.wall_clock_seconds) < eco.tolerance_seconds, f"run {r.id}"
+        assert abs(path.seconds - r.wall_clock_seconds) < TOLERANCE_SECONDS, f"run {r.id}"
 
 
 @pytest.mark.parametrize("eco", ECOSYSTEMS, ids=IDS)
 def test_install_steps_are_setup(eco: Ecosystem) -> None:
+    """Reads steps from all runs, failed ones included."""
     _, runs = load(eco.slug)
     seen = {
         s.name for r in runs for j in r.jobs for s in j.steps if any(marker in s.name for marker in INSTALL_MARKERS)
@@ -91,3 +111,11 @@ def test_tokio_critical_path_goes_through_basics() -> None:
     for r in successful(runs):
         timings, _ = job_timings(r, wf)
         assert critical_path(wf, {j: t.seconds for j, t in timings.items()}).jobs[:2] == ("clippy", "basics")
+
+
+def test_matrix_job_instances_are_not_swallowed() -> None:
+    """Tokio's wasm32-wasip1 job is named `${{ matrix.target }}`; it once matched 13 unrelated jobs."""
+    wf, runs = load("tokio")
+    for r in successful(runs):
+        mapped = [j for j in r.latest_jobs if wf.job_id_for(j.name) == "wasm32-wasip1"]
+        assert len(mapped) <= 2, f"run {r.id}: {[j.name for j in mapped]}"
