@@ -15,8 +15,9 @@ import yaml
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _MAX_EXPANSIONS = 1000
-_NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)", re.IGNORECASE)  # GitHub expressions are case-insensitive
-_READS_EVERY_NEED = re.compile(r"needs\.\*|needs\[|toJSON\s*\(\s*needs\s*\)", re.IGNORECASE)
+# GitHub expressions are case-insensitive and allow spaces around the dot. Group 1 is the named job, if any;
+# every other use of the word (`needs[...]`, `needs.*`, `format('{0}', needs)`, bare `needs`) is the whole context.
+_NEEDS_USE = re.compile(r"\bneeds\b(?:\s*\.\s*([A-Za-z0-9_-]+))?", re.IGNORECASE)
 _STATUS_FUNCTION = re.compile(r"\b(success|failure|always|cancelled)\s*\(", re.IGNORECASE)
 
 
@@ -338,10 +339,13 @@ def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
         return frozenset(needs)  # the job decides on its needs' results, so every edge carries a signal
     if not _expanded_size_within(body, _MAX_BODY_BYTES):
         return frozenset(needs)  # too large to scan: assume it reads every need, so no edge is ever cut
-    text = yaml.safe_dump(body, width=2**31)  # no line wrapping, so a pattern is never split across lines
-    if _READS_EVERY_NEED.search(text):
-        return frozenset(needs)
-    named = {ref.lower() for ref in _NEEDS_REF.findall(text)}
+    own = {k: v for k, v in body.items() if k != "needs"}  # the `needs:` key itself is not a read
+    text = yaml.safe_dump(own, width=2**31)  # no line wrapping, so a pattern is never split across lines
+    named: set[str] = set()
+    for match in _NEEDS_USE.finditer(text):
+        if match.group(1) is None:
+            return frozenset(needs)  # the whole context is read: assume every need, so no edge is ever cut
+        named.add(match.group(1).lower())
     return frozenset(n for n in needs if n.lower() in named)
 
 
