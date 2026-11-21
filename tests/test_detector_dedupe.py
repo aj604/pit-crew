@@ -195,9 +195,26 @@ def test_dedupe_ignores_dynamic_matrix_vs_no_matrix() -> None:
     assert detect_dedupe_jobs(p, wf, PATH) == []
 
 
-def test_dedupe_known_limitation_flags_different_dynamic_matrices_on_same_key() -> None:
+def test_dedupe_ignores_different_dynamic_matrices_on_same_key() -> None:
     other = DYNAMIC.replace("needs.x.outputs.v", "needs.y.outputs.w")
     p, wf = profiled(_pair(DYNAMIC, other), {"a": 100, "b": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_matrices_that_differ_only_in_exclude() -> None:
+    def matrix(excluded: str) -> str:
+        return (
+            "    strategy:\n      matrix:\n        py: ['3.11', '3.12']\n"
+            f"        exclude:\n          - py: '{excluded}'\n"
+        )
+
+    p, wf = profiled(_pair(matrix("3.12"), matrix("3.11")), {"a (3.11)": 100, "b (3.12)": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_flags_identical_matrices_with_exclude() -> None:
+    matrix = "    strategy:\n      matrix:\n        py: ['3.11', '3.12']\n        exclude:\n          - py: '3.12'\n"
+    p, wf = profiled(_pair(matrix, matrix), {"a (3.11)": 100, "b (3.11)": 200})
     assert len(detect_dedupe_jobs(p, wf, PATH)) == 1
 
 

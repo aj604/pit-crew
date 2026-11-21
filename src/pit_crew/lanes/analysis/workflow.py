@@ -5,6 +5,7 @@ to job ids ("test"). Analysis needs both sides joined to build the dependency gr
 """
 
 import itertools
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -79,6 +80,7 @@ class JobSpec:
     matrix_keys: tuple[str, ...] = ()  # keys under strategy.matrix, minus include/exclude
     needs_refs: frozenset[str] = frozenset()  # jobs whose outputs this job reads via `needs.<id>`
     matrix_values: tuple[tuple[str, tuple[str, ...]], ...] = ()  # literal values per matrix key, include entries added
+    matrix_definition: str = ""  # canonical JSON of the whole strategy.matrix (include/exclude too), or its expression
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,7 @@ def parse_workflow(text: str) -> Workflow:
             matrix_keys=_matrix_keys(body),
             needs_refs=_needs_refs(body, needs),
             matrix_values=_matrix_values(body),
+            matrix_definition=_matrix_definition(body),
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
@@ -199,6 +202,17 @@ def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], .
             if _is_literal(value) and (str(key) in values or key not in matrix):
                 values.setdefault(str(key), []).append(str(value))
     return tuple((k, tuple(dict.fromkeys(v))) for k, v in values.items())
+
+
+def _matrix_definition(body: dict[str, Any]) -> str:
+    """The full `strategy.matrix` as canonical JSON, so exclusions and inclusions tell matrices apart."""
+    strategy = body.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if isinstance(matrix, str):
+        return matrix  # an expression such as fromJSON(...): compared as written
+    if isinstance(matrix, dict):
+        return json.dumps(matrix, sort_keys=True, default=str)
+    return ""
 
 
 def _is_literal(value: object) -> bool:

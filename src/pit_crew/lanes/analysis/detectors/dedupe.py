@@ -7,14 +7,14 @@ from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_wo
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
 StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
-Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...]]
+Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...], str]
 
 
 def _signature(job: JobSpec) -> Signature:
     """What a job does and where: runner, matrix values, and each step's command and inputs. Step names are ignored."""
     steps = tuple((s.uses or "", " ".join((s.run or "").split()), tuple(sorted(s.with_.items()))) for s in job.steps)
     matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
-    return (job.runs_on, job.matrix_keys, matrix, steps)
+    return (job.runs_on, job.matrix_keys, matrix, steps, job.matrix_definition)
 
 
 def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
