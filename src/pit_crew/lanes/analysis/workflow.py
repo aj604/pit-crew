@@ -267,6 +267,7 @@ _ENTRY_COST = 2  # rough serialized overhead per container entry and per key
 
 
 _SCALAR_TYPES = (str, int, float, bool, type(None), date, datetime, bytes)
+_CONTAINERS = (list, tuple, set, frozenset)  # built once: a union made inside the walk's loop slowed it under coverage
 
 
 def _expanded_size_within(obj: object, limit: int) -> bool:
@@ -287,7 +288,7 @@ def _expanded_size_within(obj: object, limit: int) -> bool:
             total += _ENTRY_COST * len(node)
             stack.extend(node.keys())
             stack.extend(node.values())
-        elif isinstance(node, list | tuple | set | frozenset):  # !!pairs, !!omap and !!set load as these
+        elif isinstance(node, _CONTAINERS):  # !!pairs, !!omap and !!set load as these
             total += _ENTRY_COST * len(node)
             stack.extend(node)
         elif isinstance(node, _SCALAR_TYPES):
