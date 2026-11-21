@@ -1,4 +1,4 @@
-"""The only module that talks to Gemini Managed Agents.
+"""The only module that talks to Gemini: Managed Agents, and one-shot multimodal calls.
 
 Everything else in the repo runs and tests without an API key.
 """
@@ -6,12 +6,13 @@ Everything else in the repo runs and tests without an API key.
 import base64
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from google import genai
+from google.genai import types
 
 from pit_crew import tools
 from pit_crew.ledger import InMemoryLedger, Ledger
@@ -159,14 +160,7 @@ def run_lane(  # noqa: PLR0913  keyword-only request and client options mirror b
 ) -> InteractionLike:
     """Run one lane interaction to completion, servicing `requires_action` tool calls via `tools.call`."""
     active_ledger = ledger if ledger is not None else InMemoryLedger()
-    active_client = (
-        client
-        if client is not None
-        else cast(
-            "InteractionsClientLike",
-            genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"}),
-        )
-    )
+    active_client = client if client is not None else cast("InteractionsClientLike", _gemini_client())
 
     request = build_request(lane, task, repo=repo, extra_sources=extra_sources)
     allowed_tool_names = {t["name"] for t in request["tools"]}
@@ -252,6 +246,79 @@ def inline_bytes_source(target: str, data: bytes) -> dict[str, str]:
 def repository_source(repo: str, target: str = "/workspace") -> dict[str, str]:
     """Mount a GitHub repository into the remote sandbox."""
     return {"type": "repository", "source": repo, "target": target}
+
+
+class GenerateContentResponseLike(Protocol):
+    """Minimal response surface read from ``client.models.generate_content``."""
+
+    @property
+    def text(self) -> str | None:
+        """The model's text answer."""
+        ...
+
+
+class ModelsResourceLike(Protocol):
+    """Subset of ``genai.Client.models`` used by ``ask_multimodal``."""
+
+    def generate_content(self, **kwargs: object) -> GenerateContentResponseLike:
+        """Generate one answer."""
+        ...
+
+
+class ModelsClientLike(Protocol):
+    """Client wrapper exposing a ``models`` resource."""
+
+    @property
+    def models(self) -> ModelsResourceLike:
+        """Models API endpoint group."""
+        ...
+
+
+class UnsupportedPartError(TypeError):
+    """Raised when a multimodal part is neither ("text", str) nor (mime type, bytes)."""
+
+    def __init__(self, kind: str) -> None:
+        """Name the part kind that was given."""
+        super().__init__(f"part {kind!r} must be ('text', str) or (mime type, bytes)")
+
+
+def ask_multimodal(
+    model: str,
+    parts: Sequence[tuple[str, str | bytes]],
+    schema: Mapping[str, object],
+    *,
+    client: ModelsClientLike | None = None,
+) -> str:
+    """Send text and media to ``model`` and return its JSON answer, constrained to ``schema``.
+
+    Each part is ``("text", str)`` or ``(mime_type, bytes)``, e.g. ``("video/mp4", recording)``.
+    The proof lane uses this to have Gemini 4 Carbon watch replay recordings, since lanes may not
+    import google-genai themselves. Needs GEMINI_API_KEY unless ``client`` is given.
+    """
+    active_client = client if client is not None else cast("ModelsClientLike", _gemini_client())
+    response = active_client.models.generate_content(
+        model=model,
+        contents=[_part(kind, value) for kind, value in parts],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=dict(schema),
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,  # terminal text must be legible
+        ),
+    )
+    return response.text or ""
+
+
+def _gemini_client() -> genai.Client:
+    # The SDK defaults to v1, but the Interactions API is v1beta; both calls use it so they see the same API.
+    return genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"})
+
+
+def _part(kind: str, value: str | bytes) -> types.Part:
+    if kind == "text" and isinstance(value, str):
+        return types.Part(text=value)
+    if kind != "text" and isinstance(value, bytes):
+        return types.Part.from_bytes(data=value, mime_type=kind)
+    raise UnsupportedPartError(kind)
 
 
 def _inline(target: str, path: Path) -> dict[str, str]:
