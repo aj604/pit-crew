@@ -139,6 +139,10 @@ def test_prepare_context_computes_touched_red_replays_and_uncovered() -> None:
     assert github.file_requests == [(repo, base_sha, wf_path)]
     assert github.job_run_requests == [repo]
 
+    prompt = bridge.build_prompt(ctx)
+    assert "## Required replays\n- 1111aaaa\n" in prompt
+    assert "## Uncovered checks\n- CI/Lint | CI/lint\n" in prompt
+
 
 def test_prepare_context_non_workflow_change_touches_all_checks() -> None:
     repo = "acme/demo"
@@ -251,7 +255,8 @@ def test_run_injects_context_into_proof_lane_prompt() -> None:
     prompt = str(captured["task"])
     assert "cand-42" in prompt
     assert "CI/Unit Tests | CI/test" in prompt
-    assert "- 1111aaaa" in prompt
+    assert "## Required replays\n- 1111aaaa\n" in prompt
+    assert "## Uncovered checks\n- (none)\n" in prompt
     assert "1111aaaa [fixed]" in prompt
     assert "3333cccc (CI/Lint)" in prompt
     assert "Focus on xdist isolation." in prompt
