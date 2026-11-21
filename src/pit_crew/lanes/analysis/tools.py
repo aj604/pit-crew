@@ -165,7 +165,7 @@ class _Profiled:
     matched: int  # runs whose workflow file is byte-identical to the checkout's
 
 
-def _profile_workflow(
+def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
     repo: str,
     workflow: str,
     runs: int,
