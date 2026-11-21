@@ -63,11 +63,14 @@ See [docs/architecture.md](docs/architecture.md) for system design and [docs/lan
 
 ## Proof Lane (`src/pit_crew/lanes/proof/`)
 
-- [ ] Build a red-commit miner that inspects git + CI history to find commits that failed CI and maps each failure to the workflow/job/check that caught it.
-- [ ] Implement diff-to-check mapping so Proof prioritizes historical bugs that exercise the checks touched by the `Candidate` diff.
-- [ ] Build a mutation-injection fallback for repos or checks with no recorded red commits (aligned with `ReplayPlan` contract).
-- [ ] Add validation to prevent empty `ReplayPlan`s (since `rater.py` automatically rejects `bugs_total == 0`).
-- [ ] Refine `SKILL.md` with selection heuristics (prefer high-signal bugs most likely to be masked by the candidate optimization).
+- [x] Build a red-commit miner that inspects git + CI history to find commits that failed CI and maps each failure to the workflow/job/check that caught it.
+- [x] Implement diff-to-check mapping so Proof prioritizes historical bugs that exercise the checks touched by the `Candidate` diff.
+- [x] Build a mutation-injection fallback for repos or checks with no recorded red commits (aligned with `ReplayPlan` contract).
+- [x] Add validation to prevent empty `ReplayPlan`s (since `rater.py` automatically rejects `bugs_total == 0`).
+- [x] Refine `SKILL.md` with selection heuristics (prefer high-signal bugs most likely to be masked by the candidate optimization).
+- [x] Visual proof: record each replay as a terminal video, have Gemini 4 Neon confirm the candidate fails the same way as the baseline, and render a proof card for the PR.
+- [ ] Agree with Dispatcher on recording replays (`record.py`, plus `agg` and `ffmpeg` on the runner) and feeding `verify.tally()` into `Evidence`.
+- [ ] Carry the expected failing check per bug in `ReplayPlan` (contract PR), so a replay must fail on the same check.
 
 **Deliverables:**
 - Red-commit miner + mutation-injection tools in `src/pit_crew/lanes/proof/tools.py` with offline git/CI fixtures.

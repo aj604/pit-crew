@@ -46,7 +46,8 @@ uv run ruff check
 ```
 
 You do not need Managed Agents access to work on a lane. Tools are ordinary Python tested
-against fixtures and an in-memory ledger. Only `managed_agent.py` calls the Gemini API; to
+against fixtures and an in-memory ledger. Only `managed_agent.py` and the proof lane's
+`verify.py` (Gemini 4 Neon watching replay recordings) call the Gemini API; to
 try a skill against the live agent, set `GEMINI_API_KEY` and call
 `pit_crew.managed_agent.run_lane("<lane>", "<task>")`. That path has not been run against
 the live API yet.

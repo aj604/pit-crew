@@ -1,19 +1,42 @@
 ---
 name: proof
-description: Choose the historical bugs a candidate CI change must still catch.
+description: Choose the bugs a candidate CI change must still catch, injecting mutants where history has none.
 ---
 
 # Proof lane
 
-Input: one candidate. Output: a replay plan.
+Input: one candidate, from code that has already:
 
-1. Read the candidate's diff and work out which checks it touches.
-2. From the repository's history of commits that turned CI red, pick the ones those checks
-   caught. Prefer bugs the change is most likely to hide.
-3. Call `plan_replays` with those commits.
+- mapped the candidate's diff to the checks it touches (a change outside
+  `.github/workflows/` touches every check),
+- mined CI history for commits whose check failed on every attempt (flaky ones excluded),
+- chosen the **required replays**: the bugs those touched checks caught, and
+- listed the **uncovered checks**: touched checks with no recorded bug.
 
-The replays run on GitHub Actions and the rater scores them. You do not report results or
-decide the verdict.
+Output: one replay plan.
 
-TODO(proof owner): the miner for red commits, and mutation injection for areas with no
-recorded failures.
+1. Read the candidate's diff. Think about what it could hide: a stale cache that skips a
+   rebuild, test selection that misses a file, a shard that drops tests, a trigger filter
+   that stops CI running at all.
+2. Keep every required replay. Add red commits from the history you are given when the
+   diff is likely to hide them, even if code did not pick them.
+3. For each uncovered check, inject a bug that check should catch:
+   - Find the code the check exercises: the tests it runs, the files it lints or types.
+   - Call `propose_mutants` with that file and pick a mutant on a line those tests cover.
+     For a lint or typecheck check, write the smallest change that breaks that check
+     instead, such as an unused import or a wrong type.
+   - Commit that one change on a new branch `pc/mutant/<candidate id>/<n>` off the
+     candidate's base, not off the candidate, and push it.
+   - Never write a bug that fails every check, such as a syntax error. It proves nothing
+     about the check the candidate touched.
+   - Every replay is recorded on video, and Gemini 4 Neon checks that the candidate fails
+     the same way the baseline does. Pick mutants that fail with a specific, readable
+     message, like an assertion showing expected and actual values, not a crash or a hang.
+4. Call `plan_replays` with the required replays, your additions and your mutant commits.
+
+If an uncovered check has no code you can mutate, say so in your final message and still
+plan the replays you have. The gap shows in the evidence instead of hiding.
+
+You choose what is replayed. Code runs and records the replays, has Gemini 4 Neon confirm
+each failure matches the baseline's, drops bugs the baseline does not catch, and decides
+the verdict. The proof card and recordings go on the PR.
