@@ -144,8 +144,8 @@ class GitHubClient(Protocol):
         """
         ...
 
-    def set_ref(self, repo: str, branch: str, sha: str) -> None:
-        """Point ``branch`` at ``sha``, creating or force-updating it."""
+    def set_ref(self, repo: str, branch: str, sha: str, *, force: bool = False) -> None:
+        """Point ``branch`` at ``sha``, creating it if needed and force-updating only when ``force=True``."""
         ...
 
     def set_default_branch(self, repo: str, branch: str) -> None:
@@ -174,15 +174,37 @@ def git_blob_sha(content: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(content) + content, usedforsecurity=False).hexdigest()
 
 
-def load_template(template: Path = DEFAULT_TEMPLATE) -> dict[str, bytes]:
+def resolve_template(template: Path | None = None) -> Path:
+    """Resolve the benchmark template directory, requiring an explicit path when absent (e.g. wheel installs)."""
+    if template is not None:
+        return template
+    if DEFAULT_TEMPLATE.is_dir():
+        return DEFAULT_TEMPLATE
+    msg = (
+        f"default benchmark template {DEFAULT_TEMPLATE} is not present "
+        "(wheel installs omit benchmarks/target_template); "
+        "pass --template / --workspace pointing to a source checkout's benchmarks/target_template"
+    )
+    raise SeedError(msg)
+
+
+def load_template(template: Path | None = None) -> dict[str, bytes]:
     """Every file of the template that belongs in ``c0``, keyed by POSIX path, sorted."""
-    if not (template / WORKFLOW_PATH).is_file():
+    template = resolve_template(template)
+    root = template.resolve()
+    workflow = template / WORKFLOW_PATH
+    if workflow.is_symlink() or not workflow.is_file():
         msg = f"{template} is not a benchmark target template: it has no {WORKFLOW_PATH}"
         raise SeedError(msg)
     files: dict[str, bytes] = {}
     for path in sorted(template.rglob("*")):
         rel = path.relative_to(template)
-        if not path.is_file() or _SKIP_DIRS.intersection(rel.parts) or path.suffix in _SKIP_SUFFIXES:
+        if _SKIP_DIRS.intersection(rel.parts) or path.suffix in _SKIP_SUFFIXES:
+            continue
+        if path.is_symlink() or not path.resolve().is_relative_to(root):
+            msg = f"{template}: refusing to follow symlink {rel.as_posix()!r}"
+            raise SeedError(msg)
+        if not path.is_file():
             continue
         files[rel.as_posix()] = path.read_bytes()
     return files
@@ -201,7 +223,7 @@ def commit_on_main(client: GitHubClient, repo: str, files: Mapping[str, bytes], 
         msg = f"{repo} has no {MAIN} branch; run seed-target first"
         raise SeedError(msg)
     sha = client.create_commit(repo, files, message, [head])
-    client.set_ref(repo, MAIN, sha)
+    client.set_ref(repo, MAIN, sha, force=False)
     return sha
 
 
@@ -225,7 +247,7 @@ def provision(
             "existing" if head is not None and client.get_file_sha(repo, WORKFLOW_PATH, head) == frozen else "reset"
         )
     if action != "existing":
-        client.set_ref(repo, MAIN, client.create_commit(repo, files, C0_MESSAGE, []))
+        client.set_ref(repo, MAIN, client.create_commit(repo, files, C0_MESSAGE, []), force=True)
     if default != MAIN:
         client.set_default_branch(repo, MAIN)
     head = client.get_ref(repo, MAIN)
@@ -354,10 +376,13 @@ class BugPair:
     def bug_files(self, template: Mapping[str, bytes]) -> dict[str, bytes]:
         """The bug commit's change: ``path`` with ``old`` swapped for ``new``."""
         original = self.fix_files(template)[self.path].decode()
-        if original.count(self.old) != 1:
-            msg = f"{self.key}: expected exactly one {self.old!r} in {self.path}, found {original.count(self.old)}"
+        newline = "\r\n" if "\r\n" in original else "\n"
+        old = self.old.replace("\n", newline)
+        new = self.new.replace("\n", newline)
+        if original.count(old) != 1:
+            msg = f"{self.key}: expected exactly one {old!r} in {self.path}, found {original.count(old)}"
             raise SeedError(msg)
-        return {self.path: original.replace(self.old, self.new).encode()}
+        return {self.path: original.replace(old, new).encode()}
 
     def fix_files(self, template: Mapping[str, bytes]) -> dict[str, bytes]:
         """The fix commit's change: ``path`` exactly as the template has it."""
@@ -590,6 +615,8 @@ def seed_target(  # noqa: PLR0913  keyword-only knobs mirror the CLI flags
         msg = "baseline_runs and max_concurrent must be at least 1"
         raise ValueError(msg)
     files = load_template(template)
+    for pair in bug_pairs:
+        pair.bug_files(files)
     frozen = git_blob_sha(files[WORKFLOW_PATH])
     action, _ = provision(client, repo, files, private=private)
     pairs = PairSeeder(
@@ -723,12 +750,12 @@ class RestGitHubClient:
         )
         return str(commit["sha"])
 
-    def set_ref(self, repo: str, branch: str, sha: str) -> None:
-        """Force ``branch`` to ``sha``, creating it if needed."""
+    def set_ref(self, repo: str, branch: str, sha: str, *, force: bool = False) -> None:
+        """Point ``branch`` to ``sha``, creating it if needed and force-updating only when ``force=True``."""
         if self.get_ref(repo, branch) is None:
             self._call("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
         else:
-            self._call("PATCH", f"/repos/{repo}/git/refs/heads/{quote(branch)}", {"sha": sha, "force": True})
+            self._call("PATCH", f"/repos/{repo}/git/refs/heads/{quote(branch)}", {"sha": sha, "force": force})
 
     def set_default_branch(self, repo: str, branch: str) -> None:
         """Make ``branch`` the default."""
@@ -739,21 +766,34 @@ class RestGitHubClient:
         self._call("POST", f"/repos/{repo}/actions/workflows/{quote(workflow)}/dispatches", {"ref": ref})
 
     def list_workflow_runs(self, repo: str, workflow: str, *, branch: str, event: str) -> list[WorkflowRunInfo]:
-        """The newest 100 runs of ``workflow`` on ``branch`` from ``event``."""
-        query = urlencode({"branch": branch, "event": event, "per_page": 100})
-        body = self._call("GET", f"/repos/{repo}/actions/workflows/{quote(workflow)}/runs?{query}")
-        return [
-            WorkflowRunInfo(
-                id=int(r["id"]),
-                head_sha=str(r["head_sha"]),
-                head_branch=r.get("head_branch"),
-                event=str(r["event"]),
-                path=str(r.get("path", "")),
-                status=str(r["status"]),
-                conclusion=r.get("conclusion"),
-            )
-            for r in body["workflow_runs"]
-        ]
+        """All runs of ``workflow`` on ``branch`` from ``event``, paginated and deduplicated by run id."""
+        runs: list[WorkflowRunInfo] = []
+        seen: set[int] = set()
+        page = 1
+        while True:
+            query = urlencode({"branch": branch, "event": event, "per_page": 100, "page": page})
+            body = self._call("GET", f"/repos/{repo}/actions/workflows/{quote(workflow)}/runs?{query}")
+            items = body["workflow_runs"]
+            for r in items:
+                run_id = int(r["id"])
+                if run_id in seen:
+                    continue
+                seen.add(run_id)
+                runs.append(
+                    WorkflowRunInfo(
+                        id=run_id,
+                        head_sha=str(r["head_sha"]),
+                        head_branch=r.get("head_branch"),
+                        event=str(r["event"]),
+                        path=str(r.get("path", "")),
+                        status=str(r["status"]),
+                        conclusion=r.get("conclusion"),
+                    )
+                )
+            if len(items) < 100:  # noqa: PLR2004  GitHub REST API page size
+                break
+            page += 1
+        return runs
 
     def list_run_jobs(self, repo: str, run_id: int) -> dict[str, str | None]:
         """Display name to conclusion for the latest attempt of each job of ``run_id``."""

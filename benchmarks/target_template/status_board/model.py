@@ -45,7 +45,7 @@ def parse_service(raw: Mapping[str, object]) -> Service:
         msg = f"service needs a non-empty name, got {name!r}"
         raise InvalidServiceError(msg)
     status = raw.get("status")
-    if status not in set(Status):
+    if not isinstance(status, str) or status not in set(Status):
         msg = f"service {name!r} has unknown status {status!r}"
         raise InvalidServiceError(msg)
     latency = raw.get("latency_ms", 0)

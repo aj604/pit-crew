@@ -438,16 +438,18 @@ def test_default_find_bottlenecks_calls_the_analysis_tool_in_the_workspace(
     workflow_file.write_text(TEMPLATE_CI)
     calls: list[tuple[Any, ...]] = []
 
-    def find_bottlenecks(ledger: object, repo: str, workflow: str) -> dict[str, Any]:
-        calls.append((type(ledger).__name__, repo, workflow, os.environ.get(ct.WORKSPACE_ENV)))
+    def find_bottlenecks(ledger: object, repo: str, workflow: str, *, runs: int = ct.DEFAULT_RUNS) -> dict[str, Any]:
+        calls.append((type(ledger).__name__, repo, workflow, runs, os.environ.get(ct.WORKSPACE_ENV)))
         return {"findings": [_finding(s) for s in ("dep-cache", "parallelize-dag", "dedupe-jobs")]}
 
     monkeypatch.setattr(analysis_tools, "find_bottlenecks", find_bottlenecks, raising=False)
 
-    code, report = _main(["check-target", "--repo", REPO, "--workspace", str(tmp_path)], get=_ready_history().get)
+    code, report = _main(
+        ["check-target", "--repo", REPO, "--runs", "20", "--workspace", str(tmp_path)], get=_ready_history().get
+    )
 
     assert code == 0, report
-    assert calls == [("InMemoryLedger", REPO, "ci.yml", str(tmp_path))]
+    assert calls == [("InMemoryLedger", REPO, "ci.yml", 20, str(tmp_path))]
     assert ct.WORKSPACE_ENV not in os.environ
 
 
@@ -476,10 +478,31 @@ def test_cli_uses_custom_workspace_workflow_for_proof_and_baseline(tmp_path: Pat
 def test_default_find_bottlenecks_restores_a_previous_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
     _without_find_bottlenecks(monkeypatch)
     monkeypatch.setenv(ct.WORKSPACE_ENV, "/previous")
-    monkeypatch.setattr(analysis, "find_bottlenecks", lambda _ledger, _repo, _workflow: {}, raising=False)
+    monkeypatch.setattr(analysis, "find_bottlenecks", lambda _ledger, _repo, _workflow, **_kw: {}, raising=False)
 
     assert ct.default_find_bottlenecks()(REPO, "ci.yml") == {}
     assert os.environ[ct.WORKSPACE_ENV] == "/previous"
+
+
+def test_cli_preserves_crlf_workflow_bytes_for_blob_sha(tmp_path: Path) -> None:
+    crlf_ci = TEMPLATE_CI.replace("\n", "\r\n").encode("utf-8")
+    workflow_file = tmp_path / WORKFLOW_PATH
+    workflow_file.parent.mkdir(parents=True)
+    workflow_file.write_bytes(crlf_ci)
+    history = FakeHistory(default_blob=git_blob_sha(crlf_ci))
+    history.add("base0", seconds=100.0)
+    for job_id in ct.REQUIRED_CHECKS:
+        history.bug(job_id)
+
+    code, report = _main(
+        ["check-target", "--repo", REPO, "--workspace", str(tmp_path)],
+        get=history.get,
+        find_bottlenecks=_finder(),
+    )
+
+    assert code == 0, report
+    assert report["ready"] is True
+    assert report["green_runs"] == 1
 
 
 def test_cli_rejects_a_malformed_repo() -> None:

@@ -181,9 +181,13 @@ class FakeGitHubClient:
         self.writes.append(("create_commit", repo, sha))
         return sha
 
-    def set_ref(self, repo: str, branch: str, sha: str) -> None:
+    def set_ref(self, repo: str, branch: str, sha: str, *, force: bool = False) -> None:
         state = self.repos[repo]
         assert sha in state.commits
+        current = state.refs.get(branch)
+        if not force and current is not None and current not in state.commits[sha].parents:
+            msg = f"{repo}: non-fast-forward update on {branch} ({current} -> {sha})"
+            raise RuntimeError(msg)
         self.writes.append(("set_ref", repo, branch, sha))
         state.refs[branch] = sha
         path = ".github/workflows/ci.yml"

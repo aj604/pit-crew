@@ -22,12 +22,12 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from pit_crew.benchmark_seeder import (
-    DEFAULT_TEMPLATE,
     DISPATCH_EVENT,
     MAIN,
     WORKFLOW_FILE,
     WORKFLOW_PATH,
     git_blob_sha,
+    resolve_template,
 )
 from pit_crew.contracts import PLAYBOOK_SKILLS
 from pit_crew.lanes.analysis import history
@@ -71,7 +71,7 @@ def _workspace(path: Path) -> Iterator[None]:
             os.environ[WORKSPACE_ENV] = previous
 
 
-def default_find_bottlenecks(workspace: Path = DEFAULT_TEMPLATE) -> FindBottlenecks:
+def default_find_bottlenecks(workspace: Path | None = None, *, runs: int = DEFAULT_RUNS) -> FindBottlenecks:
     """The Analysis lane's ``find_bottlenecks`` tool, adapted to ``(repo, workflow)``.
 
     It reads the workflow file from ``workspace`` (default: the template whose ``ci.yml`` the
@@ -79,6 +79,7 @@ def default_find_bottlenecks(workspace: Path = DEFAULT_TEMPLATE) -> FindBottlene
     already recorded elsewhere still count. Raises ``FindBottlenecksUnavailableError`` when the
     tool has not landed yet.
     """
+    resolved = resolve_template(workspace)
     for name in _FIND_BOTTLENECKS_MODULES:
         found = getattr(importlib.import_module(name), "find_bottlenecks", None)
         if callable(found):
@@ -88,8 +89,8 @@ def default_find_bottlenecks(workspace: Path = DEFAULT_TEMPLATE) -> FindBottlene
         raise FindBottlenecksUnavailableError
 
     def run(repo: str, workflow: str) -> Mapping[str, Any]:
-        with _workspace(workspace):
-            return tool(InMemoryLedger(), repo, workflow)
+        with _workspace(resolved):
+            return tool(InMemoryLedger(), repo, workflow, runs=runs)
 
     return run
 
@@ -227,7 +228,11 @@ def check_target(  # noqa: PLR0913  keyword-only seams for offline tests
     ``ci.yml`` from the benchmark template, which names the required checks.
     """
     getter = get if get is not None else history._http_getter(os.environ.get("GITHUB_TOKEN"))  # noqa: SLF001
-    text = workflow_text if workflow_text is not None else (DEFAULT_TEMPLATE / WORKFLOW_PATH).read_text()
+    text = (
+        workflow_text
+        if workflow_text is not None
+        else (resolve_template(None) / WORKFLOW_PATH).read_bytes().decode("utf-8")
+    )
     expected_blob = git_blob_sha(text.encode())
     blob_cache: dict[str, bool] = {}
 
@@ -242,7 +247,7 @@ def check_target(  # noqa: PLR0913  keyword-only seams for offline tests
     if not walls:
         problems.append(f"no green {DISPATCH_EVENT} baseline runs of {WORKFLOW_PATH} on {MAIN}")
 
-    finder = find_bottlenecks if find_bottlenecks is not None else default_find_bottlenecks()
+    finder = find_bottlenecks if find_bottlenecks is not None else default_find_bottlenecks(runs=runs)
     findings = _qualifying(finder(repo, workflow).get("findings") or [])
     if len(findings) < MIN_FINDINGS:
         problems.append(

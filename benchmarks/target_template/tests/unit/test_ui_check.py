@@ -68,10 +68,27 @@ def test_snapshot_png_renders_banner_cards_and_failure_indicator() -> None:
 
 
 def test_malformed_service_is_reported(tmp_path: Path) -> None:
-    data = {"title": "T", "services": [{"name": "db", "status": "sideways"}], "expect": {"cards": 0, "overall": "up"}}
-    fixture = Path(_fixture(tmp_path, data))
-    assert run(fixture, tmp_path)
-    assert "unknown status" in (tmp_path / SNAPSHOT_NAME).read_text(encoding="utf-8")
-    png = (tmp_path / SNAPSHOT_PNG_NAME).read_bytes()
-    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    for bad_status in ("sideways", ["up"], {"value": "up"}):
+        sub = tmp_path / type(bad_status).__name__
+        sub.mkdir()
+        data = {
+            "title": "T",
+            "services": [{"name": "db", "status": bad_status}],
+            "expect": {"cards": 0, "overall": "up"},
+        }
+        fixture = Path(_fixture(sub, data))
+        assert run(fixture, sub)
+        assert "unknown status" in (sub / SNAPSHOT_NAME).read_text(encoding="utf-8")
+        png = (sub / SNAPSHOT_PNG_NAME).read_bytes()
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert _ihdr(png) == (640, 240, 8, 2)
+
+
+def test_snapshot_png_reserves_failure_panel_for_many_cards() -> None:
+    cards = [{"data-service": f"svc{i}", "data-status": "up", "class": "card status-up"} for i in range(9)]
+    dom = Dom(title="Service status", banner={"data-overall": "up"}, cards=cards)
+    png = snapshot_png(dom, ["9 cards rendered, expected 4"])
     assert _ihdr(png) == (640, 240, 8, 2)
+    idat_len = struct.unpack(">I", png[33:37])[0]
+    raw = zlib.decompress(png[41 : 41 + idat_len])
+    assert bytes((0xCF, 0x22, 0x2E)) in raw

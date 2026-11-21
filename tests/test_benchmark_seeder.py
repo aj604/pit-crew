@@ -451,6 +451,8 @@ def test_rest_client_commits_byte_exact_blobs_and_moves_refs() -> None:
     assert t.calls[-1][:2] == ("POST", f"{bs.API}/repos/{REPO}/git/refs")
     t.refs["main"] = "old"
     client.set_ref(REPO, "main", "c")
+    assert t.calls[-1] == ("PATCH", f"{bs.API}/repos/{REPO}/git/refs/heads/main", {"sha": "c", "force": False})
+    client.set_ref(REPO, "main", "c", force=True)
     assert t.calls[-1] == ("PATCH", f"{bs.API}/repos/{REPO}/git/refs/heads/main", {"sha": "c", "force": True})
     client.set_default_branch(REPO, "main")
     assert t.calls[-1] == ("PATCH", f"{bs.API}/repos/{REPO}", {"default_branch": "main"})
@@ -530,3 +532,61 @@ def test_cli_seed_target_builds_rest_client_from_token(
 def test_cli_seed_target_validates_flags(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         cli.main(["seed-target", *argv])
+
+
+def test_load_template_rejects_symlinks(tmp_path: Path) -> None:
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    secret = tmp_path.parent / "outside-secret.txt"
+    secret.write_text("top-secret\n")
+    (tmp_path / "leak.txt").symlink_to(secret)
+    with pytest.raises(bs.SeedError, match="refusing to follow symlink"):
+        bs.load_template(tmp_path)
+
+
+def test_resolve_template_requires_explicit_path_when_default_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bs, "DEFAULT_TEMPLATE", tmp_path / "missing-template")
+    with pytest.raises(bs.SeedError, match="wheel installs omit"):
+        bs.resolve_template()
+    assert bs.resolve_template(tmp_path) == tmp_path
+
+
+def test_bug_pair_handles_crlf_template_and_validates_before_provisioning(tmp_path: Path) -> None:
+    crlf_files = {k: v.replace(b"\n", b"\r\n") for k, v in TEMPLATE_FILES.items()}
+    bug = bs.BUG_PAIRS[0].bug_files(crlf_files)
+    assert b"import os\r\n" in bug["status_board/model.py"]
+
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_bytes(TEMPLATE_FILES[bs.WORKFLOW_PATH])
+    gh = FakeGitHubClient()
+    with pytest.raises(bs.SeedError, match="the template has no"):
+        bs.seed_target(gh, REPO, template=tmp_path, bug_pairs=bs.BUG_PAIRS)
+    assert gh.writes == []
+
+
+def test_rest_client_paginates_and_deduplicates_workflow_runs() -> None:
+    def make_run(run_id: int) -> dict[str, Any]:
+        return {
+            "id": run_id,
+            "head_sha": "abc",
+            "head_branch": "main",
+            "event": "workflow_dispatch",
+            "path": bs.WORKFLOW_PATH,
+            "status": "completed",
+            "conclusion": "success",
+        }
+
+    pages = {
+        1: [make_run(i) for i in range(100, 0, -1)],
+        2: [make_run(1), make_run(101)],
+    }
+
+    def transport(_method: str, url: str, _body: Mapping[str, Any] | None) -> tuple[int, Any]:
+        page = 2 if "page=2" in url else 1
+        return 200, {"workflow_runs": pages[page]}
+
+    runs = bs.RestGitHubClient(transport).list_workflow_runs(REPO, "ci.yml", branch="main", event="workflow_dispatch")
+    assert len(runs) == 101
+    assert {r.id for r in runs} == set(range(1, 102))

@@ -270,10 +270,17 @@ def snapshot_png(dom: Dom, problems: Sequence[str]) -> bytes:
         canvas.rect((0, _BANNER_H - 4, PNG_WIDTH, 4), _PNG_RED)
     header = f"{dom.title or 'Service status'} - {overall or 'no banner'}"
     canvas.text((16, 17), header, _PNG_WHITE, scale=2)
-    for i, card in enumerate(dom.cards):
+    card_limit_y = (PNG_HEIGHT - 36) if problems else PNG_HEIGHT
+    max_rows = max(0, (card_limit_y - 60 + 8) // (_CARD_H + 8))
+    max_cards = max_rows * _CARDS_PER_ROW
+    shown_cards = dom.cards[:max_cards]
+    omitted = len(dom.cards) - len(shown_cards)
+    for i, card in enumerate(shown_cards):
         _draw_png_card(canvas, i, card)
-    rows = max(1, (len(dom.cards) + _CARDS_PER_ROW - 1) // _CARDS_PER_ROW)
-    top = min(PNG_HEIGHT - 36, 60 + rows * (_CARD_H + 8) + 6)
+    rows = max(1, (len(shown_cards) + _CARDS_PER_ROW - 1) // _CARDS_PER_ROW)
+    if omitted:
+        canvas.text((16, 60 + rows * (_CARD_H + 8) + 2), f"+{omitted} more", _PNG_INK)
+    top = min(PNG_HEIGHT - 36, 60 + rows * (_CARD_H + 8) + (16 if omitted else 6))
     if problems:
         block_h = min(PNG_HEIGHT - top - 4, 18 + 12 * len(problems))
         canvas.rect((16, top, PNG_WIDTH - 32, 2), _PNG_RED)

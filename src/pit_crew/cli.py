@@ -182,12 +182,13 @@ def seed_target(
     """Run ``seed-target`` from parsed flags and return its JSON summary and whether it succeeded."""
     summary: dict[str, Any] = {"command": "seed-target", "repo": args.repo, "status": "error"}
     try:
+        template = benchmark_seeder.resolve_template(Path(args.template) if args.template is not None else None)
         github = github if github is not None else _rest_client()
         report = benchmark_seeder.seed_target(
             github,
             args.repo,
             baseline_runs=args.baseline_runs,
-            template=Path(args.template),
+            template=template,
             private=args.private,
             max_concurrent=args.max_concurrent,
             poll_seconds=args.poll_seconds,
@@ -208,11 +209,11 @@ def run_check_target(
     """Run ``check-target`` from parsed flags and return its JSON readiness report and whether it is ready."""
     summary: dict[str, Any] = {"command": "check-target", "repo": args.repo, "ready": False}
     try:
-        workspace = Path(args.workspace)
+        workspace = benchmark_seeder.resolve_template(Path(args.workspace) if args.workspace is not None else None)
         finder = find_bottlenecks
         if finder is None:
-            finder = check_target.default_find_bottlenecks(workspace)
-        workflow_text = (workspace / benchmark_seeder.WORKFLOW_PATH).read_text()
+            finder = check_target.default_find_bottlenecks(workspace, runs=args.runs)
+        workflow_text = (workspace / benchmark_seeder.WORKFLOW_PATH).read_bytes().decode("utf-8")
         readiness = check_target.check_target(
             args.repo, runs=args.runs, get=get, find_bottlenecks=finder, workflow_text=workflow_text
         )
@@ -250,7 +251,12 @@ def _add_seed_target(commands: "argparse._SubParsersAction[argparse.ArgumentPars
         help="green workflow_dispatch runs on main to wait for (default: %(default)s)",
     )
     seed.add_argument(
-        "--template", default=str(benchmark_seeder.DEFAULT_TEMPLATE), help="template directory to commit as c0"
+        "--template",
+        default=None,
+        help=(
+            "template directory to commit as c0 "
+            "(default: source checkout's benchmarks/target_template; required in wheel installs)"
+        ),
     )
     seed.add_argument("--private", action="store_true", help="create the repository as private if it is missing")
     seed.add_argument("--max-concurrent", type=_positive_int, default=2, help="baseline runs in flight at once")
@@ -271,8 +277,11 @@ def _add_check_target(commands: "argparse._SubParsersAction[argparse.ArgumentPar
     )
     check.add_argument(
         "--workspace",
-        default=str(benchmark_seeder.DEFAULT_TEMPLATE),
-        help="checkout whose .github/workflows/ci.yml find_bottlenecks reads (default: the benchmark template)",
+        default=None,
+        help=(
+            "checkout whose .github/workflows/ci.yml find_bottlenecks reads "
+            "(default: source checkout's benchmarks/target_template; required in wheel installs)"
+        ),
     )
 
 
