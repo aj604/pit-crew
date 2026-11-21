@@ -227,7 +227,7 @@ const fakeNode = (extra = {}) => {
     replaceChildren(...kids) { this.kids = kids; },
     append(...kids) { this.kids.push(...kids); },
     querySelectorAll(selector) { return selector === "[data-mode]" ? (this.modeButtons ?? []) : []; },
-    click() { this.dispatchEvent({ type: "click" }); },
+    click() { if (!this.disabled) this.dispatchEvent({ type: "click" }); },
     ...extra,
   };
 };
@@ -505,6 +505,11 @@ store.setFetchError(); log.clearedError = store.getState().fetchError;
 store.setMode("demo"); log.backToDemo = [...pick(store.getState()), store.getState().attempts.length];
 store.play(); store.step(); store.reset();
 log.resetStops = [...pick(store.getState()), timers.at(-1).cleared];
+store.step(); store.step(); store.play();
+log.resumeMid = pick(store.getState());
+timers.at(-1).fn(); log.resumeTick = pick(store.getState());
+store.setStage(1); log.stageWhilePlaying = [...pick(store.getState()), timers.at(-1).cleared];
+store.setStage(4); log.stageEndStops = [...pick(store.getState()), timers.at(-1).cleared];
 unsubscribe(); const before = seen.length; store.reset(); log.unsubscribed = seen.length === before;
 log.seenStart = seen.slice(0, 4);
 console.log(JSON.stringify({ boots, log }));
@@ -557,6 +562,10 @@ def test_boot_and_store_transitions() -> None:
     assert log["clearedError"] is None
     assert log["backToDemo"] == ["demo", "noise_reject", 0, "analysis", False, 1]
     assert log["resetStops"] == ["demo", "noise_reject", 0, "analysis", False, True]
+    assert log["resumeMid"] == ["demo", "noise_reject", 2, "proof", True]
+    assert log["resumeTick"] == ["demo", "noise_reject", 3, "ci", True]
+    assert log["stageWhilePlaying"] == ["demo", "noise_reject", 1, "optimizer", True, False]
+    assert log["stageEndStops"] == ["demo", "noise_reject", 4, "rater", False, True]
     assert log["unsubscribed"] is True
     assert log["seenStart"] == ["analysis", "optimizer", "proof", "ci"]
 
@@ -567,7 +576,8 @@ _SWITCHER_SCRIPT = (
 const m = await import(process.argv[1]);
 const view = (d, pw) => ({
   hdr: [d.ids["base-sha-value"].textContent, d.ids["sla-median"].textContent, d.ids["sla-p95"].textContent,
-    d.ids["sla-badge"].hidden, d.ids["run-pit-stop"].disabled],
+    d.ids["sla-badge"].hidden, d.ids["run-pit-stop"].disabled, d.ids["run-pit-stop"].attrs["aria-busy"],
+    d.ids["run-pit-stop"].textContent],
   ui: [d.ids["demo-switcher"].hidden, pw.store.getState().stage,
     pw.switcher.stageItems.map((n) => `${n.dataset.state}:${n.attrs["aria-current"]}`).join(","),
     pw.switcher.scenarioButtons.filter((n) => n.attrs["aria-pressed"] === "true").map((n) => n.textContent).join(),
@@ -581,19 +591,44 @@ const sw = pw.switcher;
 const out = { boot: view(d, pw), labels: sw.stageItems.map((n) => n.textContent),
   slotKids: d.ids["demo-switcher"].kids.length };
 sw.resetButton.click(); out.analysis = view(d, pw);
+d.ids["run-pit-stop"].click();
+out.runAfterReset = [pw.store.getState().stage, pw.store.getState().isPlaying, d.ids["run-pit-stop"].disabled];
+sw.playButton.click();
 const walk = [];
 for (let i = 0; i < 4; i += 1) { sw.stepButton.click(); walk.push(view(d, pw)); }
 out.walk = walk;
+sw.resetButton.click(); sw.stepButton.click();
+d.ids["run-pit-stop"].click(); out.runMidStage = [pw.store.getState().stage, pw.store.getState().isPlaying];
+sw.playButton.click();
 sw.scenarioButtons[0].click(); out.unsafe = view(d, pw);
 sw.playButton.click(); out.playing = view(d, pw);
 sw.playButton.click(); out.paused = view(d, pw);
 d.ids["run-pit-stop"].click(); out.runPlays = pw.store.getState().isPlaying; pw.store.pause();
 d.live.click(); out.live = view(d, pw);
+d.ids["repo-input"].value = "my-org/my-repo";
 d.demo.click(); out.demo = view(d, pw);
+d.live.click(); out.liveRestored = d.ids["repo-input"].value;
 const l = fakeDocument("complete");
 const lpw = m.bootPitWall(l.doc, "?repo=owner/name");
 out.liveBoot = { ...view(l, lpw), mode: lpw.store.getState().mode, pressed: pressed(l) };
 l.ids["run-pit-stop"].click(); out.liveRunIgnored = lpw.store.getState().isPlaying;
+l.ids["repo-input"].value = "draft/repo";
+let repoWrites = 0;
+const origSetRepo = lpw.header.setRepo;
+lpw.header.setRepo = (v) => { repoWrites += 1; origSetRepo(v); };
+lpw.store.setLiveData({
+  status: { repo: "owner/name", active: true, base_sha: "abcdef012345" }, attempts: [{ id: 1 }],
+});
+out.liveActive = { hdr: view(l, lpw).hdr, repo: l.ids["repo-input"].value, writes: repoWrites };
+lpw.store.setFetchError("offline"); lpw.store.selectAttempt(0);
+out.liveUnchanged = [l.ids["repo-input"].value, repoWrites];
+lpw.store.setRepo("next/repo");
+out.liveSetRepo = [l.ids["repo-input"].value, repoWrites];
+l.ids["repo-input"].value = "";
+l.demo.click(); const demoRepo = l.ids["repo-input"].value;
+l.live.click(); out.liveBlank = [demoRepo, l.ids["repo-input"].value];
+l.demo.click(); lpw.store.setRepo("from-demo/repo");
+l.live.click(); out.liveFromDemoSetRepo = l.ids["repo-input"].value;
 console.log(JSON.stringify(out));
 """
 )
@@ -602,8 +637,10 @@ console.log(JSON.stringify(out));
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 def test_demo_switcher_drives_header_through_stages() -> None:
     out = _node(_SWITCHER_SCRIPT, APP_JS.as_uri())
-    kept = ["e9b17d3", "48.0", "82.0", False, False]
-    pending = ["4f1c9e2", "--", "--", True, True]
+    idle = [False, "false", "Run Pit Stop"]
+    running = [True, "true", "Pit Stop Running"]
+    kept = ["e9b17d3", "48.0", "82.0", False, *idle]
+    pending = ["4f1c9e2", "--", "--", True, *idle]
     rater = "done:false,done:false,done:false,done:false,current:step"
     analysis = "current:step,pending:false,pending:false,pending:false,pending:false"
     assert out["boot"]["hdr"] == kept
@@ -613,24 +650,37 @@ def test_demo_switcher_drives_header_through_stages() -> None:
     assert out["slotKids"] == 4
     assert out["analysis"]["hdr"] == pending
     assert out["analysis"]["ui"] == [False, "analysis", analysis, "Proven Speedup", "Play", "false", False, True]
+    assert out["runAfterReset"] == ["analysis", True, True]
     assert [w["ui"][1] for w in out["walk"]] == ["optimizer", "proof", "ci", "rater"]
     assert [w["ui"][2].count("done:false") for w in out["walk"]] == [1, 2, 3, 4]
     assert [w["hdr"] for w in out["walk"]] == [pending, pending, pending, kept]
+    assert out["runMidStage"] == ["optimizer", True]
     assert out["unsafe"]["ui"][3] == "Fast but Unsafe"
-    assert out["unsafe"]["hdr"] == ["4f1c9e2", "62.5", "72.4", True, False]
+    assert out["unsafe"]["hdr"] == ["4f1c9e2", "62.5", "72.4", True, *idle]
     assert out["playing"]["ui"][1:] == [
         "analysis", analysis, "Fast but Unsafe", "Pause", "true", False, False
     ]  # fmt: skip
-    assert out["playing"]["hdr"][4] is True
+    assert out["playing"]["hdr"] == ["4f1c9e2", "--", "--", True, *running]
     assert out["paused"]["ui"][4:6] == ["Play", "false"]
+    assert out["paused"]["hdr"] == pending
     assert out["runPlays"] is True
     assert (out["live"]["ui"][0], out["live"]["hdr"], out["live"]["repo"]) == (
         True,
-        ["-------", "--", "--", True, False],
+        ["-------", "--", "--", True, *idle],
         "",
     )
-    assert (out["demo"]["ui"][0], out["demo"]["ui"][3]) == (False, "Fast but Unsafe")
+    assert (out["demo"]["ui"][0], out["demo"]["ui"][3], out["demo"]["repo"]) == (
+        False,
+        "Fast but Unsafe",
+        "pit-crew-demo/checkout-api",
+    )
+    assert out["liveRestored"] == "my-org/my-repo"
     assert (out["liveBoot"]["mode"], out["liveBoot"]["ui"][0], out["liveBoot"]["repo"]) == ("live", True, "owner/name")
     assert out["liveBoot"]["pressed"] == ["true", "false"]
     assert out["liveRunIgnored"] is False
+    assert out["liveActive"] == {"hdr": ["abcdef0", "--", "--", True, *running], "repo": "draft/repo", "writes": 0}
+    assert out["liveUnchanged"] == ["draft/repo", 0]
+    assert out["liveSetRepo"] == ["next/repo", 1]
+    assert out["liveBlank"] == ["pit-crew-demo/checkout-api", ""]
+    assert out["liveFromDemoSetRepo"] == "from-demo/repo"
     assert '<section id="demo-switcher" class="pit-wall__slot demo-switcher"' in (WEB_DIR / "index.html").read_text()

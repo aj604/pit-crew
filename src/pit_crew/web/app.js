@@ -162,10 +162,22 @@ export function createDemoSwitcher(root, slot, store) {
 
 /** Wire the Header Bar to `store`; header mode clicks update the store without echoing events back. */
 export function bindHeaderToStore(header, modeToggle, store) {
+  let prevMode = null;
+  let prevRepo = store.getState().repo;
+  let liveRepo = prevRepo;
   const render = (state) => {
+    if (prevMode === "live") liveRepo = header.repoInput.value;
+    if (prevRepo !== state.repo) liveRepo = state.repo;
     if (header.mode !== state.mode) header.setMode(state.mode);
-    if (state.mode === "live") header.setRepo(state.repo);
-    header.applyStatus(state.status);
+    if (state.mode === "demo") {
+      header.applyStatus(state.status);
+      header.setRunning(state.isPlaying);
+    } else {
+      header.applyStatus(state.status ? { ...state.status, repo: "" } : null);
+      if (header.repoInput.value !== liveRepo) header.setRepo(liveRepo);
+    }
+    prevMode = state.mode;
+    prevRepo = state.repo;
   };
   modeToggle.addEventListener("pitwall:mode", (event) => {
     if (store.getState().mode !== event.detail.mode) store.setMode(event.detail.mode);

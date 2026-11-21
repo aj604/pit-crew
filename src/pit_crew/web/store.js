@@ -85,7 +85,8 @@ export function createPitWallStore(initialOptions = {}) {
       if (!Number.isInteger(index) || index < 0 || index > LAST_STAGE) {
         throw new RangeError(`Demo stage index out of range: ${index}`);
       }
-      update({ stageIndex: index });
+      if (index === LAST_STAGE) stopTicker();
+      update({ stageIndex: index, isPlaying: ticker !== null });
     },
     step() {
       if (!inDemo()) return;
