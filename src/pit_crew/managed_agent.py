@@ -81,6 +81,11 @@ class InteractionLike(Protocol):
         """Opaque continuation token when decoding pauses."""
         ...
 
+    @property
+    def environment_id(self) -> str | None:
+        """Remote sandbox identifier allocated for the interaction."""
+        ...
+
 
 class InteractionsResourceLike(Protocol):
     """Subset of ``genai.Client.interactions`` used by ``run_lane``."""
@@ -236,7 +241,7 @@ def _execute_tool_step(
         }
     try:
         output = tools.call(step.name, ledger, dict(step.arguments or {}))
-    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+    except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
         return {
             "type": "function_result",
             "call_id": step.id,

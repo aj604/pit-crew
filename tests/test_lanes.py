@@ -1,3 +1,6 @@
+import base64
+import gzip
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, override
@@ -7,6 +10,7 @@ import pytest
 from pit_crew import managed_agent, tools
 from pit_crew.contracts import Candidate, Hypothesis, ReplayPlan
 from pit_crew.dispatcher import next_lane
+from pit_crew.lanes.analysis import history
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import (
     BASE_AGENT,
@@ -138,10 +142,11 @@ def test_run_lane_executes_polling_continuation_and_tool_loop_offline(monkeypatc
     ledger = InMemoryLedger()
     fake_client = _FakeClient(
         responses=[
-            _FakeInteraction(id="int-1", status="in_progress", steps=[]),
+            _FakeInteraction(id="int-1", status="in_progress", steps=[], environment_id="env-1"),
             _FakeInteraction(
                 id="int-2",
                 status="requires_action",
+                environment_id="env-1",
                 steps=[
                     _FakeStep(type="user_input"),
                     _FakeStep(
@@ -169,7 +174,9 @@ def test_run_lane_executes_polling_continuation_and_tool_loop_offline(monkeypatc
                     ),
                 ],
             ),
-            _FakeInteraction(id="int-3", status="completed", steps=[], output_text="Recorded 1 hypothesis."),
+            _FakeInteraction(
+                id="int-3", status="completed", steps=[], environment_id="env-1", output_text="Recorded 1 hypothesis."
+            ),
         ],
         polled=[
             _FakeInteraction(
@@ -177,6 +184,7 @@ def test_run_lane_executes_polling_continuation_and_tool_loop_offline(monkeypatc
                 status="requires_continuation",
                 steps=[],
                 continuation_token="tok-1",  # noqa: S106
+                environment_id="env-1",
             )
         ],
     )
@@ -187,11 +195,82 @@ def test_run_lane_executes_polling_continuation_and_tool_loop_offline(monkeypatc
     assert len(recorded) == 1
     assert recorded[0].skill == "dep-cache"
 
-    tool_reply = fake_client.interactions.calls[2]["input"]
+    continuation_call = fake_client.interactions.calls[1]
+    assert continuation_call["agent_config"] == {"type": "antigravity", "model": MODELS["analysis"]}
+    assert continuation_call["environment"] == "env-1"
+    assert continuation_call["tools"] == fake_client.interactions.calls[0]["tools"]
+
+    tool_call = fake_client.interactions.calls[2]
+    assert tool_call["agent_config"] == {"type": "antigravity", "model": MODELS["analysis"]}
+    assert tool_call["environment"] == "env-1"
+    assert tool_call["tools"] == fake_client.interactions.calls[0]["tools"]
+    tool_reply = tool_call["input"]
     assert isinstance(tool_reply, list)
     assert tool_reply[0]["is_error"] is True
     assert tool_reply[1]["is_error"] is True
     assert tool_reply[2]["result"] == recorded[0].id
+
+
+def test_run_lane_forwards_repo_and_falls_back_when_environment_id_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tools, "call", lambda _name, _ledger, _args: [{"path": "src/a.py", "line": 2}])
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                steps=[
+                    _FakeStep(
+                        type="function_call",
+                        id="call-list",
+                        name="record_hypothesis",
+                        arguments={},
+                    )
+                ],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[]),
+        ]
+    )
+
+    final = run_lane("analysis", "inspect fork", repo="https://github.com/org/fork", client=fake_client)
+    assert final.status == "completed"
+
+    initial_env = fake_client.interactions.calls[0]["environment"]
+    assert isinstance(initial_env, dict)
+    assert {"type": "repository", "source": "https://github.com/org/fork", "target": "/workspace"} in initial_env[
+        "sources"
+    ]
+
+    follow_up = fake_client.interactions.calls[1]
+    assert follow_up["environment"] == initial_env
+    tool_reply = follow_up["input"]
+    assert isinstance(tool_reply, list)
+    result = tool_reply[0]["result"]
+    assert isinstance(result, str)
+    assert json.loads(result) == [{"path": "src/a.py", "line": 2}]
+
+
+def test_serialize_tool_result_accepts_all_output_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    outputs: list[object] = [{"ok": True}, [1, 2], 42, True, None, object()]
+    monkeypatch.setattr(tools, "call", lambda _name, _ledger, _args: outputs.pop(0))
+
+    steps = [_FakeStep(type="function_call", id=f"c-{i}", name="record_hypothesis", arguments={}) for i in range(6)]
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(id="int-1", status="requires_action", steps=steps, environment_id="env-2"),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-2"),
+        ]
+    )
+
+    run_lane("analysis", "test shapes", client=fake_client)
+    tool_reply = fake_client.interactions.calls[1]["input"]
+    assert isinstance(tool_reply, list)
+    results = [item["result"] for item in tool_reply]
+    assert results[0] == {"ok": True}
+    assert results[1] == "[1, 2]"
+    assert results[2] == "42"
+    assert results[3] == "true"
+    assert results[4] == "null"
+    assert isinstance(results[5], str)
 
 
 def test_run_lane_raises_when_exceeding_max_turns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -255,6 +334,90 @@ def test_run_lane_forwards_repo_to_the_request() -> None:
     run_lane("analysis", "analyze", repo="org/fork", client=fake_client)
     sources = fake_client.interactions.calls[0]["environment"]["sources"]  # type: ignore[index]
     assert {"type": "repository", "source": "https://github.com/org/fork", "target": "/workspace"} in sources
+
+
+def test_run_lane_profiles_ci_from_remote_repo_without_local_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixtures = Path(__file__).parent / "fixtures" / "fastapi"
+    workflow_yaml = (fixtures / "test.yml").read_text()
+    encoded = base64.encodebytes(workflow_yaml.encode("utf-8")).decode("ascii")
+    with gzip.open(fixtures / "runs.json.gz") as handle:
+        raw_runs = json.load(handle)
+
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "no-checkout"))
+    requested_urls: list[str] = []
+
+    def fake_getter(_token: str | None) -> history.Getter:
+        def get(url: str) -> tuple[Any, str | None]:
+            requested_urls.append(url)
+            return {"type": "file", "encoding": "base64", "content": encoded}, None
+
+        return get
+
+    monkeypatch.setattr(history, "_http_getter", fake_getter)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw_runs)
+
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                environment_id="env-analysis",
+                steps=[
+                    _FakeStep(
+                        type="function_call",
+                        id="call-profile",
+                        name="profile_ci",
+                        arguments={"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "master"},
+                    )
+                ],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-analysis"),
+        ]
+    )
+
+    final = run_lane("analysis", "profile fastapi", repo="https://github.com/fastapi/fastapi", client=fake_client)
+    assert final.status == "completed"
+    assert requested_urls == [
+        "https://api.github.com/repos/fastapi/fastapi/contents/.github/workflows/test.yml?ref=master"
+    ]
+
+    tool_reply = fake_client.interactions.calls[1]["input"]
+    assert isinstance(tool_reply, list)
+    assert "is_error" not in tool_reply[0]
+    assert tool_reply[0]["result"]["critical_path"]["jobs"] == [
+        "changes",
+        "test",
+        "coverage-combine",
+        "test-alls-green",
+    ]
+
+
+def test_run_lane_converts_tool_oserror_into_function_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file", "ci.yml")
+
+    monkeypatch.setattr(tools, "call", boom)
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                environment_id="env-err",
+                steps=[_FakeStep(type="function_call", id="call-err", name="profile_ci", arguments={})],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-err"),
+        ]
+    )
+
+    final = run_lane("analysis", "handle missing file", client=fake_client)
+    assert final.status == "completed"
+    tool_reply = fake_client.interactions.calls[1]["input"]
+    assert isinstance(tool_reply, list)
+    assert tool_reply[0]["is_error"] is True
+    assert "FileNotFoundError:" in tool_reply[0]["result"]
+    assert "ci.yml" in tool_reply[0]["result"]
 
 
 def _record_call(call_id: str = "call-1") -> _FakeStep:

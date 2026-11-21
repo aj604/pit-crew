@@ -39,6 +39,7 @@ class _FakeInteraction:
     status: str | None
     steps: list[_FakeStep] | None = None
     continuation_token: str | None = None
+    environment_id: str | None = None
 
 
 @dataclass
