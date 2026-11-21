@@ -18,20 +18,30 @@ from pit_crew.lanes.analysis.workflow import StepSpec, Workflow
 SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
 TARGET_SHARD_SECONDS = 30.0  # the brief: tests under 30 seconds per shard
 MAX_SHARDS = 8
+CONFIDENT_RUNS = 20  # runs needed before the timing estimate is trusted
 TEST_STEP = re.compile(
     r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test|tox|nox|ctest)\b",
     re.IGNORECASE,
 )
-_WRAPPERS = frozenset({"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"})
+_WRAPPERS = frozenset(
+    {"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"}  # runners
+    | {"sudo", "env", "time", "nice", "nohup", "xargs"}  # prefixes that run the command that follows
+)
 _STATIC_TOOLS = frozenset(
     {"mypy", "ruff", "pyright", "tsc", "eslint", "flake8", "black", "isort", "pylint", "prettier", "biome"}
 )  # linters and type checkers take `tests/` as a path to read, not a suite to run
 _NON_TEST_COMMANDS = _STATIC_TOOLS | frozenset(
-    {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir"}
-)
+    {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir", "gh"}
+)  # `gh` downloads artifacts and cuts releases; it never runs a suite
+_UPLOAD_COMMANDS = frozenset({"codecov", "coveralls"})
+_UPLOAD_PREFIXES = ("upload", "publish")  # `upload-results.sh`, `publish.sh`: they ship results, not run tests
+_UPLOAD_PARTS = ("-upload", "_upload", "-publish", "_publish")  # `junit-upload`, `ci_publish`
+_QUOTES = ("'", '"')
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
+_SHARD_FLAGS = frozenset({"--shard", "--splits", "--group", "--num-shards", "--shard-id", "--partition"})
+_SHARD_ENV_VARS = ("CI_NODE_INDEX", "CI_NODE_TOTAL", "SHARD_INDEX", "SPLIT_INDEX")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
 
@@ -50,17 +60,35 @@ def _is_assignment(token: str) -> bool:
     )
 
 
-def _first_command(segment: str) -> str:
-    """The command word of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
+def _unquote(token: str) -> str:
+    """Strip one level of matching surrounding quotes."""
+    if token[:1] in _QUOTES and len(token) > 1 and token[-1] == token[0]:
+        return token[1:-1]
+    return token
+
+
+def _first_token(segment: str) -> str:
+    """The command token of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
 
     A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
     """
-    for token in segment.split():
+    for raw in segment.split():
+        token = _unquote(raw)
         if token in _WRAPPERS or token.startswith("-") or _is_assignment(token):
             continue
-        word = _WORD.match(token)
-        return word.group() if word is not None else token
+        return token
     return ""
+
+
+def _word(token: str) -> str:
+    """The token's leading word characters, or the whole token when it does not start with one."""
+    match = _WORD.match(token)
+    return match.group() if match is not None else token
+
+
+def _first_command(segment: str) -> str:
+    """The command word of a shell segment (see `_first_token`)."""
+    return _word(_first_token(segment))
 
 
 def _is_static_check(segment: str) -> bool:
@@ -68,9 +96,39 @@ def _is_static_check(segment: str) -> bool:
     return _first_command(segment) in _STATIC_TOOLS
 
 
+def _is_upload_tool(token: str) -> bool:
+    """Whether the command token's basename (past the last `/`) is itself an upload/publish tool.
+
+    Only the basename counts, so `python tests/test_upload.py` and `./scripts/test-publish.sh`, which are
+    tests living in a path with the word, stay tests. A basename starting with `test` is such a test too.
+    """
+    base = token.rpartition("/")[2].lower()
+    if _word(base) in _UPLOAD_COMMANDS:
+        return True
+    if base.startswith("test"):
+        return False
+    return base.startswith(_UPLOAD_PREFIXES) or any(part in base for part in _UPLOAD_PARTS)
+
+
 def _is_non_test_command(segment: str) -> bool:
     """Whether the segment's command is a static check or a file-moving/printing tool, never a test runner."""
-    return _first_command(segment) in _NON_TEST_COMMANDS
+    return _first_command(segment) in _NON_TEST_COMMANDS or _is_upload_tool(_first_token(segment))
+
+
+def _step_is_sharded(step: StepSpec) -> bool:
+    """Whether the step's own command already shards: a split flag, or a CI node/shard index variable.
+
+    `pytest -n` / `--numprocesses` (xdist) is parallel, not sharded, so it only counts next to a split flag,
+    which is already enough on its own.
+    """
+    text = f"{step.run or ''}\n{step.env}"
+    if any(var in text for var in _SHARD_ENV_VARS):
+        return True
+    for raw in (step.run or "").split():
+        flag = _unquote(raw).partition("=")[0]
+        if flag in _SHARD_FLAGS:
+            return True
+    return False
 
 
 def _runs_tests(step: StepSpec) -> bool:
@@ -101,7 +159,7 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
         for step, occurrence in zip(spec.steps, step_occurrences(spec.steps), strict=True):
             if is_setup_step(step.name):
                 continue
-            if not _runs_tests(step):
+            if not _runs_tests(step) or _step_is_sharded(step):
                 continue
             timing = step_profile(profile, job_id, step, occurrence)
             if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:
@@ -130,7 +188,7 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
                         "max_saving_seconds": measured.max_saving_seconds,
                         "runs_sampled": timing.samples,
                     },
-                    confidence=0.6,
+                    confidence=0.6 if profile.runs_analyzed >= CONFIDENT_RUNS else 0.4,
                     risk="low",
                 )
             )
