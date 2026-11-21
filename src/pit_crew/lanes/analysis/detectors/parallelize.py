@@ -14,7 +14,9 @@ _TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
 
 def _trivial_run(run: str) -> bool:
     lines = [line.strip() for line in run.splitlines()]
-    return all(line.split(maxsplit=1)[0] in _TRIVIAL_COMMANDS for line in lines if line and not line.startswith("#"))
+    return all(
+        line.split(maxsplit=1)[0].lower() in _TRIVIAL_COMMANDS for line in lines if line and not line.startswith("#")
+    )
 
 
 def _only_waits(job: JobSpec) -> bool:

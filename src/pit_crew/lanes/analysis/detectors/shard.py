@@ -14,20 +14,34 @@ MAX_SHARDS = 8
 TEST_STEP = re.compile(
     r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test)\b", re.IGNORECASE
 )
-STATIC_CHECK = re.compile(
-    r"(?:(?:uv|poetry|pipenv|npx|pnpm|yarn|python3?|-m|run|exec|dlx|--?[\w-]+|\S+=\S+)\s+)*"
-    r"(?:mypy|ruff|pyright|tsc|eslint|flake8|black|isort|pylint|prettier|biome)\b"
+_WRAPPERS = frozenset({"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"})
+_STATIC_TOOLS = frozenset(
+    {"mypy", "ruff", "pyright", "tsc", "eslint", "flake8", "black", "isort", "pylint", "prettier", "biome"}
 )  # linters and type checkers take `tests/` as a path to read, not a suite to run
+_WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
+
+
+def _is_static_check(segment: str) -> bool:
+    """Whether the command, past its wrappers, flags and `KEY=VALUE` assignments, is a linter or type checker.
+
+    A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
+    """
+    for token in segment.split():
+        if token in _WRAPPERS or token.startswith("-") or ("=" in token and not token.startswith("=")):
+            continue
+        word = _WORD.match(token)
+        return word is not None and word.group() in _STATIC_TOOLS
+    return False
 
 
 def _runs_tests(step: StepSpec) -> bool:
     """Whether the step runs a test suite: judged by its command, or by its name when it has none (a `uses:` step)."""
     if step.run is not None:
         segments = (seg.strip() for seg in _SEGMENTS.split(step.run))
-        return any(TEST_STEP.search(seg) and not STATIC_CHECK.match(seg) for seg in segments)
+        return any(TEST_STEP.search(seg) and not _is_static_check(seg) for seg in segments)
     if (step.uses or "").startswith(NO_COMMAND_ACTIONS):
         return False  # moving files around, however the step is named
     return TEST_STEP.search(step.name) is not None

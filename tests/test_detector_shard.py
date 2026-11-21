@@ -1,9 +1,12 @@
 import gzip
 import json
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.detectors.shard import detect_shard_by_timing
@@ -167,3 +170,12 @@ def test_shard_drops_findings_the_job_cap_pushes_under_ten_seconds() -> None:
     prof = profile(wf, parse_runs([{**raw, "id": i} for i in (1, 2, 3)]))
     assert next(j.max_saving_seconds for j in prof.jobs if j.job_id == "test") < 10
     assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize("command", ["a=b=c " * 2000 + "pytest", "=" * 60000 + " pytest"])
+def test_shard_classifies_adversarial_commands_in_linear_time(command: str) -> None:
+    p, wf = build([("Unit", 120.0)], runs={"Unit": f"'{command}'"})
+    start = time.perf_counter()
+    findings = detect_shard_by_timing(p, wf, PATH)
+    assert time.perf_counter() - start < 0.5
+    assert [f.job for f in findings] == ["test"]

@@ -200,6 +200,8 @@ def test_parallelize_keeps_every_gate_form(form: str) -> None:
         "    steps:\n      - run: echo done",
         "    steps:\n      - run: 'true'",
         "    steps:\n      - run: exit 0",
+        "    steps:\n      - run: true",
+        "    steps:\n      - run: Echo ok",
         "    steps:\n      - run: |\n          # wait\n          echo a\n\n          echo b",
         "    steps:\n      - name: nothing to run",
     ],
