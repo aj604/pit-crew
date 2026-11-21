@@ -226,6 +226,7 @@ def test_find_bottlenecks_with_no_analyzed_runs_says_nothing_was_measured(monkey
 
     result = find(InMemoryLedger())
 
-    assert result["uncovered"] == ["No runs analyzed (all excluded or none fetched); nothing was measured."]
+    assert len(result["uncovered"]) == 1
+    assert "No push, workflow_dispatch, schedule or merge_group runs were found" in result["uncovered"][0]
     assert result["profile_summary"]["base_sha"] == ""
     assert result["findings"] == []

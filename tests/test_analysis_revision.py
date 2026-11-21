@@ -277,7 +277,7 @@ def test_events_that_execute_the_workflow_at_head_sha_are_trusted(monkeypatch: p
 
 
 @pytest.mark.usefixtures("checkout")
-def test_empty_history_says_neither_the_event_nor_the_revision_note(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_empty_history_gives_the_trusted_runs_note_and_no_revision_note(monkeypatch: pytest.MonkeyPatch) -> None:
     patch_history(monkeypatch, [], {})
 
     result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
@@ -286,7 +286,7 @@ def test_empty_history_says_neither_the_event_nor_the_revision_note(monkeypatch:
     assert result["profile_summary"]["base_sha"] == ""
     assert result["profile_summary"]["runs_excluded_event"] == 0
     assert result["profile_summary"]["runs_excluded_revision"] == 0
-    assert result["uncovered"] == ["No runs analyzed (all excluded or none fetched); nothing was measured."]
+    assert "No push, workflow_dispatch, schedule or merge_group runs were found" in result["uncovered"][0]
 
 
 @pytest.mark.usefixtures("checkout")

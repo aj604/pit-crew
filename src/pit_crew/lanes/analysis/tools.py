@@ -250,9 +250,8 @@ _NO_MATCHING_REVISION = (
 
 _NO_TRUSTED_EVENT_RUNS = (
     "No push, workflow_dispatch, schedule or merge_group runs were found. Pull-request and other runs "
-    "cannot be matched to the checkout's workflow file: pull_request runs execute the merge commit's "
-    "workflow and pull_request_target the base branch's. "
-    "Profile the default branch (`branch=<default>`) or runs from `push` / `workflow_dispatch`."
+    "cannot be matched to the checkout's workflow file; profile the default branch (branch=<default>) "
+    "or push/workflow_dispatch runs."
 )
 
 
@@ -303,7 +302,7 @@ def find_bottlenecks(
     path = f".github/workflows/{workflow}"
     seen = recorded_keys(ledger, repo)
     no_match = profiled.matched == 0 and profiled.excluded > 0
-    only_other_events = profiled.fetched > 0 and profiled.excluded_event == profiled.fetched
+    only_other_events = profiled.excluded_event == profiled.fetched  # includes nothing fetched at all
     found = (
         []
         if no_match or only_other_events
