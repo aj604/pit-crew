@@ -3,16 +3,46 @@
 ``FakeGitHubClient`` models state rather than replaying scripted responses, so seeding flows
 (provisioning, baseline runs, and later red-to-green bug pairs) can be checked end to end offline.
 Blob SHAs are real git-blob hashes, so workflow-hash assertions mean what they say.
+
+Moving ``main`` starts a push run whose job conclusions come from ``ci`` (by default
+:func:`template_ci`, a model of the template's ``ci.yml`` that ``test_benchmark_target`` checks
+against the real job commands).
 """
 
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from pit_crew.benchmark_seeder import DISPATCH_EVENT, WorkflowRunInfo, git_blob_sha
+from pit_crew.benchmark_seeder import BUG_PAIRS, DISPATCH_EVENT, PUSH_EVENT, WorkflowRunInfo, git_blob_sha
 
 RunOutcome = Callable[["FakeRun"], str]
 """Decides a dispatched run's conclusion when it completes (``"success"``, ``"failure"``...)."""
+
+PushCI = Callable[[Mapping[str, bytes]], dict[str, str]]
+"""Job display name to conclusion for a push run of a commit with these files."""
+
+CI_JOBS = ("Lint", "Typecheck", "Unit test", "UI check", "Smoke test")
+_GREEN = dict.fromkeys(CI_JOBS, "success")
+
+TEMPLATE_CI: dict[str, dict[str, str]] = {
+    "clean": _GREEN,
+    # Lint fails, so every job that needs it is skipped.
+    "b1": {**dict.fromkeys(CI_JOBS, "skipped"), "Lint": "failure"},
+    # Typecheck fails, so Unit test (which needs it) is skipped.
+    "b2": {**_GREEN, "Typecheck": "failure", "Unit test": "skipped"},
+    "b3": {**_GREEN, "Unit test": "failure"},
+    # The badge bug also trips tests/unit/test_ui_check.py and the e2e suite Smoke test reruns.
+    "b4": {**_GREEN, "UI check": "failure", "Unit test": "failure", "Smoke test": "failure"},
+}
+"""What the template's ``ci.yml`` concludes per job on c0 (``clean``) and with each bug applied."""
+
+
+def template_ci(files: Mapping[str, bytes]) -> dict[str, str]:
+    """The template's CI job conclusions for a commit: the row of the bug it carries, else ``clean``."""
+    for pair in BUG_PAIRS:
+        if pair.new.encode() in files.get(pair.path, b""):
+            return dict(TEMPLATE_CI[pair.key])
+    return dict(TEMPLATE_CI["clean"])
 
 
 @dataclass
@@ -33,6 +63,7 @@ class FakeRun:
     status: str = "queued"
     conclusion: str | None = None
     polls: int = 0
+    jobs: dict[str, str] = field(default_factory=dict)
 
     def info(self) -> WorkflowRunInfo:
         return WorkflowRunInfo(
@@ -65,6 +96,8 @@ class FakeGitHubClient:
     writes: list[tuple[str, ...]] = field(default_factory=list)
     filter_runs: bool = True
     """When false, ``list_workflow_runs`` ignores its filters, like a sloppy API page would."""
+    ci: PushCI | None = template_ci
+    """Job conclusions of the push run moving ``main`` starts; ``None`` starts no push runs."""
     _next_run: int = 1000
     _hidden: list[tuple[str, FakeRun, int]] = field(default_factory=list)
 
@@ -149,9 +182,14 @@ class FakeGitHubClient:
         return sha
 
     def set_ref(self, repo: str, branch: str, sha: str) -> None:
-        assert sha in self.repos[repo].commits
+        state = self.repos[repo]
+        assert sha in state.commits
         self.writes.append(("set_ref", repo, branch, sha))
-        self.repos[repo].refs[branch] = sha
+        state.refs[branch] = sha
+        path = ".github/workflows/ci.yml"
+        if self.ci is not None and branch == "main" and path in state.commits[sha].files:
+            run = FakeRun(self._run_id(), sha, branch, PUSH_EVENT, path, jobs=self.ci(state.commits[sha].files))
+            self._hidden.append((repo, run, self.visible_after))
 
     def set_default_branch(self, repo: str, branch: str) -> None:
         assert branch in self.repos[repo].refs
@@ -177,6 +215,22 @@ class FakeGitHubClient:
             or (r.path.split("@", 1)[0] == path and r.head_branch == branch and r.event == event)
         ]
 
+    def list_run_jobs(self, repo: str, run_id: int) -> dict[str, str | None]:
+        (run,) = [r for r in self.repos[repo].runs if r.id == run_id]
+        if run.status != "completed":
+            return dict.fromkeys(run.jobs)
+        return dict(run.jobs)
+
+    def list_commits(self, repo: str, branch: str) -> list[tuple[str, str]]:
+        state = self.repos[repo]
+        history: list[tuple[str, str]] = []
+        sha: str | None = state.refs[branch]
+        while sha is not None:
+            commit = state.commits[sha]
+            history.append((sha, commit.message))
+            sha = commit.parents[0] if commit.parents else None
+        return history
+
     # --- internals --------------------------------------------------------------------------
 
     def _advance(self, repo: str) -> None:
@@ -190,13 +244,18 @@ class FakeGitHubClient:
                 self.repos[repo].runs.append(run)
         self._hidden = still_hidden
         for run in self.repos[repo].runs:
-            if run.status == "completed" or run.event != DISPATCH_EVENT:
+            if run.status == "completed":
                 continue
             if run.polls >= self.complete_after:
-                run.status, run.conclusion = "completed", self.outcome(run)
+                run.status, run.conclusion = "completed", self._conclude(run)
             else:
                 run.status = "in_progress"
                 run.polls += 1
+
+    def _conclude(self, run: FakeRun) -> str:
+        if run.event == PUSH_EVENT and run.jobs:
+            return "failure" if "failure" in run.jobs.values() else "success"
+        return self.outcome(run)
 
     def _commit(self, repo: str, files: dict[str, bytes], message: str, parents: list[str]) -> str:
         digest = hashlib.sha1(usedforsecurity=False)
