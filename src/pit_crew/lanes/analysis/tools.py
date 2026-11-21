@@ -28,17 +28,37 @@ def workspace() -> Path:
     return Path(os.environ.get("PIT_CREW_WORKSPACE", "/workspace"))
 
 
-def workflow_path(workflow: str) -> Path:
-    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+def _validate_workflow_name(workflow: str) -> None:
     if not _WORKFLOW_FILE.fullmatch(workflow) or workflow.startswith("."):
         msg = f"workflow must be a file name like ci.yml, got {workflow!r}"
         raise ValueError(msg)
+
+
+def workflow_path(workflow: str) -> Path:
+    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+    _validate_workflow_name(workflow)
     folder = (workspace() / ".github" / "workflows").resolve()
     path = (folder / workflow).resolve()
     if path.parent != folder:  # a symlink pointing out of the folder
         msg = f"workflow {workflow!r} resolves outside .github/workflows"
         raise ValueError(msg)
     return path
+
+
+def _read_workflow_text(
+    repo: str,
+    workflow: str,
+    *,
+    workflow_content: str | None,
+    ref: str | None,
+) -> str:
+    if workflow_content is not None:
+        _validate_workflow_name(workflow)
+        return workflow_content
+    path = workflow_path(workflow)
+    if path.is_file():
+        return path.read_text()
+    return history.fetch_workflow_content(repo, workflow, ref=ref)
 
 
 @tool(
@@ -50,16 +70,27 @@ def workflow_path(workflow: str) -> Path:
             "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
             "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
             "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
+            "workflow_content": {
+                "type": "string",
+                "description": "Full YAML text of .github/workflows/<workflow> from the sandbox (optional)",
+            },
+            "ref": {
+                "type": "string",
+                "description": "Git commit SHA or branch to read the workflow from when no local checkout exists",
+            },
         },
         "required": ["repo", "workflow"],
     },
 )
-def profile_ci(
+def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote sandbox profiling without a host checkout
     ledger: Ledger,  # noqa: ARG001  every tool takes the ledger first
     repo: str,
     workflow: str,
     runs: int = history.DEFAULT_RUNS,
     branch: str | None = None,
+    *,
+    workflow_content: str | None = None,
+    ref: str | None = None,
 ) -> dict[str, Any]:
     """Profile one workflow from its recent successful runs.
 
@@ -73,7 +104,8 @@ def profile_ci(
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    spec = parse_workflow(workflow_path(workflow).read_text())
+    workflow_text = _read_workflow_text(repo, workflow, workflow_content=workflow_content, ref=ref or branch)
+    spec = parse_workflow(workflow_text)
     raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
     return profile(spec, history.parse_runs(raw)).to_dict()
 

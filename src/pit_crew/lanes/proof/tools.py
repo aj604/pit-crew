@@ -40,6 +40,11 @@ class InvalidReplayPlanError(ValueError):
         """Build the error for a mutation without a relative path and new contents."""
         return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
 
+    @classmethod
+    def disallowed_mutation_path(cls, path: str) -> "InvalidReplayPlanError":
+        """Build the error for a mutation targeting workflow or GitHub configuration files."""
+        return cls(f"mutations may not modify .github files, got path {path!r}")
+
 
 def pick_replays(red: Iterable[RedCommit], touched: Iterable[Check] | None, limit: int = MAX_REPLAYS) -> list[str]:
     """Return bugs the touched checks caught, taking turns between checks so each gets coverage.
@@ -150,9 +155,12 @@ def plan_replays(
 
 def _mutation_case(mutation: Mapping[str, str]) -> BugCase:
     path, content = mutation.get("path", ""), mutation.get("content", "")
+    parts = path.split("/")
     # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
-    if not content or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+    if not content or "\\" in path or any(part in {"", ".", ".."} for part in parts):
         raise InvalidReplayPlanError.bad_mutation(path)
+    if parts[0].lower() == ".github":
+        raise InvalidReplayPlanError.disallowed_mutation_path(path)
     return BugCase(
         kind="mutation", mutated_files={path: content}, reason=mutation.get("reason") or "synthetic mutation"
     )

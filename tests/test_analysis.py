@@ -1,3 +1,4 @@
+import base64
 import gzip
 import json
 from collections.abc import Sequence
@@ -478,3 +479,69 @@ def test_profile_ci_rejects_a_workflow_symlinked_out_of_the_folder(
     build_request("analysis", "")
     with pytest.raises(ValueError, match="outside"):
         tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml"})
+
+
+def test_profile_ci_accepts_workflow_content_without_host_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    raw = fastapi_raw()
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(history, "fetch_workflow_content", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci",
+        InMemoryLedger(),
+        {
+            "repo": "fastapi/fastapi",
+            "workflow": "test.yml",
+            "workflow_content": (FIXTURES / "fastapi" / "test.yml").read_text(),
+        },
+    )
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def test_profile_ci_falls_back_to_github_contents_without_host_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    raw = fastapi_raw()
+    workflow_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    fetched: list[tuple[str, str, str | None]] = []
+
+    def fake_fetch_content(repo: str, workflow: str, *, ref: str | None = None) -> str:
+        fetched.append((repo, workflow, ref))
+        return workflow_text
+
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(history, "fetch_workflow_content", fake_fetch_content)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci",
+        InMemoryLedger(),
+        {"repo": "fastapi/fastapi", "workflow": "test.yml", "ref": "deadbeef"},
+    )
+    assert fetched == [("fastapi/fastapi", "test.yml", "deadbeef")]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def test_fetch_workflow_content_decodes_base64_and_validates_payload() -> None:
+    encoded = base64.b64encode(WORKFLOW.encode("utf-8")).decode("ascii")
+    urls: list[str] = []
+
+    def getter(url: str) -> tuple[Any, str | None]:
+        urls.append(url)
+        return {"encoding": "base64", "content": encoded}, None
+
+    assert history.fetch_workflow_content("o/r", "ci.yml", ref="abc123", get=getter) == WORKFLOW
+    assert urls == ["https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml?ref=abc123"]
+
+    assert history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ({"content": "jobs: {}\n"}, None)) == (
+        "jobs: {}\n"
+    )
+    with pytest.raises(TypeError, match="unexpected response"):
+        history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ([], None))
+    with pytest.raises(TypeError, match="no text content"):
+        history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ({"encoding": "base64"}, None))

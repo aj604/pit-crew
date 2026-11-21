@@ -55,6 +55,10 @@ class _FakeGitHubClient:
             head_branch="main",
         )
 
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        del repo, path, ref
+        return None
+
     def open_pull_request(self, repo: str, *, title: str, body: str, head: str, base: str) -> str:
         url = f"https://github.com/{repo}/pull/{len(self.pull_requests) + 1}"
         self.pull_requests.append({"repo": repo, "title": title, "body": body, "head": head, "base": base})
@@ -103,15 +107,15 @@ class _ScriptedLaneRunner:
         ledger: Ledger | None = None,
         *,
         repo: str | None = None,
-    ) -> None:
+    ) -> object:
         context = _parse_task_context(task)
         self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
         if ledger is None:
-            return
+            return None
         if lane == "analysis":
             if self._on_analysis is not None:
                 self._on_analysis(ledger, context)
-            return
+            return None
         if lane == "optimizer":
             hyp_id = str(context["hypothesis"]["id"])
             base_sha = str(context["base_sha"])
@@ -128,10 +132,11 @@ class _ScriptedLaneRunner:
                     changed_files=changed_files,
                 )
             )
-            return
+            return None
         if lane == "proof":
             cand_id = str(context["candidate"]["id"])
             ledger.add(ReplayPlan(id=f"plan-{cand_id}", candidate_id=cand_id, bug_shas=("bug-sha-1",)))
+        return None
 
 
 class _ControlledEvidenceDispatcher(Dispatcher):
@@ -504,3 +509,122 @@ def test_run_until_sla_holds_base_sha_after_disallowed_path_rejection() -> None:
     assert verdicts[1].keep is True
     assert verdicts[1].sla_met is True
     assert dispatcher.evidence_base_shas == [("cand-h2", "sha-default")]
+
+
+def test_run_until_sla_does_not_stop_early_when_secondary_workflow_meets_sla() -> None:
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    ledger.add(
+        Hypothesis(
+            id="h-lint",
+            repo=repo,
+            description="Speed up lint workflow",
+            skill="dep-cache",
+            expected_savings_seconds=100.0,
+            workflow_path=".github/workflows/lint.yml",
+        )
+    )
+    ledger.add(
+        Hypothesis(
+            id="h-ci",
+            repo=repo,
+            description="Speed up main CI workflow",
+            skill="shard-by-timing",
+            expected_savings_seconds=80.0,
+            workflow_path=".github/workflows/ci.yml",
+        )
+    )
+    ledger.add(
+        Hypothesis(
+            id="h-extra",
+            repo=repo,
+            description="Follow-up tweak",
+            skill="dedupe-jobs",
+            expected_savings_seconds=20.0,
+            workflow_path=".github/workflows/ci.yml",
+        )
+    )
+
+    github = _FakeGitHubClient({repo: "sha-default"})
+    runner = _ScriptedLaneRunner()
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=github,
+        lane_runner=runner,
+        evidence_by_candidate={
+            # Secondary workflow lint.yml meets SLA (45s <= 60s), but configured target ci.yml has not!
+            "cand-h-lint": _EvidenceSpec(
+                baseline_seconds=(75.0, 76.0, 74.0, 77.0, 75.0),
+                candidate_seconds=(45.0, 46.0, 44.0, 47.0, 45.0),
+            ),
+            # Configured target ci.yml meets SLA (50s <= 60s) -> now loop should stop before h-extra.
+            "cand-h-ci": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+            "cand-h-extra": _EvidenceSpec(
+                baseline_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+                candidate_seconds=(35.0, 36.0, 34.0, 37.0, 35.0),
+            ),
+        },
+        config=DispatcherConfig(workflow_file="ci.yml", max_compounding_cycles=5),
+    )
+
+    verdicts = dispatcher.run_until_sla(repo)
+
+    assert [v.candidate_id for v in verdicts] == ["cand-h-lint", "cand-h-ci"]
+    assert all(v.keep and v.sla_met for v in verdicts)
+    assert dispatcher.evidence_base_shas == [
+        ("cand-h-lint", "sha-default"),
+        ("cand-h-ci", "head-h-lint"),
+    ]
+
+
+def test_run_until_sla_advances_past_declined_hypothesis() -> None:
+    @dataclass(frozen=True)
+    class _Completed:
+        status: str = "completed"
+
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    _seed_hypotheses(ledger, repo, [("h-decline", 120.0), ("h-viable", 60.0)])
+
+    class _DecliningRunner(_ScriptedLaneRunner):
+        @override
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            context = _parse_task_context(task)
+            if lane == "optimizer" and context["hypothesis"]["id"] == "h-decline":
+                self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
+                return _Completed()
+            super().__call__(lane, task, ledger, repo=repo)
+            return _Completed()
+
+    github = _FakeGitHubClient({repo: "sha-default"})
+    runner = _DecliningRunner()
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=github,
+        lane_runner=runner,
+        evidence_by_candidate={
+            "cand-h-viable": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+        },
+        config=DispatcherConfig(max_compounding_cycles=5),
+    )
+
+    verdicts = dispatcher.run_until_sla(repo)
+
+    assert [v.candidate_id for v in verdicts] == ["cand-h-viable"]
+    assert verdicts[0].keep is True
+    assert verdicts[0].sla_met is True
+    optimizer_hyp_ids = [c.context["hypothesis"]["id"] for c in runner.calls if c.lane == "optimizer"]
+    assert optimizer_hyp_ids == ["h-decline", "h-viable"]

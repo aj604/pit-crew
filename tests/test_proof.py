@@ -330,6 +330,18 @@ def test_a_plan_of_only_mutations_is_valid(ledger_and_candidate: tuple[InMemoryL
         ({"mutations": [{"path": "src//a.py", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
+        (
+            {"mutations": [{"path": ".github/workflows/ci.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
+        (
+            {"mutations": [{"path": ".github/actions/setup/action.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
+        (
+            {"mutations": [{"path": ".GITHUB/workflows/ci.yml", "content": "name: evil\n", "reason": "r"}]},
+            r"may not modify \.github files",
+        ),
     ],
 )
 def test_plan_replays_refuses_a_plan_that_proves_nothing(

@@ -8,7 +8,8 @@ description: Find where a repository's CI time goes and record each bottleneck a
 Input: a repository. Output: hypotheses, most valuable first.
 
 1. Read the workflows under `.github/workflows/`, then call `profile_ci` for each workflow
-   that runs on pull requests.
+   that runs on pull requests, passing `workflow_content` (and `ref` when profiling a specific
+   base commit) so the host profiler does not need a local checkout.
 2. Work from the critical path. A job's `max_saving_seconds` is the most wall-clock time any
    change to it can save; a job with 0 is off the critical path, so do not propose speeding it
    up. `expected_savings_seconds` must never exceed it.

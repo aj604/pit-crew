@@ -7,6 +7,7 @@ orchestration, replay overlays, evidence collection, and compounding loop to be
 developed and tested completely offline without network calls or secrets.
 """
 
+import base64
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -26,6 +27,7 @@ API_VERSION = "2022-11-28"
 USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
+_HTTP_NOT_FOUND = 404
 
 
 def _utc_now() -> datetime:
@@ -97,6 +99,10 @@ class GitHubClient(Protocol):
 
     def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
         """Fetch status, conclusion, and timing for workflow run ``run_id`` in ``repo``."""
+        ...
+
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        """Return UTF-8 text of ``path`` at ``ref`` in ``repo``, or ``None`` if absent."""
         ...
 
     def open_pull_request(
@@ -326,6 +332,29 @@ class HttpxGitHubClient:
             head_branch=_optional_str(data, "head_branch") or "",
         )
 
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        """Return UTF-8 text of ``path`` at ``ref`` in ``repo``, or ``None`` if absent."""
+        repo_path = _repo_path(repo)
+        content_path = _content_path(path)
+        response = self._client.request(
+            "GET",
+            f"{self._base_url}/repos/{repo_path}/contents/{content_path}",
+            headers=self._headers,
+            params={"ref": ref},
+        )
+        if response.status_code == _HTTP_NOT_FOUND:
+            return None
+        response.raise_for_status()
+        data = _decode_json_object(response)
+        raw_content = _require_str(data, "content")
+        encoding = _optional_str(data, "encoding")
+        if encoding is None or encoding == "none":
+            return raw_content
+        if encoding != "base64":
+            msg = f"Unsupported content encoding {encoding!r} for {repo}:{path}@{ref}."
+            raise ValueError(msg)
+        return base64.b64decode(raw_content).decode("utf-8")
+
     def open_pull_request(
         self,
         repo: str,
@@ -384,6 +413,15 @@ def _repo_path(repo: str) -> str:
 
 def _branch_path(branch: str) -> str:
     return quote(branch, safe="/")
+
+
+def _content_path(path: str) -> str:
+    stripped = path.strip("/")
+    parts = stripped.split("/")
+    if not stripped or "\\" in path or any(part in {"", ".", ".."} for part in parts):
+        msg = f"Invalid repository file path {path!r}."
+        raise ValueError(msg)
+    return "/".join(quote(part, safe="") for part in parts)
 
 
 def _workflow_path(workflow: str) -> str:
