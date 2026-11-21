@@ -1,11 +1,15 @@
+import json
 from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import partial
 
 import pytest
 
+from pit_crew import managed_agent, rater
 from pit_crew.contracts import Candidate
 from pit_crew.lanes.proof.miner import JobRun
 from pit_crew.ledger import InMemoryLedger, Ledger
-from pit_crew.proof_bridge import ProofBridge, ProofBridgeError
+from pit_crew.proof_bridge import ProofBridge, ProofBridgeError, ReplayRunPair
 
 BASE_CI = """\
 name: CI
@@ -61,11 +65,14 @@ class FakeProofGitHub:
         self,
         files: dict[tuple[str, str, str], str] | None = None,
         job_runs: Sequence[JobRun] = (),
+        run_outputs: dict[tuple[str, str], bytes | Exception] | None = None,
     ) -> None:
         self._files = dict(files or {})
         self._job_runs = list(job_runs)
+        self._run_outputs = dict(run_outputs or {})
         self.file_requests: list[tuple[str, str, str]] = []
         self.job_run_requests: list[str] = []
+        self.failure_output_requests: list[tuple[str, str]] = []
 
     def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
         self.file_requests.append((repo, ref, path))
@@ -74,6 +81,35 @@ class FakeProofGitHub:
     def list_workflow_job_runs(self, repo: str) -> Sequence[JobRun]:
         self.job_run_requests.append(repo)
         return list(self._job_runs)
+
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        self.failure_output_requests.append((repo, run_id))
+        result = self._run_outputs[(repo, run_id)]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+@dataclass(frozen=True)
+class _FakeResponse:
+    text: str | None
+
+
+class _FakeModels:
+    def __init__(self, reply: str | Exception) -> None:
+        self._reply = reply
+        self.calls: list[dict[str, object]] = []
+
+    def generate_content(self, **kwargs: object) -> _FakeResponse:
+        self.calls.append(kwargs)
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        return _FakeResponse(text=self._reply)
+
+
+class _FakeModelsClient:
+    def __init__(self, reply: str | Exception) -> None:
+        self.models = _FakeModels(reply)
 
 
 def _job_run(
@@ -273,3 +309,202 @@ def test_errors_on_missing_repo_or_runner() -> None:
 
     with pytest.raises(ProofBridgeError, match="run_lane"):
         bridge.run(candidate, repo="acme/demo")
+
+    with pytest.raises(ProofBridgeError, match="ask callable"):
+        bridge.verify_replay_runs("acme/demo", ())
+
+
+def test_verify_replay_runs_accepts_matching_failure_and_rater_keeps() -> None:
+    repo = "acme/demo"
+    github = FakeProofGitHub(
+        run_outputs={
+            (repo, "run-base-1"): b"baseline-mp4-bytes",
+            (repo, "run-cand-1"): b"candidate-mp4-bytes",
+        }
+    )
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError in test_auth.py::test_token_expiry",
+                "candidate_failure": "AssertionError in test_auth.py::test_token_expiry",
+                "reason": "Both runs fail on the same assertion in test_token_expiry.",
+            }
+        )
+    )
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+    bridge = ProofBridge(github, ask=ask)
+
+    verification = bridge.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="run-base-1",
+                candidate_run_id="run-cand-1",
+            )
+        ],
+    )
+
+    assert verification.bugs_total == 1
+    assert verification.bugs_caught == 1
+    assert verification.replays[0].status == "caught"
+    assert verification.bug_outcomes[0]["status"] == "caught"
+    assert verification.bug_outcomes[0]["same_failure"] is True
+    assert github.failure_output_requests == [(repo, "run-base-1"), (repo, "run-cand-1")]
+    assert len(fake_client.models.calls) == 1
+    assert fake_client.models.calls[0]["model"] == "gemini-4-carbon"
+
+    evidence = verification.to_evidence(
+        candidate_id="cand-1",
+        baseline_seconds=(120.0, 121.0, 119.0, 122.0, 118.0),
+        candidate_seconds=(50.0, 51.0, 49.0, 52.0, 48.0),
+    )
+    verdict = rater.rate(evidence)
+    assert verdict.keep is True
+
+
+def test_verify_replay_runs_rejects_different_failure_fail_closed() -> None:
+    repo = "acme/demo"
+    github = FakeProofGitHub(
+        run_outputs={
+            (repo, "run-base-1"): b"baseline-assertion-failure",
+            (repo, "run-cand-1"): b"candidate-pip-install-crash",
+        }
+    )
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": False,
+                "baseline_failure": "AssertionError in test_auth.py::test_token_expiry",
+                "candidate_failure": "ModuleNotFoundError: No module named 'pytest'",
+                "reason": "Candidate crashed during test setup instead of catching the bug.",
+            }
+        )
+    )
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+    bridge = ProofBridge(github, ask=ask)
+
+    verification = bridge.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="run-base-1",
+                candidate_run_id="run-cand-1",
+            )
+        ],
+    )
+
+    assert verification.bugs_total == 1
+    assert verification.bugs_caught == 0
+    assert verification.replays[0].status == "different failure"
+    assert verification.bug_outcomes[0]["same_failure"] is False
+
+    evidence = verification.to_evidence(
+        candidate_id="cand-2",
+        baseline_seconds=(120.0, 121.0, 119.0, 122.0, 118.0),
+        candidate_seconds=(50.0, 51.0, 49.0, 52.0, 48.0),
+    )
+    verdict = rater.rate(evidence)
+    assert verdict.keep is False
+    assert verdict.reason == "caught 0/1 bugs"
+
+
+@pytest.mark.parametrize(
+    ("run_outputs", "reply"),
+    [
+        (
+            {("acme/demo", "run-base-1"): b"base", ("acme/demo", "run-cand-1"): b"cand"},
+            "not valid json",
+        ),
+        (
+            {("acme/demo", "run-base-1"): b"base", ("acme/demo", "run-cand-1"): b"cand"},
+            RuntimeError("gemini unavailable"),
+        ),
+        (
+            {("acme/demo", "run-base-1"): OSError("log download 404"), ("acme/demo", "run-cand-1"): b"cand"},
+            json.dumps({"same": True, "baseline_failure": "a", "candidate_failure": "a", "reason": "same"}),
+        ),
+    ],
+)
+def test_verify_replay_runs_fails_closed_when_unverified(
+    run_outputs: dict[tuple[str, str], bytes | Exception],
+    reply: str | Exception,
+) -> None:
+    repo = "acme/demo"
+    github = FakeProofGitHub(run_outputs=run_outputs)
+    fake_client = _FakeModelsClient(reply)
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+    bridge = ProofBridge(github)
+
+    verification = bridge.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="run-base-1",
+                candidate_run_id="run-cand-1",
+            )
+        ],
+        ask=ask,
+    )
+
+    assert verification.bugs_total == 1
+    assert verification.bugs_caught == 0
+    assert verification.replays[0].status == "unverified"
+    assert verification.bug_outcomes[0]["same_failure"] is None
+
+    evidence = verification.to_evidence(
+        candidate_id="cand-3",
+        baseline_seconds=(120.0, 121.0, 119.0, 122.0, 118.0),
+        candidate_seconds=(50.0, 51.0, 49.0, 52.0, 48.0),
+    )
+    verdict = rater.rate(evidence)
+    assert verdict.keep is False
+    assert verdict.reason == "caught 0/1 bugs"
+
+
+def test_verify_replay_runs_skips_verifier_when_not_both_failed() -> None:
+    repo = "acme/demo"
+    github = FakeProofGitHub()
+    fake_client = _FakeModelsClient(AssertionError("verifier should not be called"))
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+    bridge = ProofBridge(github, ask=ask)
+
+    verification = bridge.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="1111aaaa",
+                check="CI/Unit Tests",
+                baseline_conclusion="success",
+                candidate_conclusion="failure",
+                baseline_run_id="run-base-1",
+                candidate_run_id="run-cand-1",
+            ),
+            ReplayRunPair(
+                sha="2222bbbb",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="success",
+                baseline_run_id="run-base-2",
+                candidate_run_id="run-cand-2",
+            ),
+        ],
+    )
+
+    assert [r.status for r in verification.replays] == ["not a bug", "missed"]
+    assert verification.bugs_total == 1
+    assert verification.bugs_caught == 0
+    assert github.failure_output_requests == []
+    assert fake_client.models.calls == []

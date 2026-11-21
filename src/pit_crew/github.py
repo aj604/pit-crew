@@ -33,6 +33,10 @@ class ProofHistoryClient(Protocol):
         """Return recent GitHub Actions job run attempts for ``repo``."""
         ...
 
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        """Return failed job logs or recorded artifact bytes for workflow run ``run_id`` in ``repo``."""
+        ...
+
 
 class GitHubClient(CandidatePublisherClient, ProofHistoryClient, Protocol):
     """Every GitHub operation host code uses. Grows as the Dispatcher needs more (workflow runs, logs)."""

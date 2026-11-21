@@ -6,14 +6,17 @@ from GitHub Actions job runs, computes ``required_replays`` and ``uncovered_chec
 them into the Proof lane task prompt.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
 from typing import Protocol
 
-from pit_crew.contracts import Candidate
+from pit_crew.contracts import Candidate, Evidence
 from pit_crew.github import ProofHistoryClient
 from pit_crew.lanes.proof.checks import Check, FileChange, touched_checks
 from pit_crew.lanes.proof.miner import RedCommit, flaky_checks, red_commits
 from pit_crew.lanes.proof.tools import MAX_REPLAYS, pick_replays, uncovered_checks
+from pit_crew.lanes.proof.verify import AskModel, Replay, compare_failures, tally, verify_replays
 from pit_crew.ledger import Ledger
 
 
@@ -30,6 +33,11 @@ class ProofBridgeError(ValueError):
         """Build error when ``run()`` is called without a configured ``run_lane`` callable."""
         return cls("ProofBridge.run() requires a run_lane callable")
 
+    @classmethod
+    def missing_verifier(cls) -> "ProofBridgeError":
+        """Build error when ``verify_replay_runs()`` is called without a multimodal ``ask`` callable."""
+        return cls("ProofBridge.verify_replay_runs() requires an ask callable (e.g. managed_agent.ask_multimodal)")
+
 
 class LaneRunner(Protocol):
     """Callable that invokes a lane with a task prompt (e.g. ``managed_agent.run_lane``)."""
@@ -37,6 +45,47 @@ class LaneRunner(Protocol):
     def __call__(self, lane: str, task: str, *, repo: str = "", ledger: Ledger | None = None) -> object:
         """Execute ``lane`` with ``task`` and return the lane interaction/result."""
         ...
+
+
+@dataclass(frozen=True)
+class ReplayRunPair:
+    """One bug replay pair measured on baseline and candidate workflow runs."""
+
+    sha: str
+    check: str
+    baseline_conclusion: str
+    candidate_conclusion: str
+    baseline_run_id: str
+    candidate_run_id: str
+
+
+@dataclass(frozen=True)
+class ReplayVerification:
+    """Verified replay outcomes ready to populate ``Evidence``."""
+
+    replays: tuple[Replay, ...]
+    bugs_total: int
+    bugs_caught: int
+    bug_outcomes: tuple[dict[str, object], ...]
+
+    def to_evidence(
+        self,
+        candidate_id: str,
+        baseline_seconds: tuple[float, ...],
+        candidate_seconds: tuple[float, ...],
+        *,
+        run_urls: tuple[str, ...] = (),
+    ) -> Evidence:
+        """Build a ``contracts.Evidence`` record from these verified replay outcomes."""
+        return Evidence(
+            candidate_id=candidate_id,
+            baseline_seconds=baseline_seconds,
+            candidate_seconds=candidate_seconds,
+            bugs_total=self.bugs_total,
+            bugs_caught=self.bugs_caught,
+            run_urls=run_urls,
+            bug_outcomes=self.bug_outcomes,
+        )
 
 
 @dataclass(frozen=True)
@@ -62,11 +111,13 @@ class ProofBridge:
         run_lane: LaneRunner | None = None,
         *,
         replay_limit: int = MAX_REPLAYS,
+        ask: AskModel | None = None,
     ) -> None:
-        """Create a bridge using ``github`` for history/base files and optional ``run_lane``."""
+        """Create a bridge using ``github`` for history/base files, optional ``run_lane``, and optional ``ask``."""
         self._github = github
         self._run_lane = run_lane
         self._replay_limit = replay_limit
+        self._ask = ask
 
     def prepare_context(
         self,
@@ -165,6 +216,49 @@ class ProofBridge:
         prompt = self.build_prompt(context, extra_instructions=extra_instructions)
         result = self._run_lane("proof", prompt, repo=context.repo, ledger=ledger)
         return context, result
+
+    def verify_replay_runs(
+        self,
+        repo: str,
+        runs: Iterable[ReplayRunPair],
+        *,
+        ask: AskModel | None = None,
+    ) -> ReplayVerification:
+        """Verify failure equivalence for replay pairs where both baseline and candidate failed.
+
+        Fetches failed run output (logs / artifact bytes) from GitHub for each failing pair and
+        delegates multimodal comparison to ``compare_failures(..., ask=ask)``. Any ``"different failure"``
+        or ``"unverified"`` outcome fails closed and does not increment ``bugs_caught``.
+        """
+        verifier = ask if ask is not None else self._ask
+        if verifier is None:
+            raise ProofBridgeError.missing_verifier()
+
+        raw_replays = [
+            Replay(
+                sha=pair.sha,
+                check=pair.check,
+                baseline_failed=pair.baseline_conclusion == "failure",
+                candidate_failed=pair.candidate_conclusion == "failure",
+                baseline_video=pair.baseline_run_id,
+                candidate_video=pair.candidate_run_id,
+            )
+            for pair in runs
+        ]
+        verified = tuple(
+            verify_replays(
+                raw_replays,
+                load=lambda run_id: self._github.get_run_failure_output(repo, run_id),
+                compare=partial(compare_failures, ask=verifier),
+            )
+        )
+        bugs_total, bugs_caught = tally(verified)
+        return ReplayVerification(
+            replays=verified,
+            bugs_total=bugs_total,
+            bugs_caught=bugs_caught,
+            bug_outcomes=tuple(replay.as_outcome() for replay in verified),
+        )
 
     def _compute_touched_checks(
         self,
