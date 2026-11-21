@@ -1,11 +1,15 @@
 import asyncio
+import base64
 import io
+import json
 import os
 import tarfile
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -211,6 +215,67 @@ def test_materialize_yields_the_checkout_and_deletes_it_after(tmp_path: Path) ->
 
     assert urls == ["https://api.github.com/repos/Org/Repo/tarball/abc123"]
     assert not temp_root.exists()
+
+
+def test_materialize_backfills_workflows_omitted_by_archive(tmp_path: Path) -> None:
+    """When .gitattributes export-ignore omits .github/workflows from the tarball, fetch them via Contents API."""
+    archive = _archive(
+        tmp_path / "no-workflows.tgz",
+        _member(TOP, tarfile.DIRTYPE),
+        _member(f"{TOP}/README.md", data=b"hello"),
+    )
+    workflow_yaml = b"name: Tests\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+    urls: list[str] = []
+
+    def download(url: str, dest: Path) -> None:
+        urls.append(url)
+        if "/tarball" in url:
+            dest.write_bytes(archive.read_bytes())
+        elif url.endswith("/contents/.github/workflows?ref=abc123"):
+            listing = [
+                {"type": "file", "name": "tests.yml"},
+                {"type": "file", "name": "README.md"},
+                {"type": "file", "name": "../escape.yml"},
+                {"type": "dir", "name": "nested"},
+            ]
+            dest.write_text(json.dumps(listing), encoding="utf-8")
+        elif url.endswith("/contents/.github/workflows/tests.yml?ref=abc123"):
+            payload = {"encoding": "base64", "content": base64.b64encode(workflow_yaml).decode("ascii")}
+            dest.write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            pytest.fail(f"unexpected URL: {url}")
+
+    with (
+        workspace.materialize("laravel/laravel", "abc123", download=download) as checkout,
+        workspace.use_workspace(checkout),
+    ):
+        assert analysis_tools.workflow_path("tests.yml").read_bytes() == workflow_yaml
+        assert not (checkout / ".github" / "workflows" / "README.md").exists()
+        assert not (checkout / ".github" / "escape.yml").exists()
+
+    assert urls == [
+        "https://api.github.com/repos/laravel/laravel/tarball/abc123",
+        "https://api.github.com/repos/laravel/laravel/contents/.github/workflows?ref=abc123",
+        "https://api.github.com/repos/laravel/laravel/contents/.github/workflows/tests.yml?ref=abc123",
+    ]
+
+
+def test_materialize_ignores_404_when_repo_has_no_workflows(tmp_path: Path) -> None:
+    archive = _archive(
+        tmp_path / "no-workflows.tgz",
+        _member(TOP, tarfile.DIRTYPE),
+        _member(f"{TOP}/README.md", data=b"hello"),
+    )
+
+    def download(url: str, dest: Path) -> None:
+        if "/tarball" in url:
+            dest.write_bytes(archive.read_bytes())
+            return
+        raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
+
+    with workspace.materialize("Org/Repo", download=download) as checkout:
+        assert (checkout / "README.md").read_text() == "hello"
+        assert not (checkout / ".github").exists()
 
 
 def test_materialize_cleans_up_when_extraction_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

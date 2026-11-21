@@ -8,15 +8,20 @@ When no checkout is given, ``materialize`` downloads the repository tarball from
 into a temporary directory, extracts only regular files and directories, and deletes it on exit.
 """
 
+import base64
+import json
 import os
 import re
 import shutil
 import tarfile
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 
 WORKSPACE_ENV = "PIT_CREW_WORKSPACE"
@@ -64,18 +69,41 @@ def use_workspace(path: str | Path) -> Iterator[Path]:
         _ACTIVE.reset(token)
 
 
-def tarball_url(repo: str, ref: str | None = None) -> str:
-    """The GitHub API URL of ``repo``'s tarball at ``ref`` (the default branch when None)."""
+def _normalize_repo(repo: str) -> str:
+    """Validate and normalize ``repo`` to ``owner/name``."""
     name = repo.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
     if not _REPO.fullmatch(name) or ".." in name.split("/"):
         msg = f"repo must look like owner/name, got {repo!r}"
         raise ValueError(msg)
-    if ref is None:
-        return f"{API}/repos/{name}/tarball"
+    return name
+
+
+def _validate_ref(ref: str) -> str:
+    """Validate that ``ref`` is a safe branch, tag, or commit sha."""
     if not _REF.fullmatch(ref) or ".." in ref.split("/"):
         msg = f"ref must be a branch, tag or commit sha, got {ref!r}"
         raise ValueError(msg)
-    return f"{API}/repos/{name}/tarball/{ref}"
+    return ref
+
+
+def tarball_url(repo: str, ref: str | None = None) -> str:
+    """The GitHub API URL of ``repo``'s tarball at ``ref`` (the default branch when None)."""
+    name = _normalize_repo(repo)
+    if ref is None:
+        return f"{API}/repos/{name}/tarball"
+    return f"{API}/repos/{name}/tarball/{_validate_ref(ref)}"
+
+
+def workflows_url(repo: str, ref: str | None = None, filename: str | None = None) -> str:
+    """The GitHub Contents API URL for ``.github/workflows`` (or one workflow file) at ``ref``."""
+    name = _normalize_repo(repo)
+    path = ".github/workflows"
+    if filename is not None:
+        path = f"{path}/{urllib.parse.quote(filename, safe='')}"
+    url = f"{API}/repos/{name}/contents/{path}"
+    if ref is None:
+        return url
+    return f"{url}?ref={urllib.parse.quote(_validate_ref(ref), safe='')}"
 
 
 def http_download(token: str | None) -> Download:
@@ -158,16 +186,82 @@ def safe_extract(archive: Path, dest: Path) -> None:
                 shutil.copyfileobj(source, out)
 
 
+def _has_workflows(checkout: Path) -> bool:
+    """Whether ``checkout/.github/workflows`` already contains at least one workflow YAML file."""
+    workflows_dir = checkout / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return False
+    return any(p.is_file() and p.suffix in {".yml", ".yaml"} for p in workflows_dir.iterdir())
+
+
+def _safe_workflow_filename(name: object) -> str | None:
+    """Return ``name`` if it is a plain ``.yml``/``.yaml`` filename, else None."""
+    if not isinstance(name, str) or not name.endswith((".yml", ".yaml")):
+        return None
+    path = PurePosixPath(name)
+    if path.is_absolute() or len(path.parts) != 1 or path.name in {".", ".."}:
+        return None
+    return name
+
+
+def _fetch_json(fetch: Download, url: str, dest: Path) -> object | None:
+    """Download ``url`` into ``dest``, parse JSON, and remove ``dest``; return None on 404 or non-JSON."""
+    try:
+        fetch(url, dest)
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTPStatus.NOT_FOUND:
+            return None
+        raise
+    try:
+        parsed: object = json.loads(dest.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    else:
+        return parsed
+    finally:
+        dest.unlink(missing_ok=True)
+
+
+def _backfill_workflows(repo: str, ref: str | None, checkout: Path, fetch: Download, tmp: Path) -> None:
+    """Fetch ``.github/workflows/*.yml`` via the GitHub Contents API when the archive omitted them."""
+    entries = _fetch_json(fetch, workflows_url(repo, ref), tmp / "workflows.json")
+    if not isinstance(entries, list):
+        return
+    workflows_dir = checkout / ".github" / "workflows"
+    item_file = tmp / "workflow_item.json"
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        filename = _safe_workflow_filename(entry.get("name"))
+        if filename is None:
+            continue
+        payload = _fetch_json(fetch, workflows_url(repo, ref, filename), item_file)
+        if not isinstance(payload, dict) or payload.get("encoding") != "base64":
+            continue
+        raw_content = payload.get("content")
+        if not isinstance(raw_content, str):
+            continue
+        workflows_dir.mkdir(parents=True, exist_ok=True)
+        (workflows_dir / filename).write_bytes(base64.b64decode(raw_content))
+
+
 @contextmanager
 def materialize(repo: str, ref: str | None = None, *, download: Download | None = None) -> Iterator[Path]:
-    """Download and extract ``repo`` at ``ref`` into a temporary folder, yield it, and delete it after."""
+    """Download and extract ``repo`` at ``ref`` into a temporary folder, yield it, and delete it after.
+
+    If the extracted archive omits ``.github/workflows`` (for example, when ``.gitattributes`` marks
+    ``.github`` with ``export-ignore``), workflow files are backfilled from the GitHub Contents API.
+    """
     url = tarball_url(repo, ref)
     fetch = download or http_download(os.environ.get("GITHUB_TOKEN"))
     with tempfile.TemporaryDirectory(prefix="pit-crew-workspace-") as tmp:
-        archive = Path(tmp) / "repo.tar.gz"
-        checkout = Path(tmp) / "repo"
+        tmp_path = Path(tmp)
+        archive = tmp_path / "repo.tar.gz"
+        checkout = tmp_path / "repo"
         checkout.mkdir()
         fetch(url, archive)
         safe_extract(archive, checkout)
         archive.unlink()
+        if not _has_workflows(checkout):
+            _backfill_workflows(repo, ref, checkout, fetch, tmp_path)
         yield checkout
