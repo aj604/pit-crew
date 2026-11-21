@@ -1,6 +1,6 @@
 """FastAPI HTTP server scaffold for Pit Crew."""
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from fastapi import FastAPI
 
@@ -27,5 +27,10 @@ def create_app(
         """Return service health and active ledger backend."""
         ledger_kind = "sqlite" if isinstance(ledger, SqliteLedger) else "memory"
         return {"status": "ok", "ledger": ledger_kind}
+
+    @app.get("/api/repos/{owner}/{name}/attempts")
+    def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
+        """Return prior optimization attempts for a repository."""
+        return ledger.prior_attempts(f"{owner}/{name}")
 
     return app
