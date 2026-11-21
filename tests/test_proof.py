@@ -430,6 +430,9 @@ def test_plan_replays_merges_duplicate_commit_shas_across_bug_shas_and_commits(
         ({"bug_shas": ["b2b2b2b", "main"]}, "not commit SHAs: main"),
         ({"commits": [{"sha": "main", "expected_checks": ["CI/lint"]}]}, "not commit SHAs: main"),
         ({"commits": [{"sha": 123, "expected_checks": ["CI/lint"]}]}, "not commit SHAs: 123"),
+        ({"commits": [{"sha": "b2b2b2b"}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": None}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": []}]}, "expected_checks"),
         ({"commits": [{"sha": "b2b2b2b", "expected_checks": "CI/lint"}]}, "expected_checks"),
         ({"commits": [{"sha": "b2b2b2b", "expected_checks": [""]}]}, "expected_checks"),
         ({"commits": [{"sha": "b2b2b2b", "expected_checks": [42]}]}, "expected_checks"),
@@ -443,6 +446,14 @@ def test_plan_replays_merges_duplicate_commit_shas_across_bug_shas_and_commits(
         ({"mutations": [{"path": 123, "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
         ({"mutations": [{"path": "a.py", "content": 123, "reason": "r"}]}, "whole mutated file"),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": None}]},
+            "expected_checks",
+        ),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": []}]},
+            "expected_checks",
+        ),
         (
             {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": "CI/lint"}]},
             "expected_checks",
@@ -460,6 +471,17 @@ def test_plan_replays_refuses_a_plan_that_proves_nothing(
     with pytest.raises(InvalidReplayPlanError, match=message):
         tools.call("plan_replays", ledger, {"candidate_id": candidate_id, **arguments})
     assert ledger.all(ReplayPlan) == []
+
+
+def test_plan_replays_schema_requires_non_empty_expected_checks() -> None:
+    build_request("proof", "")
+    (spec,) = [t for t in tools.for_lane("proof") if t.name == "plan_replays"]
+    commits_item = spec.parameters["properties"]["commits"]["items"]
+    mutations_item = spec.parameters["properties"]["mutations"]["items"]
+    assert "expected_checks" in commits_item["required"]
+    assert commits_item["properties"]["expected_checks"]["minItems"] == 1
+    assert "expected_checks" in mutations_item["required"]
+    assert mutations_item["properties"]["expected_checks"]["minItems"] == 1
 
 
 def test_plan_replays_refuses_an_unknown_candidate() -> None:

@@ -43,8 +43,8 @@ class InvalidReplayPlanError(ValueError):
 
     @classmethod
     def bad_expected_checks(cls, value: object) -> "InvalidReplayPlanError":
-        """Build the error for expected_checks that is not a list of non-empty check names."""
-        return cls(f"expected_checks must be a list of non-empty check names, got {value!r}")
+        """Build the error for expected_checks that is not a non-empty list of check names."""
+        return cls(f"expected_checks must be a non-empty list of check names, got {value!r}")
 
 
 def pick_replays(red: Iterable[RedCommit], touched: Iterable[Check] | None, limit: int = MAX_REPLAYS) -> list[str]:
@@ -142,6 +142,7 @@ def propose_mutants(
                         "expected_checks": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "minItems": 1,
                             "description": (
                                 "CI check keys (workflow/job, including id and display-name aliases) "
                                 "expected to fail on this commit"
@@ -164,6 +165,7 @@ def propose_mutants(
                         "expected_checks": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "minItems": 1,
                             "description": (
                                 "CI check keys (workflow/job, including id and display-name aliases) "
                                 "expected to catch this mutation"
@@ -245,18 +247,17 @@ def _mutation_case(mutation: Mapping[str, object]) -> BugCase:
         raise InvalidReplayPlanError.bad_mutation(path)
     raw_reason = mutation.get("reason")
     reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else "synthetic mutation"
+    expected_checks = _parse_expected_checks(mutation["expected_checks"]) if "expected_checks" in mutation else ()
     return BugCase(
         kind="mutation",
         mutated_files={path: content},
         reason=reason,
-        expected_checks=_parse_expected_checks(mutation.get("expected_checks")),
+        expected_checks=expected_checks,
     )
 
 
 def _parse_expected_checks(raw: object) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, str | bytes) or not isinstance(raw, Sequence):
+    if isinstance(raw, str | bytes) or not isinstance(raw, Sequence) or not raw:
         raise InvalidReplayPlanError.bad_expected_checks(raw)
     checks: list[str] = []
     for item in raw:
