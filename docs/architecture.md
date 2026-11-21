@@ -1,5 +1,9 @@
 # Pit Crew Architecture
 
+<p align="center">
+  <img src="../brand/circuit-architecture.svg" alt="Pit Crew Circuit Architecture" width="100%" />
+</p>
+
 Pit Crew is an autonomous CI optimization system with one core rule: **the agent proposes, and deterministic code judges.**
 
 The agent inspects a repository, proposes a single targeted CI optimization, pushes a branch on a fork, and selects historical bugs that must still fail. Deterministic code runs the measurements on GitHub Actions and decides whether the change is kept.
@@ -122,3 +126,17 @@ All cross-lane state is represented by five frozen dataclasses:
 3. **Compounding Pit Stops Toward 60s / 120s SLA (`rater.py`):** Target repo CI goal is **`median <= 60s` and `p95 <= 120s`**. Any candidate achieving `speedup >= 1.05x` (`MIN_SPEEDUP`), `p <= 0.05` (exact permutation up to 10 runs/side, deterministic Monte Carlo above 10, including cold Run #1 across 5 staggered pairs), and `100%` bugs caught is kept (`keep=True`) and promoted as the new `base_sha` until `Verdict.sla_met` is `True`.
 4. **Dual Replay Plan (`BugCase` in `ReplayPlan`):** Supports both historical red SHAs (`kind="commit"`) via 3-way overlay of Candidate files onto `bug_sha` and synthetic mutations (`kind="mutation"`, `mutated_files`) verified to fail Baseline so dud mutations cannot game Rater.
 5. **Runtime, Storage & UI:** Single FastAPI service (`workflow_run` webhooks + live Pit Wall UI + PR SVG/PNG charts) backed by WAL-mode `SqliteLedger` (`ledger.prior_attempts(repo)`, `ledger.latest_kept_candidate(repo)`) and in-process `@tool` gates via the Interactions API `requires_action` loop.
+
+## Master Specifications
+
+The remaining Dispatcher, server, UI, integration, and operations work is specified in [`docs/specs/`](specs/):
+
+| Spec | Document | Scope |
+|---|---|---|
+| 1A | [Core Dispatcher & GitHub Actions Orchestrator](specs/dispatcher-core.md) | Turns `dispatcher.py` into the deterministic cycle engine: timing runs, bug replays, `Evidence`, and `Verdict` follow-up. |
+| 1B | [Webhook Server & Pit Wall API](specs/dispatcher-server.md) | The FastAPI service in `server.py`: `workflow_run` webhooks, triggers, and telemetry endpoints. |
+| 2 | [Pit Wall UI & Telemetry Dashboard](specs/pit-wall-ui.md) | The branded live dashboard for the optimization loop. |
+| 3 | [End-to-End Integration & Live Smoke Harness](specs/e2e-integration.md) | Milestones M1 (offline dry run), M2 (live smoke), and M3 (automated verdict on a fork). |
+| 3B | [Cross-Lane Seam & Event-Driven Runtime Wiring](specs/cross-lane-wiring.md) | Runtime and protocol seams between lanes, `managed_agent.py`, Dispatcher, server, UI, and CLI. |
+| 4A | [Runtime Packaging, Webhook Ingress & Repo Governance](specs/infra-and-ops.md) | Wheel and Docker packaging, webhook registration and tunnels, `CODEOWNERS`, and worktree hygiene. |
+| 4B | [Target Benchmark Repository & Seeded CI History](specs/benchmark-target-repo.md) | The reproducible benchmark fork and seeded CI history used by M2 and M3. |

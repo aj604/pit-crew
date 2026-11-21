@@ -1,12 +1,24 @@
+import asyncio
+import logging
+import queue
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.ledger import InMemoryLedger, Ledger, SqliteLedger
-from pit_crew.server import create_app
+from pit_crew.server import (
+    CYCLE_STAGES,
+    CycleProgressBoard,
+    ProgressCallback,
+    _accepts_on_progress,
+    _run_cycle_task,
+    create_app,
+)
 
 
 class _StubDispatcher:
@@ -367,6 +379,9 @@ def test_repo_status_idle_empty(backend: str, tmp_path: Path) -> None:
         "base_sha": None,
         "latest_verdict": None,
         "sla_met": False,
+        "stage": None,
+        "completed_runs": 0,
+        "total_runs": 0,
     }
 
 
@@ -527,4 +542,597 @@ def test_repo_status_post_verdict_and_base_sha_progression(backend: str, tmp_pat
             "sla_met": True,
         },
         "sla_met": True,
+        "stage": None,
+        "completed_runs": 0,
+        "total_runs": 0,
     }
+
+
+def test_repo_status_rejected_candidate_does_not_skew_sla() -> None:
+    ledger = InMemoryLedger()
+    hyp1 = Hypothesis(
+        id="h1",
+        repo="acme/widget",
+        description="Aggressive shortcut",
+        skill="affected-tests",
+        expected_savings_seconds=40.0,
+        base_sha="sha-base-1",
+    )
+    cand1 = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/shortcut",
+        base_sha="sha-base-1",
+        head_sha="sha-bad",
+        summary="Skipped tests",
+    )
+    verdict1 = Verdict(
+        id="v1",
+        candidate_id="c1",
+        keep=False,
+        speedup=2.0,
+        p_value=0.001,
+        median_seconds=45.0,
+        p95_seconds=50.0,
+        sla_met=True,
+        reason="missed replayed bug",
+    )
+    for rec in (hyp1, cand1, verdict1):
+        ledger.add(rec)
+
+    app = create_app(ledger=ledger)
+    with TestClient(app) as client:
+        resp = client.get("/api/repos/acme/widget/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sla_met"] is False
+    assert body["latest_verdict"]["id"] == "v1"
+    assert body["latest_verdict"]["sla_met"] is True
+
+    # Now add a kept candidate meeting SLA, followed by a rejected candidate not meeting SLA.
+    cand2 = Candidate(
+        id="c2",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/good",
+        base_sha="sha-base-1",
+        head_sha="sha-good",
+        summary="Good optimization",
+    )
+    verdict2 = Verdict(
+        id="v2",
+        candidate_id="c2",
+        keep=True,
+        speedup=2.0,
+        p_value=0.001,
+        median_seconds=45.0,
+        p95_seconds=55.0,
+        sla_met=True,
+        reason="fast and safe",
+    )
+    cand3 = Candidate(
+        id="c3",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/slow",
+        base_sha="sha-good",
+        head_sha="sha-slow",
+        summary="Slower experiment",
+    )
+    verdict3 = Verdict(
+        id="v3",
+        candidate_id="c3",
+        keep=False,
+        speedup=0.9,
+        p_value=0.5,
+        median_seconds=90.0,
+        p95_seconds=130.0,
+        sla_met=False,
+        reason="slower",
+    )
+    for rec in (cand2, verdict2, cand3, verdict3):
+        ledger.add(rec)
+
+    with TestClient(app) as client:
+        resp2 = client.get("/api/repos/acme/widget/status")
+
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["base_sha"] == "sha-good"
+    assert body2["sla_met"] is True
+    assert body2["latest_verdict"]["id"] == "v3"
+    assert body2["latest_verdict"]["keep"] is False
+
+
+def test_repo_status_preserves_base_sha_when_kept_candidate_lacks_shas() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        id="h1",
+        repo="acme/widget",
+        description="Cache deps",
+        skill="dep-cache",
+        expected_savings_seconds=20.0,
+        base_sha="abc123",
+    )
+    cand = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/dep-cache",
+        summary="Added cache without recording SHAs",
+    )
+    verdict = Verdict(
+        id="v1",
+        candidate_id="c1",
+        keep=True,
+        speedup=1.5,
+        p_value=0.01,
+        sla_met=True,
+        reason="faster",
+    )
+    for rec in (hyp, cand, verdict):
+        ledger.add(rec)
+
+    app = create_app(ledger=ledger)
+    with TestClient(app) as client:
+        resp = client.get("/api/repos/acme/widget/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["base_sha"] == "abc123"
+
+
+def test_repo_casing_normalized_for_locks_and_telemetry() -> None:
+    ledger = InMemoryLedger()
+    ledger.add(
+        Hypothesis(
+            id="h1",
+            repo="acme/widget",
+            description="Cache deps",
+            skill="dep-cache",
+            expected_savings_seconds=20.0,
+            base_sha="abc123",
+        )
+    )
+    dispatcher = _StubDispatcher()
+    app = create_app(ledger=ledger, dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        first = client.post("/triggers/cycle", json={"repo": "Acme/Widget"})
+        assert first.status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+
+        conflict = client.post("/triggers/cycle", json={"repo": "acme/widget"})
+        assert conflict.status_code == 409
+
+        status_resp = client.get("/api/repos/ACME/WIDGET/status")
+        assert status_resp.status_code == 200
+        assert status_resp.json()["active"] is True
+        assert status_resp.json()["base_sha"] == "abc123"
+
+        attempts_resp = client.get("/api/repos/Acme/Widget/attempts")
+        assert attempts_resp.status_code == 200
+        assert len(attempts_resp.json()) == 1
+
+        records_resp = client.get("/api/repos/Acme/Widget/records")
+        assert records_resp.status_code == 200
+        assert len(records_resp.json()["hypotheses"]) == 1
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        while "acme/widget" in app.state.active_repos:
+            client.get("/health")
+
+
+def test_api_token_enforces_bearer_auth_on_api_and_triggers() -> None:
+    dispatcher = _AsyncStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher, api_token="secret-api-token")  # noqa: S106
+    auth_headers = {"Authorization": "Bearer secret-api-token"}
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+        for method, path in (
+            ("GET", "/api/repos/acme/widget/attempts"),
+            ("GET", "/api/repos/acme/widget/records"),
+            ("GET", "/api/repos/acme/widget/status"),
+        ):
+            missing = client.request(method, path)
+            assert missing.status_code == 401
+            assert missing.headers.get("www-authenticate") == "Bearer"
+
+            wrong = client.request(method, path, headers={"Authorization": "Bearer wrong"})
+            assert wrong.status_code == 401
+            assert wrong.headers.get("www-authenticate") == "Bearer"
+
+            basic = client.request(method, path, headers={"Authorization": "Basic secret-api-token"})
+            assert basic.status_code == 401
+            assert basic.headers.get("www-authenticate") == "Bearer"
+
+            assert client.request(method, path, headers=auth_headers).status_code == 200
+
+        missing_trigger = client.post("/triggers/cycle", json={"repo": "acme/widget"})
+        assert missing_trigger.status_code == 401
+        assert missing_trigger.headers.get("www-authenticate") == "Bearer"
+
+        wrong_trigger = client.post(
+            "/triggers/cycle",
+            json={"repo": "acme/widget"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert wrong_trigger.status_code == 401
+        assert wrong_trigger.headers.get("www-authenticate") == "Bearer"
+
+        ok = client.post("/triggers/cycle", json={"repo": "acme/widget"}, headers=auth_headers)
+        assert ok.status_code == 202
+        assert dispatcher.done.wait(timeout=5)
+
+
+def test_openapi_declares_http_bearer_security_scheme() -> None:
+    protected_routes = (
+        ("/triggers/cycle", "post"),
+        ("/api/repos/{owner}/{name}/attempts", "get"),
+        ("/api/repos/{owner}/{name}/records", "get"),
+        ("/api/repos/{owner}/{name}/status", "get"),
+    )
+
+    app = create_app(ledger=InMemoryLedger(), api_token="secret-api-token")  # noqa: S106
+    schema = app.openapi()
+
+    security_schemes = schema.get("components", {}).get("securitySchemes", {})
+    assert security_schemes.get("HTTPBearer") == {"type": "http", "scheme": "bearer"}
+
+    for path, method in protected_routes:
+        assert {"HTTPBearer": []} in schema["paths"][path][method].get("security", [])
+
+    assert "security" not in schema["paths"]["/health"]["get"]
+
+    unauthenticated_app = create_app(ledger=InMemoryLedger())
+    with TestClient(unauthenticated_app) as client:
+        unauth_resp = client.get("/openapi.json")
+    assert unauth_resp.status_code == 200
+    unauth_schema = unauth_resp.json()
+
+    unauth_schemes = unauth_schema.get("components", {}).get("securitySchemes", {})
+    assert "HTTPBearer" not in unauth_schemes
+
+    for path, method in protected_routes:
+        assert "security" not in unauth_schema["paths"][path][method]
+
+
+_Step = tuple[Any, Any, Any]  # deliberately loose so tests can send invalid updates
+
+
+class _ProgressStubDispatcher:
+    """Sync dispatcher that reports progress one step at a time, driven by the test."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.steps: queue.Queue[_Step | None] = queue.Queue()
+        self.reported: queue.Queue[None] = queue.Queue()
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self.callbacks: list[ProgressCallback] = []
+        self.fail = fail
+
+    def _drive(self, on_progress: ProgressCallback | None) -> None:
+        assert on_progress is not None
+        self.callbacks.append(on_progress)
+        self.started.set()
+        try:
+            while (step := self.steps.get(timeout=5)) is not None:
+                on_progress(*step)
+                self.reported.put(None)
+            if self.fail:
+                msg = "boom"
+                raise RuntimeError(msg)
+        finally:
+            self.finished.set()
+
+    def run_cycle(self, repo: str, *, on_progress: ProgressCallback | None = None) -> None:
+        self.calls.append(("run_cycle", repo))
+        self._drive(on_progress)
+
+    def run_until_sla(self, repo: str, *, on_progress: ProgressCallback | None = None) -> None:
+        self.calls.append(("run_until_sla", repo))
+        self._drive(on_progress)
+
+    def report(self, stage: object, completed_runs: object = 0, total_runs: object = 0) -> None:
+        self.steps.put((stage, completed_runs, total_runs))
+        self.reported.get(timeout=5)
+
+
+class _AsyncProgressStubDispatcher:
+    """Async dispatcher that reports progress one step at a time, driven by the test."""
+
+    def __init__(self) -> None:
+        self.steps: queue.Queue[_Step | None] = queue.Queue()
+        self.reported: queue.Queue[None] = queue.Queue()
+        self.finished = threading.Event()
+
+    async def run_cycle(self, repo: str, on_progress: ProgressCallback | None = None) -> None:
+        self.repo = repo
+        assert on_progress is not None
+        try:
+            while (step := await asyncio.to_thread(self.steps.get, timeout=5)) is not None:
+                on_progress(*step)
+                self.reported.put(None)
+        finally:
+            self.finished.set()
+
+    async def run_until_sla(self, repo: str, on_progress: ProgressCallback | None = None) -> None:
+        await self.run_cycle(repo, on_progress)
+
+    def report(self, stage: object, completed_runs: object = 0, total_runs: object = 0) -> None:
+        self.steps.put((stage, completed_runs, total_runs))
+        self.reported.get(timeout=5)
+
+
+class _KwargsProgressStubDispatcher:
+    """Dispatcher that accepts progress through ``**kwargs``."""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.release = threading.Event()
+        self.reported = threading.Event()
+
+    def run_cycle(self, repo: str, **kwargs: ProgressCallback) -> None:
+        self.run_until_sla(repo, **kwargs)
+
+    def run_until_sla(self, repo: str, **kwargs: ProgressCallback) -> None:
+        self.repo = repo
+        kwargs["on_progress"]("timing", completed_runs=1, total_runs=4)
+        self.reported.set()
+        self.release.wait(timeout=5)
+        self.finished.set()
+
+
+def _progress(client: TestClient, repo: str = "acme/widget") -> dict[str, Any]:
+    body = client.get(f"/api/repos/{repo}/status").json()
+    return {key: body[key] for key in ("active", "stage", "completed_runs", "total_runs")}
+
+
+def _wait_idle(app: FastAPI, client: TestClient, repo_key: str = "acme/widget") -> None:
+    while repo_key in app.state.active_repos:
+        client.get("/health")
+
+
+_IDLE = {"active": False, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+
+@pytest.mark.parametrize("until_sla", [False, True])
+def test_repo_status_reports_progress_through_every_stage(*, until_sla: bool) -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert _progress(client) == _IDLE
+        trigger = client.post("/triggers/cycle", json={"repo": "acme/widget", "until_sla": until_sla})
+        assert trigger.status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        script: list[tuple[str, int, int]] = [
+            ("analysis", 0, 0),
+            ("optimizer", 0, 0),
+            ("proof", 0, 0),
+            ("timing", 0, 6),
+            ("timing", 3, 6),
+            ("timing", 6, 6),
+            ("replay", 0, 4),
+            ("replay", 4, 4),
+            ("rating", 10, 10),
+        ]
+        assert {stage for stage, _, _ in script} == set(CYCLE_STAGES)
+        for stage, completed, total in script:
+            dispatcher.report(stage, completed, total)
+            assert _progress(client) == {
+                "active": True,
+                "stage": stage,
+                "completed_runs": completed,
+                "total_runs": total,
+            }
+            assert _progress(client, "other/repo") == _IDLE
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+    expected_call = "run_until_sla" if until_sla else "run_cycle"
+    assert dispatcher.calls == [(expected_call, "acme/widget")]
+
+
+def test_repo_status_progress_resets_after_failure_and_next_cycle_starts_clean() -> None:
+    dispatcher = _ProgressStubDispatcher(fail=True)
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("replay", 2, 5)
+        assert _progress(client) == {"active": True, "stage": "replay", "completed_runs": 2, "total_runs": 5}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+        dispatcher.fail = False
+        dispatcher.started.clear()
+        dispatcher.finished.clear()
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+def test_repo_status_ignores_progress_from_finished_cycle() -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("proof")
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        stale = dispatcher.callbacks[0]
+
+        stale("rating", 1, 1)
+        assert _progress(client) == _IDLE
+        assert app.state.progress_board.get("acme/widget").stage is None
+
+        dispatcher.started.clear()
+        dispatcher.finished.clear()
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        dispatcher.report("analysis")
+
+        stale("rating", 1, 1)
+        assert _progress(client) == {"active": True, "stage": "analysis", "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+
+
+def test_repo_status_drops_invalid_progress_updates(caplog: pytest.LogCaptureFixture) -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("timing", 1, 3)
+        valid = {"active": True, "stage": "timing", "completed_runs": 1, "total_runs": 3}
+
+        with caplog.at_level(logging.WARNING, logger="pit_crew.server"):
+            for bad in [
+                ("deploy", 0, 0),
+                (None, 0, 0),
+                ("timing", 4, 3),
+                ("timing", -1, 3),
+                ("timing", 1, -1),
+                ("timing", True, 3),
+                ("timing", 1, 3.0),
+                ("timing", "1", 3),
+            ]:
+                dispatcher.report(*bad)
+                assert _progress(client) == valid
+        assert sum("Ignoring invalid progress" in r.getMessage() for r in caplog.records) == 8
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+@pytest.mark.parametrize("until_sla", [False, True])
+def test_repo_status_reports_progress_from_async_dispatcher(*, until_sla: bool) -> None:
+    dispatcher = _AsyncProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget", "until_sla": until_sla}).status_code == 202
+        dispatcher.report("optimizer")
+        assert _progress(client) == {"active": True, "stage": "optimizer", "completed_runs": 0, "total_runs": 0}
+        dispatcher.report("replay", completed_runs=1, total_runs=2)
+        assert _progress(client) == {"active": True, "stage": "replay", "completed_runs": 1, "total_runs": 2}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+def test_repo_status_reports_progress_from_kwargs_dispatcher_with_mixed_case_repo() -> None:
+    dispatcher = _KwargsProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "Acme/Widget", "until_sla": True}).status_code == 202
+        assert dispatcher.reported.wait(timeout=5)
+        timing = {"active": True, "stage": "timing", "completed_runs": 1, "total_runs": 4}
+        assert _progress(client, "acme/widget") == timing
+        assert _progress(client, "ACME/WIDGET") == timing
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client, "Acme/Widget") == _IDLE
+
+
+def test_repo_status_legacy_dispatcher_without_progress_shows_active_without_stage() -> None:
+    dispatcher = _StubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+    assert dispatcher.calls == [("run_cycle", "acme/widget")]
+
+
+def test_run_cycle_task_without_board_still_releases_lock() -> None:
+    dispatcher = _KwargsProgressStubDispatcher()
+    dispatcher.release.set()
+    active_repos = {"acme/widget"}
+
+    asyncio.run(_run_cycle_task(dispatcher, "Acme/Widget", until_sla=False, active_repos=active_repos))
+
+    assert dispatcher.finished.is_set()
+    assert active_repos == set()
+
+
+def test_progress_board_isolates_tokens() -> None:
+    board = CycleProgressBoard()
+    first = board.start("acme/widget")
+    second = board.start("acme/widget")
+
+    assert board.get("acme/widget").stage is None
+    board.reporter("acme/widget", first)("proof")
+    assert board.get("acme/widget").stage is None
+    board.reporter("acme/widget", second)("proof")
+    assert board.get("acme/widget").stage == "proof"
+
+    board.clear("acme/widget", first)
+    assert board.get("acme/widget").stage == "proof"
+    board.clear("acme/widget", second)
+    assert board.get("acme/widget").stage is None
+    board.clear("acme/widget", second)
+    assert board.get("other/repo").stage is None
+
+
+class _BadSignature:
+    __signature__ = "not a signature"
+
+    def __call__(self, repo: str) -> None: ...
+
+
+def test_accepts_on_progress_detects_supported_signatures() -> None:
+    def keyword_only(repo: str, *, on_progress: ProgressCallback) -> None: ...
+
+    def positional_or_keyword(repo: str, on_progress: ProgressCallback | None = None) -> None: ...
+
+    def var_keyword(repo: str, **kwargs: object) -> None: ...
+
+    def positional_only(repo: str, on_progress: ProgressCallback, /) -> None: ...
+
+    def legacy(repo: str) -> None: ...
+
+    assert _accepts_on_progress(keyword_only)
+    assert _accepts_on_progress(positional_or_keyword)
+    assert _accepts_on_progress(var_keyword)
+    assert not _accepts_on_progress(positional_only)
+    assert not _accepts_on_progress(legacy)
+    assert not _accepts_on_progress(_BadSignature())

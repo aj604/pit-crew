@@ -195,6 +195,9 @@ export function scenarioSnapshotAtStage(scenarioId, stageIndex) {
       base_sha: verdict?.keep ? s.candidate.head_sha : BASE_SHA,
       sla_met: verdict?.sla_met ?? false,
       latest_verdict: verdict,
+      stage: null,
+      completed_runs: 0,
+      total_runs: 0,
     },
     attempts: [attemptFor(s, stageIndex)],
     records: {

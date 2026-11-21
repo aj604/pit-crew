@@ -1,0 +1,64 @@
+"""shard-by-timing: a long test step on the critical path could run as parallel shards."""
+
+import math
+import re
+
+from pit_crew.lanes.analysis.buckets import is_setup_step
+from pit_crew.lanes.analysis.critical_path import CIProfile
+from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, step_profile
+from pit_crew.lanes.analysis.workflow import Workflow
+
+SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
+TARGET_SHARD_SECONDS = 30.0  # the brief: tests under 30 seconds per shard
+MAX_SHARDS = 8
+TEST_STEP = re.compile(
+    r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test)\b", re.IGNORECASE
+)
+ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
+
+
+def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
+    """Flag measured, non-setup steps of at least SHARD_MIN_SECONDS in jobs that still shorten the critical path."""
+    findings: list[Finding] = []
+    for job_id, spec in workflow.jobs.items():
+        measured = job_profile(profile, job_id)
+        if measured is None or measured.max_saving_seconds <= 0:
+            continue
+        if any(ALREADY_SHARDED.search(key) for key in spec.matrix_keys):
+            continue
+        for step in spec.steps:
+            if is_setup_step(step.name):
+                continue
+            if not (TEST_STEP.search(step.name) or (step.run and TEST_STEP.search(step.run))):
+                continue
+            timing = step_profile(profile, job_id, step)
+            if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:
+                continue
+            shards = min(math.ceil(timing.median_seconds / TARGET_SHARD_SECONDS), MAX_SHARDS)
+            expected = min(timing.median_seconds * (1 - 1 / shards), measured.max_saving_seconds)
+            findings.append(
+                Finding(
+                    skill="shard-by-timing",
+                    workflow_path=workflow_path,
+                    job=job_id,
+                    step=step.name,
+                    bucket="running",
+                    description=(
+                        f"Step '{step.name}' takes a median {timing.median_seconds:.0f}s on the critical path. "
+                        f"Split it into {shards} parallel shards balanced by recorded test timings. "
+                        "The shards together must run every test file: prove it by comparing the union of "
+                        "the shards' test files with the unsharded run's before merging."
+                    ),
+                    expected_savings_seconds=expected,
+                    evidence={
+                        "step_p50_seconds": timing.median_seconds,
+                        "step_p95_seconds": timing.p95_seconds,
+                        "shards": float(shards),
+                        "max_saving_seconds": measured.max_saving_seconds,
+                        "runs_sampled": float(profile.runs_analyzed),
+                    },
+                    confidence=0.6,
+                    risk="low",
+                )
+            )
+    return findings

@@ -66,6 +66,8 @@ known-first-party = ["pit_crew"]
 quote-style = "double"
 indent-style = "space"
 docstring-code-format = true
+# Master specs are design records copied verbatim; their code blocks are illustrative sketches.
+exclude = ["docs/specs/*.md"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -138,6 +140,7 @@ forbidden_modules = [
     "pit_crew.tools",
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
     "pit_crew.lanes",
 ]
@@ -150,6 +153,7 @@ forbidden_modules = [
     "pit_crew.ledger",
     "pit_crew.tools",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
     "pit_crew.lanes",
     "google",
@@ -162,7 +166,19 @@ source_modules = ["pit_crew.lanes"]
 forbidden_modules = [
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
+    "google",
+]
+
+[[tool.importlinter.contracts]]
+name = "GitHub client boundary does not import lanes or agent layers"
+type = "forbidden"
+source_modules = ["pit_crew.github"]
+forbidden_modules = [
+    "pit_crew.dispatcher",
+    "pit_crew.managed_agent",
+    "pit_crew.lanes",
     "google",
 ]
 
@@ -175,6 +191,15 @@ source_modules = [
     "pit_crew.tools",
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
+    "pit_crew.proof_bridge",
     "pit_crew.lanes",
 ]
 forbidden_modules = ["google"]
+
+[[tool.importlinter.contracts]]
+name = "The CLI reaches google-genai only through managed_agent"
+type = "forbidden"
+source_modules = ["pit_crew.cli"]
+forbidden_modules = ["google"]
+allow_indirect_imports = true

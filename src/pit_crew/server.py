@@ -1,17 +1,22 @@
 """FastAPI HTTP server scaffold for Pit Crew."""
 
 import asyncio
+import hmac
 import inspect
 import logging
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Annotated, Any, Literal, Protocol, get_args
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
+from pit_crew.demo import DemoEngine, create_demo_router
 from pit_crew.ledger import Ledger, SqliteLedger
 from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
@@ -25,8 +30,18 @@ DEFAULT_BRAND_DIR = Path(__file__).resolve().parents[2] / "brand"
 """Repository-root brand assets; absent when running from an installed wheel."""
 
 
+def _normalize_repo(repo: str) -> str:
+    """Normalize a repository identifier for case-insensitive lock and telemetry matching."""
+    return repo.strip().lower()
+
+
 class DispatcherProtocol(Protocol):
-    """Protocol for dispatcher instances wired into the FastAPI server."""
+    """Protocol for dispatcher instances wired into the FastAPI server.
+
+    To report live progress, a dispatcher adds an optional keyword argument
+    ``on_progress: ProgressCallback | None = None`` to either method; the server
+    detects it at call time and passes a :class:`ProgressCallback`.
+    """
 
     def run_cycle(self, repo: str) -> object:
         """Run a single optimization cycle for a repository."""
@@ -35,6 +50,123 @@ class DispatcherProtocol(Protocol):
     def run_until_sla(self, repo: str) -> object:
         """Run optimization cycles for a repository until its SLA is met."""
         ...
+
+
+CycleStage = Literal["analysis", "optimizer", "proof", "timing", "replay", "rating"]
+CYCLE_STAGES: tuple[CycleStage, ...] = get_args(CycleStage)
+
+
+class ProgressCallback(Protocol):
+    """Callback a dispatcher calls to report live cycle progress.
+
+    Dispatchers opt in by accepting an ``on_progress`` keyword argument on
+    ``run_cycle`` / ``run_until_sla``. Dispatchers that do not accept it are
+    still called without it, so their status shows ``active`` with no stage.
+    """
+
+    def __call__(self, stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
+        """Report the active stage and how many workflow runs have completed."""
+        ...
+
+
+@dataclass(frozen=True)
+class CycleProgress:
+    """Snapshot of a running cycle's stage and workflow-run counts."""
+
+    stage: CycleStage | None = None
+    completed_runs: int = 0
+    total_runs: int = 0
+
+
+IDLE_PROGRESS = CycleProgress()
+
+
+class CycleProgressBoard:
+    """Thread-safe per-repo progress state for running cycles.
+
+    Each cycle gets a fresh token from :meth:`start`. Updates and clears carry
+    that token, so a reporter left over from a finished or cancelled cycle can
+    never overwrite the progress of a later cycle for the same repo.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty board."""
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[object, CycleProgress]] = {}
+
+    def start(self, repo_key: str) -> object:
+        """Begin tracking a new cycle for ``repo_key`` and return its token."""
+        token = object()
+        with self._lock:
+            self._entries[repo_key] = (token, IDLE_PROGRESS)
+        return token
+
+    def update(self, repo_key: str, token: object, progress: CycleProgress) -> bool:
+        """Record ``progress`` if ``token`` still owns ``repo_key``; return whether it did."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+            if entry is None or entry[0] is not token:
+                return False
+            self._entries[repo_key] = (token, progress)
+            return True
+
+    def clear(self, repo_key: str, token: object) -> None:
+        """Drop progress for ``repo_key`` if ``token`` still owns it."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+            if entry is not None and entry[0] is token:
+                del self._entries[repo_key]
+
+    def get(self, repo_key: str) -> CycleProgress:
+        """Return the current progress for ``repo_key``, or idle defaults."""
+        with self._lock:
+            entry = self._entries.get(repo_key)
+        return entry[1] if entry is not None else IDLE_PROGRESS
+
+    def reporter(self, repo_key: str, token: object) -> ProgressCallback:
+        """Build the ``on_progress`` callback handed to the dispatcher for one cycle."""
+
+        def on_progress(stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
+            if not _valid_progress(stage, completed_runs, total_runs):
+                logger.warning(
+                    "Ignoring invalid progress for %s: stage=%r completed_runs=%r total_runs=%r",
+                    repo_key,
+                    stage,
+                    completed_runs,
+                    total_runs,
+                )
+                return
+            progress = CycleProgress(stage=stage, completed_runs=completed_runs, total_runs=total_runs)
+            if not self.update(repo_key, token, progress):
+                logger.debug("Ignoring progress for %s from a finished cycle", repo_key)
+
+        return on_progress
+
+
+def _valid_progress(stage: object, completed_runs: object, total_runs: object) -> bool:
+    """Return whether a progress report has a known stage and sane run counts."""
+    if stage not in CYCLE_STAGES:
+        return False
+    if type(completed_runs) is not int or type(total_runs) is not int:
+        return False
+    return 0 <= completed_runs <= total_runs
+
+
+def _accepts_on_progress(fn: Callable[..., object]) -> bool:
+    """Return whether ``fn`` can be called with an ``on_progress`` keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "on_progress" and param.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -51,20 +183,29 @@ async def _run_cycle_task(
     *,
     until_sla: bool,
     active_repos: set[str],
+    progress_board: CycleProgressBoard | None = None,
 ) -> None:
-    """Execute a dispatcher cycle and always release the per-repo lock."""
+    """Execute a dispatcher cycle, reporting progress, and always release the per-repo lock."""
+    repo_key = _normalize_repo(repo)
+    board = progress_board if progress_board is not None else CycleProgressBoard()
+    token = board.start(repo_key)
     try:
-        fn = dispatcher.run_until_sla if until_sla else dispatcher.run_cycle
+        fn: Callable[..., object] = dispatcher.run_until_sla if until_sla else dispatcher.run_cycle
+        kwargs: dict[str, Any] = {}
+        if _accepts_on_progress(fn):
+            kwargs["on_progress"] = board.reporter(repo_key, token)
         if inspect.iscoroutinefunction(fn):
-            await fn(repo)
+            await fn(repo, **kwargs)
         else:
-            result = await asyncio.to_thread(fn, repo)
+            result = await asyncio.to_thread(fn, repo, **kwargs)
             if inspect.isawaitable(result):
                 await result
     except Exception:
         logger.exception("Cycle failed for %s", repo)
     finally:
-        active_repos.discard(repo)
+        # Clear progress before releasing the lock so an idle status never shows a stale stage.
+        board.clear(repo_key, token)
+        active_repos.discard(repo_key)
 
 
 def _current_base_sha(
@@ -74,7 +215,14 @@ def _current_base_sha(
 ) -> str | None:
     """Resolve the current base SHA for a repository from its ledger records."""
     if latest_kept is not None:
-        return latest_kept.head_sha or latest_kept.base_sha or None
+        if latest_kept.head_sha:
+            return latest_kept.head_sha
+        if latest_kept.base_sha:
+            return latest_kept.base_sha
+        hypotheses_by_id = {h.id: h for h in hypotheses}
+        linked_hyp = hypotheses_by_id.get(latest_kept.hypothesis_id)
+        if linked_hyp is not None and linked_hyp.base_sha:
+            return linked_hyp.base_sha
     for cand in reversed(candidates):
         if cand.base_sha:
             return cand.base_sha
@@ -84,26 +232,67 @@ def _current_base_sha(
     return None
 
 
-def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str, Any]:
+def _repo_status(
+    ledger: Ledger,
+    repo: str,
+    active_repos: set[str],
+    progress_board: CycleProgressBoard | None = None,
+) -> dict[str, Any]:
     """Build the Pit Wall status payload for ``repo``."""
+    repo_key = _normalize_repo(repo)
+    active = repo_key in active_repos
+    progress = progress_board.get(repo_key) if active and progress_board is not None else IDLE_PROGRESS
     hypotheses = ledger.hypotheses_for_repo(repo)
     hypothesis_ids = {h.id for h in hypotheses}
-    repo_candidates = [c for c in ledger.all(Candidate) if c.hypothesis_id in hypothesis_ids or c.repo == repo]
+    repo_candidates = [
+        c for c in ledger.all(Candidate) if c.hypothesis_id in hypothesis_ids or _normalize_repo(c.repo) == repo_key
+    ]
     candidate_ids = {c.id for c in repo_candidates}
 
+    latest_kept = ledger.latest_kept_candidate(repo)
     latest_verdict: Verdict | None = None
+    latest_kept_verdict: Verdict | None = None
     for verdict in ledger.all(Verdict):
         if verdict.candidate_id in candidate_ids:
             latest_verdict = verdict
+        if latest_kept is not None and verdict.candidate_id == latest_kept.id:
+            latest_kept_verdict = verdict
 
-    base_sha = _current_base_sha(ledger.latest_kept_candidate(repo), repo_candidates, hypotheses)
+    base_sha = _current_base_sha(latest_kept, repo_candidates, hypotheses)
     return {
         "repo": repo,
-        "active": repo in active_repos,
+        "active": active,
         "base_sha": base_sha,
         "latest_verdict": asdict(latest_verdict) if latest_verdict is not None else None,
-        "sla_met": latest_verdict.sla_met if latest_verdict is not None else False,
+        "sla_met": latest_kept_verdict.sla_met if latest_kept_verdict is not None else False,
+        "stage": progress.stage,
+        "completed_runs": progress.completed_runs,
+        "total_runs": progress.total_runs,
     }
+
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _make_api_token_dependency(api_token: str) -> Callable[[HTTPAuthorizationCredentials | None], None]:
+    """Build a FastAPI dependency that enforces Bearer token auth for ``api_token``."""
+
+    def _require_api_token(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+    ) -> None:
+        if (
+            credentials is None
+            or credentials.scheme.lower() != "bearer"
+            or not credentials.credentials
+            or not hmac.compare_digest(credentials.credentials, api_token)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return _require_api_token
 
 
 def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing positional callers working
@@ -111,6 +300,7 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
     dispatcher: DispatcherProtocol | None = None,
     webhook_secret: str | None = None,
     run_tracker: RunTracker | None = None,
+    api_token: str | None = None,
     *,
     brand_dir: Path | None = None,
     web_dir: Path | None = None,
@@ -124,13 +314,21 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
+    progress_board = CycleProgressBoard()
     tracker = run_tracker if run_tracker is not None else RunTracker()
+    engine = DemoEngine()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
     app.state.run_tracker = tracker
+    app.state.api_token = api_token
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
+    app.state.progress_board = progress_board
+    app.state.demo_engine = engine
+
+    api_auth_dependencies = [Depends(_make_api_token_dependency(api_token))] if api_token is not None else []
+    app.include_router(create_demo_router(engine, dependencies=api_auth_dependencies))
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -140,7 +338,11 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
 
     app.include_router(create_github_webhook_router(webhook_secret=webhook_secret, run_tracker=tracker))
 
-    @app.post("/triggers/cycle", status_code=status.HTTP_202_ACCEPTED)
+    @app.post(
+        "/triggers/cycle",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=api_auth_dependencies,
+    )
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
         """Enqueue a background optimization cycle guarded by a per-repo lock."""
         if dispatcher is None:
@@ -148,39 +350,50 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Dispatcher is not configured",
             )
-        if payload.repo in active_repos:
+        repo_key = _normalize_repo(payload.repo)
+        if repo_key in active_repos:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Cycle already active for {payload.repo}",
             )
 
-        active_repos.add(payload.repo)
+        active_repos.add(repo_key)
         task = asyncio.create_task(
             _run_cycle_task(
                 dispatcher,
                 payload.repo,
                 until_sla=payload.until_sla,
                 active_repos=active_repos,
+                progress_board=progress_board,
             )
         )
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
         return {"status": "started", "repo": payload.repo}
 
-    @app.get("/api/repos/{owner}/{name}/attempts")
+    @app.get(
+        "/api/repos/{owner}/{name}/attempts",
+        dependencies=api_auth_dependencies,
+    )
     def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
         """Return prior optimization attempts for a repository."""
         return ledger.prior_attempts(f"{owner}/{name}")
 
-    @app.get("/api/repos/{owner}/{name}/records")
+    @app.get(
+        "/api/repos/{owner}/{name}/records",
+        dependencies=api_auth_dependencies,
+    )
     def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
         """Return structured ledger records for a repository."""
         return ledger.records_for_repo(f"{owner}/{name}")
 
-    @app.get("/api/repos/{owner}/{name}/status")
+    @app.get(
+        "/api/repos/{owner}/{name}/status",
+        dependencies=api_auth_dependencies,
+    )
     def repo_status(owner: str, name: str) -> dict[str, Any]:
-        """Return current cycle state, base SHA, latest verdict, and SLA status."""
-        return _repo_status(ledger, f"{owner}/{name}", active_repos)
+        """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
+        return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
     _mount_pit_wall(app, brand_dir=brand_dir or DEFAULT_BRAND_DIR, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app

@@ -2,11 +2,13 @@ import hashlib
 import hmac
 import json
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.run_tracker import RunTracker, WorkflowRunResult
 from pit_crew.server import create_app
+from pit_crew.webhooks import DeliveryCache, create_github_webhook_router
 
 _SECRET = "test-webhook-secret"  # noqa: S105
 
@@ -279,3 +281,93 @@ def test_webhook_workflow_run_completed_with_invalid_timestamps_and_bool_id() ->
     assert resolved is not None
     assert resolved.duration_seconds is None
     assert res2.status_code == 202
+
+
+def test_webhook_delivery_cache_ttl_and_lru_eviction() -> None:
+    now = 1000.0
+    app = FastAPI()
+    app.include_router(
+        create_github_webhook_router(
+            webhook_secret=_SECRET,
+            delivery_cache=DeliveryCache(max_entries=2, ttl_seconds=60.0, clock=lambda: now),
+        )
+    )
+    payload = b'{"action": "completed"}'
+
+    def _post(client: TestClient, delivery_id: str) -> tuple[int, dict[str, str]]:
+        resp = client.post(
+            "/webhooks/github",
+            content=payload,
+            headers={
+                "X-Hub-Signature-256": _sign(payload),
+                "X-GitHub-Delivery": delivery_id,
+                "X-GitHub-Event": "workflow_run",
+            },
+        )
+        return resp.status_code, resp.json()
+
+    with TestClient(app) as client:
+        # Recent duplicate is suppressed.
+        assert _post(client, "d1") == (202, {"status": "accepted"})
+        assert _post(client, "d1") == (200, {"status": "duplicate"})
+
+        # Advancing clock past TTL expires d1.
+        now += 61.0
+        assert _post(client, "d1") == (202, {"status": "accepted"})
+
+        # Filling beyond max_deliveries=2 evicts the oldest entry (d1).
+        assert _post(client, "d2") == (202, {"status": "accepted"})
+        assert _post(client, "d3") == (202, {"status": "accepted"})
+        assert _post(client, "d2") == (200, {"status": "duplicate"})
+        assert _post(client, "d1") == (202, {"status": "accepted"})
+
+
+def test_webhook_rejects_oversized_payload_with_413() -> None:
+    app = FastAPI()
+    app.include_router(create_github_webhook_router(webhook_secret=_SECRET, max_body_bytes=64))
+    oversized = b'{"action": "completed", "pad": "' + b"x" * 100 + b'"}'
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/github",
+            content=oversized,
+            headers={
+                "X-Hub-Signature-256": _sign(oversized),
+                "X-GitHub-Delivery": "delivery-oversized",
+                "X-GitHub-Event": "workflow_run",
+            },
+        )
+        assert resp.status_code == 413
+
+        # Streaming chunked body without Content-Length also returns 413.
+        def _chunks() -> list[bytes]:
+            return [b"x" * 40, b"y" * 40]
+
+        resp_stream = client.post(
+            "/webhooks/github",
+            content=iter(_chunks()),
+            headers={
+                "X-Hub-Signature-256": _sign(b"x" * 40 + b"y" * 40),
+                "X-GitHub-Delivery": "delivery-oversized-stream",
+                "X-GitHub-Event": "workflow_run",
+            },
+        )
+        assert resp_stream.status_code == 413
+
+
+def test_webhook_rejects_missing_signature_before_reading_body() -> None:
+    app = FastAPI()
+    app.include_router(create_github_webhook_router(webhook_secret=_SECRET, max_body_bytes=16))
+    oversized = b"x" * 100
+
+    with TestClient(app) as client:
+        # Missing signature returns 401 rather than 413 because it is rejected before body buffering.
+        resp = client.post(
+            "/webhooks/github",
+            content=oversized,
+            headers={
+                "X-GitHub-Delivery": "delivery-no-sig-large",
+                "X-GitHub-Event": "workflow_run",
+            },
+        )
+    assert resp.status_code == 401

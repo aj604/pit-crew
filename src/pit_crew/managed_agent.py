@@ -1,17 +1,19 @@
-"""The only module that talks to Gemini Managed Agents.
+"""The only module that talks to Gemini: Managed Agents, and one-shot multimodal calls.
 
 Everything else in the repo runs and tests without an API key.
 """
 
 import base64
+import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from google import genai
+from google.genai import types
 
 from pit_crew import tools
 from pit_crew.ledger import InMemoryLedger, Ledger
@@ -24,6 +26,9 @@ MODELS = {
 }
 POLL_INTERVAL_SECONDS = 1.0
 MAX_TOOL_TURNS = 25
+PENDING_STATUSES = frozenset({"in_progress", "queued", "starting"})
+FAILED_STATUSES = frozenset({"failed", "cancelled", "expired"})
+GITHUB_URL = "https://github.com/"
 
 _ROOT = Path(__file__).resolve().parents[2]
 _LANES = Path(__file__).parent / "lanes"
@@ -106,6 +111,17 @@ class MaxTurnsExceededError(RuntimeError):
         super().__init__(f"lane {lane!r} exceeded {max_turns} tool-call turns")
 
 
+class InteractionFailedError(RuntimeError):
+    """Raised when a lane interaction ends in a terminal failure status (failed, cancelled, expired)."""
+
+    def __init__(self, lane: str, interaction_id: str, status: str) -> None:
+        """Format error for ``lane`` whose interaction ``interaction_id`` ended with ``status``."""
+        super().__init__(f"lane {lane!r} interaction {interaction_id!r} ended with status {status!r}")
+        self.lane = lane
+        self.interaction_id = interaction_id
+        self.status = status
+
+
 def build_request(
     lane: str,
     task: str,
@@ -148,39 +164,46 @@ def build_request(
     }
 
 
-def run_lane(
+def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus the injectable client
     lane: str,
     task: str,
     ledger: Ledger | None = None,
     *,
+    repo: str | None = None,
     extra_sources: list[dict[str, Any]] | None = None,
     client: InteractionsClientLike | None = None,
 ) -> InteractionLike:
     """Run one lane interaction to completion, servicing `requires_action` tool calls via `tools.call`."""
     active_ledger = ledger if ledger is not None else InMemoryLedger()
-    active_client = (
-        client
-        if client is not None
-        else cast(
-            "InteractionsClientLike",
-            genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"}),
-        )
-    )
+    active_client = client if client is not None else cast("InteractionsClientLike", _gemini_client())
 
-    request = build_request(lane, task, extra_sources=extra_sources)
+    request = build_request(lane, task, repo=repo, extra_sources=extra_sources)
     allowed_tool_names = {t["name"] for t in request["tools"]}
 
     interaction = active_client.interactions.create(**request)
+    # Follow-up turns resume the same sandbox, so remember the first environment ID the API assigns.
+    environment_id: str | None = None
     for _ in range(MAX_TOOL_TURNS):
-        while interaction.status in ("in_progress", "queued", "starting"):
+        environment_id = environment_id or _environment_id(interaction)
+        while interaction.status in PENDING_STATUSES:
             time.sleep(POLL_INTERVAL_SECONDS)
             interaction = active_client.interactions.get(interaction.id)
+            environment_id = environment_id or _environment_id(interaction)
+
+        if interaction.status is not None and interaction.status in FAILED_STATUSES:
+            raise InteractionFailedError(lane, interaction.id, interaction.status)
+
+        follow_up = {
+            "agent": BASE_AGENT,
+            "previous_interaction_id": interaction.id,
+            "agent_config": request["agent_config"],
+            "environment": _environment_id(interaction) or environment_id or request["environment"],
+            "tools": request["tools"],
+        }
 
         if interaction.status == "requires_continuation" and interaction.continuation_token:
             interaction = active_client.interactions.create(
-                agent=BASE_AGENT,
-                previous_interaction_id=interaction.id,
-                continuation_token=interaction.continuation_token,
+                **follow_up, continuation_token=interaction.continuation_token
             )
             continue
 
@@ -192,11 +215,7 @@ def run_lane(
             return interaction
 
         results = [_execute_tool_step(lane, allowed_tool_names, active_ledger, step) for step in call_steps]
-        interaction = active_client.interactions.create(
-            agent=BASE_AGENT,
-            previous_interaction_id=interaction.id,
-            input=results,
-        )
+        interaction = active_client.interactions.create(**follow_up, input=results)
 
     raise MaxTurnsExceededError(lane, MAX_TOOL_TURNS)
 
@@ -229,8 +248,21 @@ def _execute_tool_step(
         "type": "function_result",
         "call_id": step.id,
         "name": step.name,
-        "result": output if isinstance(output, (str, dict, list, int, float, bool)) else str(output),
+        "result": _serialize_result(output),
     }
+
+
+def _serialize_result(output: object) -> str | dict[str, Any]:
+    """Pass ``str`` and ``dict`` through; JSON-encode everything else (the SDK rejects bare lists and scalars)."""
+    if isinstance(output, (str, dict)):
+        return output
+    return json.dumps(output, default=str)
+
+
+def _environment_id(interaction: InteractionLike) -> str | None:
+    """The remote environment ID the API assigned, absent on fakes and on interactions without one."""
+    environment_id = getattr(interaction, "environment_id", None)
+    return environment_id if isinstance(environment_id, str) and environment_id else None
 
 
 def inline_text_source(target: str, content: str) -> dict[str, str]:
@@ -249,8 +281,92 @@ def inline_bytes_source(target: str, data: bytes) -> dict[str, str]:
 
 
 def repository_source(repo: str, target: str = "/workspace") -> dict[str, str]:
-    """Mount a GitHub repository into the remote sandbox."""
-    return {"type": "repository", "source": repo, "target": target}
+    """Mount a GitHub repository into the remote sandbox.
+
+    ``repo`` is a full URL or a bare ``owner/name``, which becomes ``https://github.com/owner/name``.
+    """
+    return {"type": "repository", "source": normalize_repository_url(repo), "target": target}
+
+
+def normalize_repository_url(repo: str) -> str:
+    """Expand a bare ``owner/name`` to its GitHub HTTPS URL; leave URLs (anything with a scheme) unchanged."""
+    stripped = repo.strip()
+    if "://" in stripped:
+        return stripped
+    return GITHUB_URL + stripped.strip("/")
+
+
+class GenerateContentResponseLike(Protocol):
+    """Minimal response surface read from ``client.models.generate_content``."""
+
+    @property
+    def text(self) -> str | None:
+        """The model's text answer."""
+        ...
+
+
+class ModelsResourceLike(Protocol):
+    """Subset of ``genai.Client.models`` used by ``ask_multimodal``."""
+
+    def generate_content(self, **kwargs: object) -> GenerateContentResponseLike:
+        """Generate one answer."""
+        ...
+
+
+class ModelsClientLike(Protocol):
+    """Client wrapper exposing a ``models`` resource."""
+
+    @property
+    def models(self) -> ModelsResourceLike:
+        """Models API endpoint group."""
+        ...
+
+
+class UnsupportedPartError(TypeError):
+    """Raised when a multimodal part is neither ("text", str) nor (mime type, bytes)."""
+
+    def __init__(self, kind: str) -> None:
+        """Name the part kind that was given."""
+        super().__init__(f"part {kind!r} must be ('text', str) or (mime type, bytes)")
+
+
+def ask_multimodal(
+    model: str,
+    parts: Sequence[tuple[str, str | bytes]],
+    schema: Mapping[str, object],
+    *,
+    client: ModelsClientLike | None = None,
+) -> str:
+    """Send text and media to ``model`` and return its JSON answer, constrained to ``schema``.
+
+    Each part is ``("text", str)`` or ``(mime_type, bytes)``, e.g. ``("video/mp4", recording)``.
+    The proof lane uses this to have Gemini 4 Carbon watch replay recordings, since lanes may not
+    import google-genai themselves. Needs GEMINI_API_KEY unless ``client`` is given.
+    """
+    active_client = client if client is not None else cast("ModelsClientLike", _gemini_client())
+    response = active_client.models.generate_content(
+        model=model,
+        contents=[_part(kind, value) for kind, value in parts],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=dict(schema),
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,  # terminal text must be legible
+        ),
+    )
+    return response.text or ""
+
+
+def _gemini_client() -> genai.Client:
+    # The SDK defaults to v1, but the Interactions API is v1beta; both calls use it so they see the same API.
+    return genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"})
+
+
+def _part(kind: str, value: str | bytes) -> types.Part:
+    if kind == "text" and isinstance(value, str):
+        return types.Part(text=value)
+    if kind != "text" and isinstance(value, bytes):
+        return types.Part.from_bytes(data=value, mime_type=kind)
+    raise UnsupportedPartError(kind)
 
 
 def _inline(target: str, path: Path) -> dict[str, str]:
