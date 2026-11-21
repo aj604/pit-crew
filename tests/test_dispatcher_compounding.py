@@ -628,3 +628,52 @@ def test_run_until_sla_advances_past_declined_hypothesis() -> None:
     assert verdicts[0].sla_met is True
     optimizer_hyp_ids = [c.context["hypothesis"]["id"] for c in runner.calls if c.lane == "optimizer"]
     assert optimizer_hyp_ids == ["h-decline", "h-viable"]
+
+
+def test_run_until_sla_advances_past_optimizer_max_turns_exceeded() -> None:
+    class MaxTurnsExceededError(RuntimeError):
+        pass
+
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    _seed_hypotheses(ledger, repo, [("h-stuck", 120.0), ("h-viable", 60.0)])
+
+    class _MaxTurnsRunner(_ScriptedLaneRunner):
+        @override
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            context = _parse_task_context(task)
+            if lane == "optimizer" and context["hypothesis"]["id"] == "h-stuck":
+                self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
+                msg = "lane 'optimizer' exceeded 25 tool-call turns"
+                raise MaxTurnsExceededError(msg)
+            return super().__call__(lane, task, ledger, repo=repo)
+
+    github = _FakeGitHubClient({repo: "sha-default"})
+    runner = _MaxTurnsRunner()
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=github,
+        lane_runner=runner,
+        evidence_by_candidate={
+            "cand-h-viable": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+        },
+        config=DispatcherConfig(max_compounding_cycles=5),
+    )
+
+    verdicts = dispatcher.run_until_sla(repo)
+
+    assert [v.candidate_id for v in verdicts] == ["cand-h-viable"]
+    assert verdicts[0].keep is True
+    assert verdicts[0].sla_met is True
+    optimizer_hyp_ids = [c.context["hypothesis"]["id"] for c in runner.calls if c.lane == "optimizer"]
+    assert optimizer_hyp_ids == ["h-stuck", "h-viable"]
