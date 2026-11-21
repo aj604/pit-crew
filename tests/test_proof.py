@@ -5,7 +5,7 @@ import pytest
 
 from pit_crew import tools
 from pit_crew.contracts import Candidate, ReplayPlan
-from pit_crew.lanes.proof.checks import FileChange, all_checks, touched_checks
+from pit_crew.lanes.proof.checks import Check, FileChange, all_checks, touched_checks
 from pit_crew.lanes.proof.miner import JobRun, RedCommit, flaky_checks, red_commits
 from pit_crew.lanes.proof.mutants import Mutant, StaleMutantError, apply_mutant, mutants
 from pit_crew.lanes.proof.tools import InvalidReplayPlanError, pick_replays, uncovered_checks
@@ -39,7 +39,14 @@ jobs:
       - run: echo done
 """
 PATH = ".github/workflows/ci.yml"
-EVERY_JOB = {"CI/lint", "CI/test", "CI/Unit tests", "CI/report"}
+
+
+def check(*keys: str) -> Check:
+    return frozenset(keys)
+
+
+LINT, TEST, REPORT = check("CI/lint"), check("CI/test", "CI/Unit tests"), check("CI/report")
+EVERY_JOB = {LINT, TEST, REPORT}
 
 
 def change(after: str | None, before: str | None = WORKFLOW, path: str = PATH) -> list[FileChange]:
@@ -76,7 +83,7 @@ def test_miner_reports_flaky_checks_separately() -> None:
 
 def test_a_job_change_touches_that_job_and_its_dependents() -> None:
     after = WORKFLOW.replace("bun test --shard", "bun test --randomize --shard")
-    assert touched_checks(change(after)) == {"CI/test", "CI/Unit tests", "CI/report"}
+    assert touched_checks(change(after)) == {TEST, REPORT}
 
 
 def test_a_header_change_touches_every_job_in_the_workflow() -> None:
@@ -93,7 +100,7 @@ def test_a_comment_or_formatting_change_touches_nothing() -> None:
 
 def test_a_removed_job_is_touched_so_its_bugs_are_replayed() -> None:
     after = WORKFLOW.replace("  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun lint\n", "")
-    assert touched_checks(change(after)) == {"CI/lint"}
+    assert touched_checks(change(after)) == {LINT}
 
 
 def test_added_and_deleted_workflows_touch_their_jobs() -> None:
@@ -104,14 +111,42 @@ def test_added_and_deleted_workflows_touch_their_jobs() -> None:
 def test_flow_style_yaml_is_read_like_any_other() -> None:
     before = "name: CI\njobs: {lint: {runs-on: x}, test: {runs-on: x}}\n"
     after = "name: CI\njobs: {lint: {runs-on: y}, test: {runs-on: x}}\n"
-    assert touched_checks(change(after, before)) == {"CI/lint"}
+    assert touched_checks(change(after, before)) == {LINT}
+
+
+def test_a_renamed_job_is_one_check_under_every_name() -> None:
+    after = WORKFLOW.replace("name: Unit tests", "name: Tests")
+    assert touched_checks(change(after)) == {check("CI/test", "CI/Unit tests", "CI/Tests"), REPORT}
 
 
 def test_a_change_outside_workflows_touches_every_check() -> None:
     assert touched_checks([{"path": "vitest.config.ts", "before": "a", "after": "b"}]) is None
 
 
-@pytest.mark.parametrize("broken", ["name: CI\njobs: [lint\n", "name: CI\njobs: [lint, test]\n", "just text\n"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/../ci.yml",  # really .github/ci.yml
+        ".github/workflows/old/ci.yml",  # GitHub runs only files directly in .github/workflows
+        ".github/workflows/ci.json",
+        "src/.github/workflows/ci.yml",
+    ],
+)
+def test_a_file_github_would_not_run_as_a_workflow_touches_every_check(path: str) -> None:
+    assert touched_checks(change(WORKFLOW.replace("bun lint", "bun lint --quiet"), path=path)) is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "name: CI\njobs: [lint\n",
+        "name: CI\njobs: [lint, test]\n",
+        "just text\n",
+        "name: CI\njobs: {lint: 3}\n",
+        "name: CI\njobs: {lint: {}, test: {needs: 123}}\n",
+        "name: CI\njobs: {lint: {}, test: {needs: [lint, {x: 1}]}}\n",
+    ],
+)
 def test_a_workflow_it_cannot_read_touches_every_check(broken: str) -> None:
     assert touched_checks(change(broken)) is None
 
@@ -125,7 +160,7 @@ def test_all_checks_lists_every_job_by_id_and_name() -> None:
 
 
 def test_picks_only_bugs_the_touched_checks_caught_fixed_ones_first(red: list[RedCommit]) -> None:
-    assert pick_replays(red, {"CI/test", "CI/Unit tests"}) == ["b2b2b2b", "1818181"]
+    assert pick_replays(red, {TEST}) == ["b2b2b2b", "1818181"]
 
 
 def test_takes_turns_between_checks_when_every_check_is_touched(red: list[RedCommit]) -> None:
@@ -138,7 +173,14 @@ def test_a_bug_two_checks_caught_is_picked_once() -> None:
 
 
 def test_touched_checks_with_no_bug_need_a_mutant(red: list[RedCommit]) -> None:
-    assert uncovered_checks(red, {"CI/lint", "CI/typecheck"}) == {"CI/typecheck"}
+    assert uncovered_checks(red, {LINT, check("CI/typecheck")}) == {check("CI/typecheck")}
+
+
+def test_a_job_with_bugs_under_its_display_name_is_covered(red: list[RedCommit]) -> None:
+    # CI history names the job "Unit tests", never "test", so the id alone must not count as a gap.
+    touched = touched_checks(change(WORKFLOW.replace("bun test --shard", "bun test --randomize --shard")))
+    assert touched is not None
+    assert uncovered_checks(red, touched) == {REPORT}
 
 
 def test_diff_to_replays_end_to_end(red: list[RedCommit]) -> None:
@@ -190,12 +232,24 @@ def test_mutants_are_spread_across_the_file_when_capped() -> None:
     assert [m.line for m in mutants("m.py", source, limit=4)] == [1, 26, 51, 76]
 
 
+def test_a_limit_below_one_gets_no_mutants() -> None:
+    assert mutants("m.py", "x = a == b\n", limit=0) == []
+
+
 def test_apply_mutant_changes_one_line_and_refuses_a_stale_one() -> None:
     mutant = mutants("src/merge.ts", TS)[0]
     patched = apply_mutant(TS, mutant)
     assert patched.split("\n")[3] == "  return pr.length <= 0 && ready === true;"
     with pytest.raises(StaleMutantError, match=r"src/merge\.ts:4"):
         apply_mutant(patched, mutant)
+
+
+@pytest.mark.parametrize("line", [0, -1, 3])
+def test_apply_mutant_refuses_a_line_the_file_does_not_have(line: int) -> None:
+    source = "x = a == b\n"  # two lines: the code and an empty last one
+    mutant = Mutant("m.py", line, "", "y", "== -> !=")
+    with pytest.raises(StaleMutantError):
+        apply_mutant(source, mutant)
 
 
 # Tools
@@ -248,6 +302,11 @@ def test_a_plan_of_only_mutations_is_valid(ledger_and_candidate: tuple[InMemoryL
         ({"bug_shas": ["b2b2b2b", "main"]}, "not commit SHAs: main"),
         ({"mutations": [{"path": "/etc/passwd", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "../up.py", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": "..\\..\\etc\\passwd", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": ".", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": "./", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": "src//a.py", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": "", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
     ],
 )
@@ -278,3 +337,10 @@ def test_propose_mutants_returns_json_ready_dicts() -> None:
         }
     ]
     assert json.loads(json.dumps(result)) == result
+
+
+def test_propose_mutants_asks_for_at_least_one_and_survives_zero() -> None:
+    build_request("proof", "")
+    (spec,) = [t for t in tools.for_lane("proof") if t.name == "propose_mutants"]
+    assert spec.parameters["properties"]["limit"]["minimum"] == 1
+    assert tools.call("propose_mutants", InMemoryLedger(), {"path": "a.py", "source": "x = a == b\n", "limit": 0}) == []

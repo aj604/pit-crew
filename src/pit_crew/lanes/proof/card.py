@@ -15,6 +15,7 @@ from pit_crew.lanes.proof.verify import MODEL, Replay
 WIDTH = 760
 ROW = 30
 _TOP = 116  # y of the table header
+_BRANCH_CHARS = 56  # fits the 18px title left of a right-aligned REJECT
 _STYLE = """
 text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; fill: #e6edf3; }
 .title { font-size: 18px; font-weight: bold; }
@@ -40,13 +41,12 @@ def render_card(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequ
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" viewBox="0 0 {WIDTH} {height}">',
         f"<style>{_STYLE}</style>",
         f'<rect width="{WIDTH}" height="{height}" rx="12" fill="#0d1117"/>',
-        _text(24, 36, branch, "title"),
+        _text(24, 36, _clip(branch, _BRANCH_CHARS), "title"),
         _text(WIDTH - 24, 36, "KEEP" if verdict.keep else "REJECT", f"title {verdict_class}", "end"),
         _text(
             24,
             76,
-            f"CI time  {_duration(median(evidence.baseline_seconds))}  ->  "
-            f"{_duration(median(evidence.candidate_seconds))}",
+            f"CI time  {_median(evidence.baseline_seconds)}  ->  {_median(evidence.candidate_seconds)}",
             "big",
         ),
         _text(WIDTH - 24, 76, _speedup(verdict), f"big {verdict_class if verdict.keep else 'muted'}", "end"),
@@ -75,7 +75,7 @@ def render_card(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequ
 def pr_body(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequence[Replay], card_url: str) -> str:
     """Return the markdown PR body: the card, the verdict, and every replay with links to its recordings."""
     rows = [
-        "| Bug | Check | Baseline | Candidate | Result | Recordings | What Gemini 4 Neon saw |",
+        f"| Bug | Check | Baseline | Candidate | Result | Recordings | What {MODEL} saw |",
         "|---|---|---|---|---|---|---|",
     ]
     for r in replays:
@@ -83,9 +83,9 @@ def pr_body(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequence
         rows.append(
             f"| `{r.sha[:7]}` | {_cell(r.check)} | {_outcome(failed=r.baseline_failed)} "
             f"| {_outcome(failed=r.candidate_failed)} | **{r.status}** "
-            f"| [baseline]({r.baseline_video}) / [candidate]({r.candidate_video}) | {_cell(seen)} |"
+            f"| {_recordings(r)} | {_cell(seen)} |"
         )
-    before, after = _duration(median(evidence.baseline_seconds)), _duration(median(evidence.candidate_seconds))
+    before, after = _median(evidence.baseline_seconds), _median(evidence.candidate_seconds)
     return "\n".join(
         [
             f"## Pit Crew: `{branch}`",
@@ -137,6 +137,17 @@ def _text(x: int, y: int, s: str, css: str, anchor: str = "start") -> str:
 def _run(x: int, y: int, *, failed: bool) -> str:
     # Red means the check went red on the bug, which is what we want to see on both sides.
     return _text(x, y, "x failed" if failed else "o passed", "red" if failed else "muted")
+
+
+def _median(seconds: Sequence[float]) -> str:
+    # The rater rejects a candidate with no runs; the card still has to say so.
+    return _duration(median(seconds)) if seconds else "no runs"
+
+
+def _recordings(replay: Replay) -> str:
+    # A replay without agg or ffmpeg has no video; say so rather than link to nothing.
+    videos = (("baseline", replay.baseline_video), ("candidate", replay.candidate_video))
+    return " / ".join(f"[{side}]({url})" for side, url in videos if url) or "none"
 
 
 def _duration(seconds: float) -> str:

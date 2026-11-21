@@ -13,7 +13,14 @@ import yaml
 
 from pit_crew.lanes.proof.miner import check_key
 
-_WORKFLOWS = ".github/workflows/"
+_WORKFLOWS = ".github/workflows"  # GitHub runs only the files directly in here
+
+Check = frozenset[str]
+"""One job's check keys: by job id and by display name, and across a change, old and new.
+
+CI history names a job by its display name, so a check counts as covered when a bug was
+recorded under any one of its keys.
+"""
 
 
 class FileChange(TypedDict):
@@ -35,20 +42,20 @@ class Workflow:
     def needs(self, job_id: str) -> tuple[str, ...]:
         """Return the jobs `job_id` waits for."""
         needs = self.jobs.get(job_id, {}).get("needs") or ()
-        return (needs,) if isinstance(needs, str) else tuple(str(n) for n in needs)
+        return (needs,) if isinstance(needs, str) else tuple(needs)
 
-    def keys(self, job_ids: Iterable[str]) -> set[str]:
-        """Return check keys for these jobs, by id and by display name, so either spelling matches."""
-        out = set()
-        for job_id in set(job_ids) & self.jobs.keys():
-            name = self.jobs[job_id].get("name")
-            out.add(check_key(self.name, job_id))
-            out.add(check_key(self.name, name if isinstance(name, str) and name else job_id))
-        return out
+    def keys(self, job_id: str) -> Check:
+        """Return the job's check keys, by id and by display name, or none if there is no such job."""
+        if job_id not in self.jobs:
+            return frozenset()
+        name = self.jobs[job_id].get("name")
+        return frozenset(
+            {check_key(self.name, job_id), check_key(self.name, name if isinstance(name, str) and name else job_id)}
+        )
 
 
 def parse_workflow(text: str, path: str) -> Workflow | None:
-    """Parse a workflow file, or return None if it is not YAML with a mapping of jobs."""
+    """Parse a workflow file, or return None if it is not YAML with a mapping of well-formed jobs."""
     try:
         doc = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -63,19 +70,19 @@ def parse_workflow(text: str, path: str) -> Workflow | None:
     )
 
 
-def touched_checks(changes: Iterable[FileChange]) -> set[str] | None:
-    """Return the check keys a change can affect, or None for every check.
+def touched_checks(changes: Iterable[FileChange]) -> set[Check] | None:
+    """Return the checks a change can affect, or None for every check.
 
-    A changed file outside .github/workflows/ (a script, a test config, a lockfile, a
-    composite action) can affect any check, so it answers None, as does a workflow that
-    won't parse. A change outside `jobs:` (triggers, env, permissions) touches every job in
-    that workflow. A removed job is reported as touched, so its old bugs are replayed and
-    the removal fails.
+    A changed file that is not a workflow directly in .github/workflows/ (a script, a test
+    config, a lockfile, a composite action) can affect any check, so it answers None, as
+    does a workflow that won't parse. A change outside `jobs:` (triggers, env, permissions)
+    touches every job in that workflow. A removed job is reported as touched, so its old
+    bugs are replayed and the removal fails.
     """
-    touched: set[str] = set()
+    touched: set[Check] = set()
     for change in changes:
         path = change["path"]
-        if not (path.startswith(_WORKFLOWS) and path.endswith((".yml", ".yaml"))):
+        if not _is_workflow(path):
             return None
         before = _side(change["before"], path)
         after = _side(change["after"], path)
@@ -87,27 +94,42 @@ def touched_checks(changes: Iterable[FileChange]) -> set[str] | None:
         else:
             changed = set(every_job)
         changed = _with_dependents(changed, before, after)
-        touched |= before.keys(changed) | after.keys(changed)
+        # A renamed job or workflow is one check, so its old and new spellings go together.
+        touched |= {before.keys(job_id) | after.keys(job_id) for job_id in changed}
     return touched
 
 
-def all_checks(workflows: Mapping[str, str]) -> set[str] | None:
-    """Return every check key defined by these workflow files (path -> text), or None if one won't parse."""
-    keys: set[str] = set()
+def all_checks(workflows: Mapping[str, str]) -> set[Check] | None:
+    """Return every check defined by these workflow files (path -> text), or None if one won't parse."""
+    checks: set[Check] = set()
     for path, text in workflows.items():
         workflow = parse_workflow(text, path)
         if workflow is None:
             return None
-        keys |= workflow.keys(workflow.jobs)
-    return keys
+        checks |= {workflow.keys(job_id) for job_id in workflow.jobs}
+    return checks
 
 
 def _side(text: str | None, path: str) -> Workflow | None:
     return Workflow(path) if text is None else parse_workflow(text, path)
 
 
+def _is_workflow(path: str) -> bool:
+    folder, _, file = path.rpartition("/")
+    return folder == _WORKFLOWS and file.endswith((".yml", ".yaml"))
+
+
 def _is_jobs(jobs: object) -> bool:
-    return isinstance(jobs, dict) and all(isinstance(k, str) and isinstance(v, dict) for k, v in jobs.items())
+    return isinstance(jobs, dict) and all(isinstance(k, str) and _is_job(v) for k, v in jobs.items())
+
+
+def _is_job(job: object) -> bool:
+    if not isinstance(job, dict):
+        return False
+    needs = job.get("needs")
+    return (
+        needs is None or isinstance(needs, str) or (isinstance(needs, list) and all(isinstance(n, str) for n in needs))
+    )
 
 
 def _with_dependents(changed: set[str], *workflows: Workflow) -> set[str]:
