@@ -54,6 +54,12 @@ the live API yet.
 To add a tool, decorate a function in your lane's `tools.py` with `@tool`. To change a
 record in `contracts.py`, open a separate PR, because every lane depends on it.
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — end-to-end lifecycle, trust boundaries, data contracts, and open architectural decisions.
+- [Lane Owner Guide](docs/lane-guide.md) — working agreements, `@tool` and `SKILL.md` conventions, testing, and per-lane starting points.
+- [TODO](TODO.md) — tasks, deliverables, and integration milestones per lane.
+
 ## Open decisions
 
 - Gemini API or the Cloud Agent Platform surface for Managed Agents.
