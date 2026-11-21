@@ -13,14 +13,17 @@ _TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
 _SPACE = " \t"  # the only blanks bash recognises; \r, \f and \v are word characters
 
 
-def _opaque(c: str, nxt: str, *, quoted: bool) -> bool:
+def _opaque(c: str, nxt: str, quote: str) -> bool:
     """True where the script can run something this scan cannot see: substitutions, heredocs, process substitution.
 
     `$'` (ANSI-C quoting, where a backslash escapes a quote) is opaque too: it is treated as real work, not parsed.
+    Inside single quotes nothing expands, so a backtick or `$(` there is literal text; inside double quotes it runs.
     """
+    if quote == "'":
+        return False
     if c == "`" or (c == "$" and nxt == "("):
         return True
-    if quoted:
+    if quote:
         return False
     return (c in "<>" and nxt == "(") or (c == "<" and nxt == "<") or (c == "$" and nxt == "'")
 
@@ -49,7 +52,7 @@ def _segments(run: str) -> list[str] | None:
     i = 0
     while i < len(run):
         c, nxt = run[i], run[i + 1 : i + 2]
-        if _opaque(c, nxt, quoted=bool(quote)):
+        if _opaque(c, nxt, quote):
             return None
         step = 1
         if c == "\\" and quote != "'":

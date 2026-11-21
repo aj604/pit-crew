@@ -365,6 +365,10 @@ def test_parallelize_logging_prefix_does_not_hide_real_work() -> None:
         ("echo a\t# ; curl x", True),
         ("echo $'\\'' ; curl x ; echo 'z'", False),  # ANSI-C quoting: a backslash escapes the quote
         ("echo $'a' ; curl x", False),
+        ("echo 'All checks passed: `ok`'", True),  # single quotes: nothing expands
+        ("echo 'status $(not run)'", True),
+        ('echo "result: $(make build)"', False),  # double quotes still expand
+        ('echo "x `make build`"', False),
     ],
 )
 def test_trivial_run_checks_every_segment(script: str, *, trivial: bool) -> None:
@@ -402,3 +406,20 @@ def test_parallelize_does_not_treat_tokenizer_edge_cases_as_wait_only(script: st
     steps = f"    steps:\n      - run: {json.dumps(script)}"
     p, wf = profiled(two_jobs(steps), SPANS)
     assert [f.job for f in detect_parallelize_dag(p, wf, PATH)] == ["test"]
+
+
+def test_parallelize_keeps_gate_that_echoes_single_quoted_backticks() -> None:
+    steps = "    steps:\n      - run: |\n          echo 'All checks passed: `ok`'"
+    wf_yaml = f"""
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  gate:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+{steps}
+"""
+    p, wf = profiled(wf_yaml, {"a": (0, 50), "b": (0, 100), "gate": (100, 125)})
+    assert detect_parallelize_dag(p, wf, PATH) == []
