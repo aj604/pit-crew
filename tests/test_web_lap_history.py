@@ -131,11 +131,12 @@ const fakeNode = (tag = "div", extra = {}) => {
     setAttribute(k, v) { this.attrs[k] = v; },
     addEventListener(t, fn) { (ls[t] ??= []).push(fn); },
     dispatchEvent(event) {
-      let stopped = false;
-      const ev = { target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
-        stopPropagation() { stopped = true; }, ...event };
+      const ev = event._ev ? event : {
+        _ev: true, _stopped: false, target: this, defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this._stopped = true; }, ...event,
+      };
       for (const fn of ls[ev.type] ?? []) fn(ev);
-      if (!stopped && this.parentNode) this.parentNode.dispatchEvent(ev);
+      if (!ev._stopped && this.parentNode) this.parentNode.dispatchEvent(ev);
       return ev;
     },
     replaceChildren(...kids) { this.kids = []; this.append(...kids); },
@@ -184,11 +185,15 @@ const slot = d.ids["lap-history"];
 const rows = () => pw.lapHistory.getRows().map((tr) => {
   const tds = tr.querySelectorAll("td"), link = tr.querySelectorAll("a")[0] ?? null;
   const cmp = tr.querySelectorAll(".lap-history__compound")[0], ring = tr.querySelectorAll(".lap-history__ring")[0];
+  const targetEl = tds[2].querySelectorAll(".lap-history__target")[0] ?? null;
+  const summaryEl = tds[2].querySelectorAll(".lap-history__summary")[0] ?? null;
   const verd = tr.querySelectorAll(".lap-history__verdict")[0], bugs = tr.querySelectorAll(".lap-history__bugs")[0];
   return {
     sel: tr.attrs["aria-selected"], selCls: tr.className.includes("lap-history__row--selected"),
+    labels: tds.map((td) => td.dataset.label),
     n: tds[0].textContent, skill: cmp.dataset.skill, tok: cmp.dataset.compoundToken, ring: ring.style.borderColor,
-    code: ring.textContent, spd: tds[3].textContent, p: tds[4].textContent, bugs: bugs.textContent,
+    code: ring.textContent, targetTxt: targetEl?.textContent ?? null, summaryTxt: summaryEl?.textContent ?? null,
+    spd: tds[3].textContent, p: tds[4].textContent, bugs: bugs.textContent,
     bugsSt: bugs.dataset.status, v: verd.textContent, vCls: verd.className,
     pr: link ? link.textContent : textOf(tds[7]), href: link?.attrs.href ?? null,
     target: link?.attrs.target ?? null, rel: link?.attrs.rel ?? null,
@@ -214,8 +219,11 @@ const key1 = { idx: pw.store.getState().selectedAttemptIndex, prev: k1.defaultPr
   focus: d.doc.activeElement?.dataset?.attemptIndex, hdr: hdr() };
 pw.lapHistory.getRows()[2].dispatchEvent({ type: "keydown", key: " " });
 const key2 = { idx: pw.store.getState().selectedAttemptIndex, hdr: hdr() };
-const prEv = pw.lapHistory.getRows()[0].querySelectorAll("a")[0].click();
+const prLink = pw.lapHistory.getRows()[0].querySelectorAll("a")[0];
+const prEv = prLink.click();
 const prClick = { idx: pw.store.getState().selectedAttemptIndex, prev: prEv.defaultPrevented };
+const prKeyEv = prLink.dispatchEvent({ type: "keydown", key: "Enter" });
+const prKey = { idx: pw.store.getState().selectedAttemptIndex, prev: prKeyEv.defaultPrevented };
 const missing = app.bootPitWall(fakeDoc(false).doc, "").lapHistory === null;
 const helper = {
   nullState: app.statusForHeader(null),
@@ -242,7 +250,7 @@ const helper = {
   }),
 };
 console.log(JSON.stringify({
-  headers, demoKeep, demoReject, demoPending, liveEmpty, liveInit, click0, key1, key2, prClick, missing, helper,
+  headers, demoKeep, demoReject, demoPending, liveEmpty, liveInit, click0, key1, key2, prClick, prKey, missing, helper,
 }));
 """
 
@@ -292,6 +300,11 @@ def test_lap_history_renders_selects_syncs_header_and_handles_empty() -> None:
     assert (keep["n"], keep["skill"], keep["tok"], keep["ring"], keep["code"]) == (
         "1", "dep-cache", "var(--pc-compound-soft)", "var(--pc-compound-soft)", "S",
     )  # fmt: skip
+    assert keep["labels"] == out["headers"]
+    assert (keep["targetTxt"], keep["summaryTxt"]) == (
+        ".github/workflows/ci.yml · test · Install dependencies",
+        "Cache pip downloads keyed on requirements.txt.",
+    )
     assert (keep["spd"], keep["p"], keep["bugs"], keep["bugsSt"], keep["v"], keep["pr"]) == (
         "1.85x", "0.004", "4/4", "all", "KEEP", "—",
     )  # fmt: skip
@@ -299,14 +312,28 @@ def test_lap_history_renders_selects_syncs_header_and_handles_empty() -> None:
     assert (rej["skill"], rej["tok"], rej["bugs"], rej["bugsSt"], rej["v"]) == (
         "affected-tests", "var(--pc-compound-hard)", "3/4", "missed", "REJECT",
     )  # fmt: skip
+    assert (rej["targetTxt"], rej["summaryTxt"]) == (
+        ".github/workflows/ci.yml · test · Run tests",
+        "Run only tests whose imports touch changed files.",
+    )
     assert "lap-history__verdict--reject" in rej["vCls"]
     assert (pend["spd"], pend["p"], pend["bugs"], pend["v"]) == ("—", "—", "—", "PENDING")
+    assert (pend["targetTxt"], pend["summaryTxt"]) == (
+        ".github/workflows/ci.yml · test · Run tests",
+        "Full pytest run dominates the test job; only run tests affected by the diff.",
+    )
     assert "lap-history__verdict--pending" in pend["vCls"]
 
     assert out["liveEmpty"][:2] == [0, "0 laps"]
     assert "No laps recorded" in out["liveEmpty"][2]
     live_rows = out["liveInit"]["rows"]
     assert [r["v"] for r in live_rows] == ["KEEP", "REJECT", "PENDING"]
+    assert [r["labels"] for r in live_rows] == [out["headers"]] * 3
+    assert [(r["targetTxt"], r["summaryTxt"]) for r in live_rows] == [
+        (".github/workflows/ci.yml · test · Install", "Enable uv cache"),
+        (".github/workflows/ci.yml · test · Pytest", "2 shards"),
+        (".github/workflows/ci.yml · lint", "Parallelize jobs"),
+    ]
     assert (live_rows[0]["pr"], live_rows[0]["href"], live_rows[0]["target"], live_rows[0]["rel"]) == (
         "PR #99", "https://github.com/aj604/pit-crew/pull/99", "_blank", "noopener noreferrer",
     )  # fmt: skip
@@ -319,6 +346,7 @@ def test_lap_history_renders_selects_syncs_header_and_handles_empty() -> None:
     assert out["key1"] == {"idx": 1, "prev": True, "focus": "1", "hdr": ["aaaaaaa", "69.0", "70.8", True]}
     assert out["key2"] == {"idx": 2, "hdr": ["aaaaaaa", "--", "--", True]}
     assert out["prClick"] == {"idx": 2, "prev": False}
+    assert out["prKey"] == {"idx": 2, "prev": False}
     assert out["missing"] is True
 
     h = out["helper"]
