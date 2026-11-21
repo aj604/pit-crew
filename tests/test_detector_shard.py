@@ -218,3 +218,42 @@ def test_shard_empty_value_assignments_do_not_hide_the_test_command() -> None:
     assert not _is_static_check("FOO= BAR=1 pytest")
     prof, wf = build([("Unit", 240.0)], runs={"Unit": "FOO= BAR=1 pytest"})
     assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Unit"]
+
+
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        ("Run tests", "sudo aws s3 cp test-results s3://x"),
+        ("Run tests", "env AWS_PROFILE=x time nice nohup aws s3 cp test-results s3://x"),
+        ("Run tests", "gh run download && ./publish.sh"),
+        ("Run tests", "gh release upload v1 dist/*"),
+        ("Upload test report", "npx junit-upload report.xml"),
+        ("Upload test report", "codecov --file coverage.xml"),
+        ("Upload test report", "xargs coveralls"),
+        ("Lint tests", '"ruff" check tests/'),
+        ("Typecheck tests", "'mypy' tests/"),
+    ],
+)
+def test_shard_ignores_commands_that_only_mention_tests(name: str, command: str) -> None:
+    prof, wf = build([(name, 240.0)], runs={name: f"|\n          {command}"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tox -e py312",
+        "./scripts/ci.sh",
+        "uv run pytest tests/",
+        "python -m pytest",
+        "cargo test",
+        "make test",
+        "npx tsc -p tests && npm test",
+        "npx playwright test",
+        "sudo -E pytest",
+        '"pytest" tests/',
+    ],
+)
+def test_shard_keeps_real_test_commands_positive(command: str) -> None:
+    prof, wf = build([("Run tests", 240.0)], runs={"Run tests": f"|\n          {command}"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]

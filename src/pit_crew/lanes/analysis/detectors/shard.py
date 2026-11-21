@@ -22,13 +22,19 @@ TEST_STEP = re.compile(
     r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test|tox|nox|ctest)\b",
     re.IGNORECASE,
 )
-_WRAPPERS = frozenset({"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"})
+_WRAPPERS = frozenset(
+    {"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"}  # runners
+    | {"sudo", "env", "time", "nice", "nohup", "xargs"}  # prefixes that run the command that follows
+)
 _STATIC_TOOLS = frozenset(
     {"mypy", "ruff", "pyright", "tsc", "eslint", "flake8", "black", "isort", "pylint", "prettier", "biome"}
 )  # linters and type checkers take `tests/` as a path to read, not a suite to run
 _NON_TEST_COMMANDS = _STATIC_TOOLS | frozenset(
-    {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir"}
-)
+    {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir", "gh"}
+)  # `gh` downloads artifacts and cuts releases; it never runs a suite
+_UPLOAD_COMMANDS = frozenset({"codecov", "coveralls"})
+_UPLOAD_MARKERS = ("upload", "publish")  # `junit-upload`, `./publish.sh`: they ship results, not run tests
+_QUOTES = ("'", '"')
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
@@ -50,17 +56,35 @@ def _is_assignment(token: str) -> bool:
     )
 
 
-def _first_command(segment: str) -> str:
-    """The command word of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
+def _unquote(token: str) -> str:
+    """Strip one level of matching surrounding quotes."""
+    if token[:1] in _QUOTES and len(token) > 1 and token[-1] == token[0]:
+        return token[1:-1]
+    return token
+
+
+def _first_token(segment: str) -> str:
+    """The command token of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
 
     A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
     """
-    for token in segment.split():
+    for raw in segment.split():
+        token = _unquote(raw)
         if token in _WRAPPERS or token.startswith("-") or _is_assignment(token):
             continue
-        word = _WORD.match(token)
-        return word.group() if word is not None else token
+        return token
     return ""
+
+
+def _word(token: str) -> str:
+    """The token's leading word characters, or the whole token when it does not start with one."""
+    match = _WORD.match(token)
+    return match.group() if match is not None else token
+
+
+def _first_command(segment: str) -> str:
+    """The command word of a shell segment (see `_first_token`)."""
+    return _word(_first_token(segment))
 
 
 def _is_static_check(segment: str) -> bool:
@@ -70,7 +94,12 @@ def _is_static_check(segment: str) -> bool:
 
 def _is_non_test_command(segment: str) -> bool:
     """Whether the segment's command is a static check or a file-moving/printing tool, never a test runner."""
-    return _first_command(segment) in _NON_TEST_COMMANDS
+    token = _first_token(segment).lower()
+    return (
+        _first_command(segment) in _NON_TEST_COMMANDS
+        or _word(token) in _UPLOAD_COMMANDS
+        or any(marker in token for marker in _UPLOAD_MARKERS)
+    )
 
 
 def _runs_tests(step: StepSpec) -> bool:
