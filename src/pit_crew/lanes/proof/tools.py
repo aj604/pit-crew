@@ -11,7 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 
-from pit_crew.contracts import BugCase, Candidate, ReplayPlan
+from pit_crew.contracts import BugCase, Candidate, ReplayPlan, is_allowed_candidate_path
 from pit_crew.lanes.proof.checks import Check
 from pit_crew.lanes.proof.miner import RedCommit
 from pit_crew.lanes.proof.mutants import mutants
@@ -37,9 +37,22 @@ class InvalidReplayPlanError(ValueError):
         return cls(f"not commit SHAs: {', '.join(bad)}")
 
     @classmethod
-    def bad_mutation(cls, path: str) -> "InvalidReplayPlanError":
+    def not_a_list(cls, field: str) -> "InvalidReplayPlanError":
+        """Build the error for bug_shas, commits or mutations given as something other than a list."""
+        return cls(f"{field} must be a list")
+
+    @classmethod
+    def bad_mutation(cls, path: object) -> "InvalidReplayPlanError":
         """Build the error for a mutation without a relative path and new contents."""
         return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
+
+    @classmethod
+    def mutates_the_candidate(cls, path: str) -> "InvalidReplayPlanError":
+        """Build the error for a mutation of CI config or of a file the candidate changed."""
+        return cls(
+            f"a mutation must change code under test, not {path!r}: the candidate may change that file, "
+            "so replaying the mutation would overwrite the change it is meant to test"
+        )
 
     @classmethod
     def disallowed_mutation_path(cls, path: str) -> "InvalidReplayPlanError":
@@ -192,9 +205,9 @@ def plan_replays(
     commits: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     """Choose which bugs to replay against a candidate: red commits and mutated files. Returns the plan id."""
-    ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
-    shas, cases = _commit_cases(bug_shas, commits)
-    cases += [_mutation_case(m) for m in mutations or ()]
+    candidate = ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
+    shas, cases = _commit_cases(_listed(bug_shas, "bug_shas"), _listed(commits, "commits"))
+    cases += [_mutation_case(m, candidate) for m in _listed(mutations, "mutations")]
     if not cases:
         raise InvalidReplayPlanError.empty()
     plan = ReplayPlan(candidate_id, bug_shas=shas, cases=tuple(cases))
@@ -202,20 +215,31 @@ def plan_replays(
     return plan.id
 
 
-def _commit_cases(
-    bug_shas: Sequence[str] | None,
-    commits: Sequence[Mapping[str, object]] | None,
-) -> tuple[tuple[str, ...], list[BugCase]]:
-    raw_entries: list[tuple[object, tuple[str, ...], str]] = [(sha, (), "") for sha in bug_shas or ()]
-    for entry in commits or ():
-        raw_reason = entry.get("reason")
+# The model writes these arguments, so each has its type checked here: a wrong one must come
+# back to the model as an error it can fix, not crash the lane.
+
+
+def _listed(value: object, field: str) -> list[object]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise InvalidReplayPlanError.not_a_list(field)
+    return value
+
+
+def _commit_cases(bug_shas: list[object], commits: list[object]) -> tuple[tuple[str, ...], list[BugCase]]:
+    raw_entries: list[tuple[object, tuple[str, ...], str]] = [(sha, (), "") for sha in bug_shas]
+    for entry in commits:
+        fields = entry if isinstance(entry, Mapping) else {}
+        raw_reason = fields.get("reason")
         reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
-        raw_entries.append((entry.get("sha"), _parse_expected_checks(entry.get("expected_checks")), reason))
+        raw_entries.append((fields.get("sha"), _parse_expected_checks(fields.get("expected_checks")), reason))
 
     bad: list[str] = []
     merged_checks: dict[str, list[str]] = {}
     merged_reason: dict[str, str] = {}
     for raw_sha, checks, reason in raw_entries:
+        # A number is refused, not read as hex: 0012345 written as a number is the wrong commit.
         sha = raw_sha.strip().lower() if isinstance(raw_sha, str) else ""
         if not _SHA.match(sha):
             bad.append(sha if isinstance(raw_sha, str) else repr(raw_sha))
@@ -243,23 +267,24 @@ def _commit_cases(
     return shas, cases
 
 
-def _mutation_case(mutation: Mapping[str, object]) -> BugCase:
-    raw_path, raw_content = mutation.get("path", ""), mutation.get("content", "")
-    path = raw_path if isinstance(raw_path, str) else ""
-    content = raw_content if isinstance(raw_content, str) else ""
+def _mutation_case(mutation: object, candidate: Candidate) -> BugCase:
+    fields = mutation if isinstance(mutation, Mapping) else {}
+    path, content, reason = (fields.get(k, "") for k in ("path", "content", "reason"))
+    if not (isinstance(path, str) and isinstance(content, str) and isinstance(reason, str)) or not content:
+        raise InvalidReplayPlanError.bad_mutation(path)
     parts = path.split("/")
     # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
-    if not content or "\\" in path or any(part in {"", ".", ".."} for part in parts):
+    if "\\" in path or any(part in {"", ".", ".."} for part in parts):
         raise InvalidReplayPlanError.bad_mutation(path)
     if parts[0].lower() == ".github":
         raise InvalidReplayPlanError.disallowed_mutation_path(path)
-    raw_reason = mutation.get("reason")
-    reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else "synthetic mutation"
-    expected_checks = _parse_expected_checks(mutation["expected_checks"]) if "expected_checks" in mutation else ()
+    if is_allowed_candidate_path(path) or path in candidate.changed_files:
+        raise InvalidReplayPlanError.mutates_the_candidate(path)
+    expected_checks = _parse_expected_checks(fields["expected_checks"]) if "expected_checks" in fields else ()
     return BugCase(
         kind="mutation",
         mutated_files={path: content},
-        reason=reason,
+        reason=reason.strip() or "synthetic mutation",
         expected_checks=expected_checks,
     )
 

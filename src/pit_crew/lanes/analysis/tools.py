@@ -7,15 +7,18 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 import math
 import re
 import urllib.error
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Hypothesis
 from pit_crew.lanes.analysis import history
-from pit_crew.lanes.analysis.critical_path import profile
+from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.dedupe_ledger import DuplicateHypothesisError, hypothesis_key, recorded_keys
-from pit_crew.lanes.analysis.workflow import parse_workflow
+from pit_crew.lanes.analysis.detectors import DETECTORS
+from pit_crew.lanes.analysis.detectors.base import keep_worthwhile
+from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
@@ -66,34 +69,31 @@ def workflow_path(workflow: str) -> Path:
     return path
 
 
-def _load_workflow_and_history(  # noqa: PLR0913  mirrors profile_ci parameters
+def _load_workflow_text(  # noqa: PLR0913  mirrors profile_ci parameters
     repo: str,
     workflow: str,
-    *,
-    runs: int,
     branch: str | None,
+    raw: list[dict[str, Any]],
+    *,
     workflow_content: str | None,
     ref: str | None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Load workflow YAML and run history, falling back to a run's commit SHA if ``branch`` was deleted."""
-    if workflow_content is not None:
-        _validate_workflow_name(workflow)
-        return workflow_content, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+) -> str:
+    """The workflow file's text: the caller's, else the checkout's, else GitHub's at ``ref``/``branch``.
 
+    If ``branch`` was deleted (404) the file is read at the commit of a run in ``raw``. The text keeps the
+    file's exact bytes (line endings included) so its blob SHA matches GitHub's.
+    """
+    if workflow_content is not None:
+        return workflow_content
     path = workflow_path(workflow)
     if path.is_file():
-        return path.read_text(), history.fetch_history(repo, workflow, runs=runs, branch=branch)
-
-    fetch_ref = ref or branch
+        return path.read_bytes().decode()
     try:
-        yaml_text = history.fetch_workflow(repo, workflow, ref=fetch_ref)
+        return history.fetch_workflow(repo, workflow, ref=ref or branch)
     except urllib.error.HTTPError as exc:
         if ref is not None or branch is None or exc.code != _HTTP_NOT_FOUND:
             raise
-        raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
-        return _fetch_workflow_from_runs(repo, workflow, branch, raw), raw
-
-    return yaml_text, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+        return _fetch_workflow_from_runs(repo, workflow, branch, raw)
 
 
 def _fetch_workflow_from_runs(
@@ -153,18 +153,189 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
     wall-clock time any change to that job can save. Jobs with max_saving_seconds of 0 are off
     the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
+    profiled = _profile_workflow(repo, workflow, runs, branch, workflow_content=workflow_content, ref=ref)
+    return {
+        **profiled.ci.to_dict(),
+        "runs_excluded_revision": profiled.excluded,
+        "runs_excluded_event": profiled.excluded_event,
+    }
+
+
+@dataclass(frozen=True)
+class _Profiled:
+    ci: CIProfile
+    spec: Workflow
+    excluded: int  # runs dropped because their workflow file differs from the checkout's
+    matched: int  # runs whose workflow file is byte-identical to the checkout's
+    excluded_event: int  # runs dropped because their event does not execute the workflow at head_sha
+    fetched: int  # runs the history returned before any exclusion
+
+
+# Events whose run executes the workflow file as committed at head_sha, in the order they are fetched.
+_HEAD_SHA_EVENT_ORDER = ("push", "merge_group", "workflow_dispatch", "schedule")
+_HEAD_SHA_EVENTS = frozenset(_HEAD_SHA_EVENT_ORDER)
+
+
+def _newest_first(run: dict[str, Any]) -> tuple[str, int]:
+    raw_id = run.get("id")
+    return str(run.get("run_started_at") or run.get("created_at") or ""), raw_id if isinstance(raw_id, int) else 0
+
+
+def _fetch_trusted_history(repo: str, workflow: str, runs: int, branch: str | None) -> list[dict[str, Any]]:
+    """The newest `runs` runs among the trusted events, newest first.
+
+    One request per event (at most four), each asking only for what is still missing, so pull-request runs
+    never use up the window and no jobs are fetched for runs that would be dropped. Runs are de-duplicated by id.
+    """
+    collected: dict[object, dict[str, Any]] = {}
+    for event in _HEAD_SHA_EVENT_ORDER:
+        if len(collected) >= runs:
+            break
+        for run in history.fetch_history(repo, workflow, runs=runs - len(collected), branch=branch, event=event):
+            collected.setdefault(run.get("id"), run)
+    return sorted(collected.values(), key=_newest_first, reverse=True)[: max(runs, 0)]
+
+
+def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
+    repo: str,
+    workflow: str,
+    runs: int,
+    branch: str | None,
+    *,
+    workflow_content: str | None = None,
+    ref: str | None = None,
+) -> _Profiled:
+    """Validate the arguments, read the workflow file and its run history, and profile it.
+
+    Only runs whose workflow file is byte-identical to the checkout's are profiled: a run of another
+    revision may have a same-named step that runs a different command. Only events that execute the
+    workflow at head_sha count: pull_request runs the merge commit's file and pull_request_target the
+    base branch's, so the blob at head_sha says nothing about what ran. The history is fetched per trusted
+    event, so pull-request runs cannot fill the window; the event filter below stays as defence in depth.
+    """
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    yaml_text, raw = _load_workflow_and_history(
-        repo,
-        workflow,
-        runs=runs,
-        branch=branch,
-        workflow_content=workflow_content,
-        ref=ref,
+    if workflow_content is None:
+        workflow_path(workflow)  # reject a bad workflow name before any network call
+    else:
+        _validate_workflow_name(workflow)
+    fetched = _fetch_trusted_history(repo, workflow, runs, branch)
+    raw = [r for r in fetched if r.get("event") in _HEAD_SHA_EVENTS]
+    text = _load_workflow_text(repo, workflow, branch, raw, workflow_content=workflow_content, ref=ref)
+    spec = parse_workflow(text)
+    local = history.workflow_blob_sha(text)
+    remote = (
+        history.fetch_workflow_blob_shas(
+            repo, f".github/workflows/{workflow}", {str(r.get("head_sha", "")) for r in raw}
+        )
+        if raw
+        else {}
     )
-    return profile(parse_workflow(yaml_text), history.parse_runs(raw)).to_dict()
+    same = [r for r in raw if remote.get(str(r.get("head_sha", ""))) == local]
+    return _Profiled(
+        profile(spec, history.parse_runs(same)),
+        spec,
+        len(raw) - len(same),
+        len(same),
+        len(fetched) - len(raw),
+        len(fetched),
+    )
+
+
+_NO_MATCHING_REVISION = (
+    "No run in the history used this exact workflow file, so nothing can be measured against the checkout. "
+    "Analyse the branch the history comes from: check that branch out and pass it as `branch`."
+)
+
+_NO_TRUSTED_EVENT_RUNS = (
+    "No push, workflow_dispatch, schedule or merge_group runs were found. Pull-request and other runs "
+    "cannot be matched to the checkout's workflow file; profile the default branch (branch=<default>) "
+    "or push/workflow_dispatch runs."
+)
+
+
+def _uncovered(ci: CIProfile) -> list[str]:
+    """Plain-language notes on time no playbook skill can shrink."""
+    notes: list[str] = []
+    if ci.runs_analyzed == 0:  # with nothing measured the buckets are all zero and "waiting" would win by default
+        return ["No runs analyzed (all excluded or none fetched); nothing was measured."]
+    if "waiting" in {ci.biggest_bucket, ci.biggest_bucket_p95}:
+        notes.append(
+            "The critical path's biggest bucket is waiting for a runner "
+            f"(p50: {ci.biggest_bucket}, p95: {ci.biggest_bucket_p95}): no playbook skill shrinks runner queueing. "
+            "Report it; runner choice and cancelling superseded runs are outside the playbook."
+        )
+    return notes
+
+
+@tool(
+    lane="analysis",
+    parameters={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "owner/name whose Actions history to read"},
+            "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
+            "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
+            "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
+        },
+        "required": ["repo", "workflow"],
+    },
+)
+def find_bottlenecks(
+    ledger: Ledger,
+    repo: str,
+    workflow: str,
+    runs: int = history.DEFAULT_RUNS,
+    branch: str | None = None,
+) -> dict[str, Any]:
+    """Profile one workflow, run every bottleneck detector, and rank what is left.
+
+    Returns profile_summary (wall-clock p50/p95, the critical path and its waiting/setup/running
+    split, and base_sha: the commit of the newest analyzed run), findings (each ready to pass to
+    record_hypothesis; biggest expected_savings_seconds first, none under 10 seconds; bottlenecks
+    already in the ledger are left out) and uncovered (time no playbook skill can shrink, such as
+    runner queueing: report these).
+    """
+    profiled = _profile_workflow(repo, workflow, runs, branch)
+    ci, spec = profiled.ci, profiled.spec
+    path = f".github/workflows/{workflow}"
+    seen = recorded_keys(ledger, repo)
+    no_match = profiled.matched == 0 and profiled.excluded > 0
+    only_other_events = profiled.excluded_event == profiled.fetched  # includes nothing fetched at all
+    found = (
+        []
+        if no_match or only_other_events
+        else keep_worthwhile(f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen)
+    )
+    summary = ci.to_dict()
+    return {
+        "profile_summary": {
+            "base_sha": ci.newest_head_sha,
+            **{
+                key: summary[key]
+                for key in (
+                    "runs_analyzed",
+                    "wall_clock_median_seconds",
+                    "wall_clock_p95_seconds",
+                    "critical_path",
+                    "critical_path_buckets",
+                    "biggest_bucket",
+                    "biggest_bucket_p95",
+                )
+            },
+            "runs_excluded_revision": profiled.excluded,
+            "runs_excluded_event": profiled.excluded_event,
+        },
+        "findings": [f.to_dict() for f in found],
+        "uncovered": _uncovered_notes(ci, no_match=no_match, only_other_events=only_other_events),
+    }
+
+
+def _uncovered_notes(ci: CIProfile, *, no_match: bool, only_other_events: bool) -> list[str]:
+    if only_other_events:
+        return [_NO_TRUSTED_EVENT_RUNS]
+    return [_NO_MATCHING_REVISION] if no_match else _uncovered(ci)
 
 
 class InvalidRecordError(ValueError):

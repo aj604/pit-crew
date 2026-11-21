@@ -123,6 +123,19 @@ def test_a_change_outside_workflows_touches_every_check() -> None:
     assert touched_checks([{"path": "vitest.config.ts", "before": "a", "after": "b"}]) is None
 
 
+@pytest.mark.parametrize("on", ["workflow_call", "[push, workflow_call]", "\n  workflow_call:\n    inputs: {}"])
+def test_a_reusable_workflow_touches_every_check(on: str) -> None:
+    # Its jobs report as "<caller job> / build" under each caller, never under this file's name.
+    before = f"name: Build\non: {on}\njobs:\n  build: {{runs-on: x, steps: [{{run: make}}]}}\n"
+    after = before.replace("make", "make -j8")
+    assert touched_checks(change(after, before, path=".github/workflows/build.yml")) is None
+
+
+def test_a_trigger_change_is_still_read_as_a_header_change() -> None:
+    after = WORKFLOW.replace("  pull_request:", "  push:")  # YAML reads `on` as true; it must still compare
+    assert touched_checks(change(after)) == EVERY_JOB
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -236,6 +249,85 @@ def test_shell_redirects_and_words_are_not_mutated() -> None:
     assert ops == [(4, "== -> !="), (4, "&& -> ||"), (4, "true -> false")]
 
 
+def test_shell_command_substitution_inside_arithmetic_is_shell_again() -> None:
+    # `<` here is inside [[ ]] in $( ), where flipping it to >= is a syntax error.
+    source = "echo $(( $([[ a < b ]] && echo 1 || echo 0) + 1 ))\nif (( n > 1 )); then :; fi\n"
+    ops = [(m.line, m.operator) for m in mutants("a.sh", source)]
+    assert ops == [(1, "&& -> ||"), (1, "|| -> &&"), (2, "> -> <=")]
+
+
+def test_shell_here_documents_are_text_not_code() -> None:
+    source = (
+        "cat <<'EOF' > notes.txt\n(( a < b )) && true\nEOF\n"
+        "cat <<-END <<\\LAST\n\t[ x == y ]\n\tEND\n(( c > d ))\nLAST\n"
+        "grep x <<< y && (( e < f ))\n"
+    )
+    ops = [(m.line, m.operator) for m in mutants("a.sh", source)]
+    assert ops == [(9, "&& -> ||"), (9, "< -> >=")]
+
+
+@pytest.mark.parametrize("shift", ["(( mask = 1 << bit ))", "echo $((1<<n))"])
+def test_a_shell_shift_is_not_a_here_document(shift: str) -> None:
+    assert [(m.line, m.operator) for m in mutants("a.sh", f"{shift}\n(( n > 2 ))\n")] == [(2, "> -> <=")]
+
+
+@pytest.mark.parametrize("opener", ["cat <<END-OF-FILE", "cat <<'END-OF-FILE' > out.txt"])
+def test_a_here_document_ends_at_its_whole_delimiter(opener: str) -> None:
+    source = f"{opener}\n(( a < b ))\nEND-OF-FILE\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
+def test_a_quoted_here_document_delimiter_is_not_mutated() -> None:
+    source = "cat <<'A && B'\n(( x < y ))\nA && B\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [("<<E'OF'", "EOF"), ('<<E"O"F', "EOF"), ('<<"E\\$F"', "E$F"), ("<<'E\\$F'", "E\\$F")],
+)
+def test_a_partly_quoted_here_document_delimiter_is_read_as_bash_reads_it(opener: str, closer: str) -> None:
+    source = f"cat {opener}\n(( a < b )) && true\n{closer}\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["cat <<$'E\\x4fF'\n(( n > 2 ))\nEOF\n", "cat <<E`echo O`F\n(( n > 2 ))\nEOF\n", "cat <<EOF\n(( n > 2 ))\n"],
+)
+def test_a_here_document_it_cannot_read_or_close_masks_nothing(source: str) -> None:
+    # Better a mutant in text than none for the rest of the file.
+    assert (2, "> -> <=") in [(m.line, m.operator) for m in mutants("a.sh", source)]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # The )) of (( )) inside $( ) does not close it.
+        (
+            "cat <<'OUTER' $( (( n > 1 )) && cat <<'INNER'\n(( a < b ))\nINNER\n)\n(( c < d ))\nOUTER\n(( x > y ))\n",
+            [(1, "> -> <="), (1, "&& -> ||"), (7, "> -> <=")],
+        ),
+        # A substitution closed before the newline leaves its here-document to the next one.
+        ("x=$(cat <<'EOF')\n(( a < b ))\nEOF\n(( n > 2 ))\n", [(4, "> -> <=")]),
+    ],
+)
+def test_a_here_document_in_a_command_substitution_has_its_body_there(
+    source: str, expected: list[tuple[int, str]]
+) -> None:
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == expected
+
+
+def test_shell_arithmetic_in_double_quotes_is_still_code() -> None:
+    source = "printf '%s\\n' \"n=$(( a < b ))\"\necho \"\\$(( c > d ))\" '$(( e > f ))'\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(1, "< -> >=")]
+
+
+@pytest.mark.parametrize("line", ["if (( $# > 0 )); then :; fi", "(( ${#items[@]} > 0 )) || exit"])
+def test_a_shell_hash_inside_a_word_is_not_a_comment(line: str) -> None:
+    assert "> -> <=" in [m.operator for m in mutants("a.sh", line + "\n")]
+
+
 def test_shell_order_comparisons_flip_only_inside_arithmetic() -> None:
     source = (
         "if (( retries < max_retries )); then echo retry > log.txt; fi\n"
@@ -268,8 +360,9 @@ def test_shell_mutants_skip_quoted_heredoc_bodies(redirect: str, indent: str) ->
 
 
 def test_shell_heredocs_are_consumed_in_redirection_order() -> None:
+    # FIRST is unquoted, but its body is still text: cat prints that `true`, it doesn't run it.
     source = "cat <<FIRST <<'SECOND'\ntrue\nFIRST\n(( a < b ))\nSECOND\n(( x > y ))\n"
-    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(2, "true -> false"), (6, "> -> <=")]
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(6, "> -> <=")]
 
 
 def test_shell_heredocs_inside_command_substitution_have_their_own_queue() -> None:
@@ -474,6 +567,16 @@ def test_plan_replays_merges_duplicate_commit_shas_across_bug_shas_and_commits(
             {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": ["  "]}]},
             "expected_checks",
         ),
+        # The model writes these arguments; a wrong type must come back as an error, not crash the lane.
+        ({"bug_shas": [1818181]}, "not commit SHAs: 1818181"),
+        ({"bug_shas": "b2b2b2b"}, "bug_shas must be a list"),
+        ({"commits": {"sha": "b2b2b2b", "expected_checks": ["CI/lint"]}}, "commits must be a list"),
+        ({"commits": ["b2b2b2b"]}, "expected_checks"),
+        ({"mutations": {"path": "a.py", "content": "x"}}, "mutations must be a list"),
+        ({"mutations": ["src/a.py"]}, "relative path"),
+        ({"mutations": [{"path": "a.py", "content": "x", "reason": 3}]}, "whole mutated file"),
+        # Replaying this would overwrite the candidate's own build config change.
+        ({"mutations": [{"path": "package.json", "content": "{}", "reason": "r"}]}, "code under test"),
     ],
 )
 def test_plan_replays_refuses_a_plan_that_proves_nothing(
@@ -494,6 +597,16 @@ def test_plan_replays_schema_requires_non_empty_expected_checks() -> None:
     assert commits_item["properties"]["expected_checks"]["minItems"] == 1
     assert "expected_checks" in mutations_item["required"]
     assert mutations_item["properties"]["expected_checks"]["minItems"] == 1
+
+
+def test_plan_replays_refuses_to_mutate_a_file_the_candidate_changed() -> None:
+    build_request("proof", "")
+    ledger = InMemoryLedger()
+    candidate = Candidate("h1", "pc/x", "x", changed_files=("scripts/ci.sh",))
+    ledger.add(candidate)
+    mutation = {"path": "scripts/ci.sh", "content": "exit 1\n", "reason": "r"}
+    with pytest.raises(InvalidReplayPlanError, match="code under test"):
+        tools.call("plan_replays", ledger, {"candidate_id": candidate.id, "mutations": [mutation]})
 
 
 def test_plan_replays_refuses_an_unknown_candidate() -> None:

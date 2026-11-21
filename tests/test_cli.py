@@ -287,6 +287,12 @@ def fastapi_history(monkeypatch: pytest.MonkeyPatch) -> None:
     with gzip.open(FIXTURES / "fastapi" / "runs.json.gz") as f:
         raw = json.load(f)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    # profile_ci keeps only runs whose workflow file matches the checkout's byte for byte (blob SHA),
+    # so make every run's remote blob equal the checked-out fixture instead of asking GitHub.
+    blob = history.workflow_blob_sha((FIXTURES / "fastapi" / "test.yml").read_bytes().decode())
+    monkeypatch.setattr(
+        history, "fetch_workflow_blob_shas", lambda _repo, _path, refs, **_kwargs: dict.fromkeys(refs, blob)
+    )
 
 
 @pytest.mark.usefixtures("fastapi_history")
