@@ -1,3 +1,4 @@
+import base64
 import json
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
@@ -19,8 +20,13 @@ from pit_crew.github import (
 class FakeGitHubClient:
     """In-memory offline implementation of ``GitHubClient`` for protocol conformance tests."""
 
-    def __init__(self, default_shas: dict[str, str]) -> None:
+    def __init__(
+        self,
+        default_shas: dict[str, str],
+        files: dict[tuple[str, str, str], str] | None = None,
+    ) -> None:
         self._default_shas = dict(default_shas)
+        self._files = dict(files or {})
         self.branches: dict[tuple[str, str], str] = {}
         self.commits: list[dict[str, object]] = []
         self.dispatches: list[tuple[str, str, str]] = []
@@ -80,6 +86,9 @@ class FakeGitHubClient:
 
     def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
         return self.runs[(repo, run_id)]
+
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        return self._files.get((repo, ref, path))
 
     def open_pull_request(
         self,
@@ -982,3 +991,37 @@ def test_httpx_client_conforms_to_protocol_end_to_end() -> None:
         head_branch="pc/candidate-1",
     )
     assert pr_url == "https://github.com/org/repo/pull/1"
+
+
+def test_httpx_get_file_content_decodes_base64_plain_and_handles_missing_and_errors() -> None:
+    encoded = base64.b64encode(b"name: CI\non: push\n").decode("ascii")
+    multiline_encoded = f"{encoded[:8]}\n{encoded[8:]}\n"
+    seen: list[tuple[bytes, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_github_headers(request)
+        seen.append((request.url.raw_path, dict(request.url.params)))
+        if request.url.path == "/repos/org/repo/contents/.github/workflows/ci.yml":
+            return httpx.Response(200, json={"encoding": "base64", "content": multiline_encoded})
+        if request.url.path == "/repos/org/repo/contents/plain.txt":
+            return httpx.Response(200, json={"encoding": "none", "content": "plain text\n"})
+        if request.url.path == "/repos/org/repo/contents/bad-enc.txt":
+            return httpx.Response(200, json={"encoding": "gzip", "content": "abc"})
+        if request.url.path == "/repos/org/repo/contents/boom.txt":
+            return httpx.Response(500, json={"message": "Internal Error"})
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        assert client.get_file_content("org/repo", ".github/workflows/ci.yml", "abc123") == "name: CI\non: push\n"
+        assert client.get_file_content("org/repo", "plain.txt", "abc123") == "plain text\n"
+        assert client.get_file_content("org/repo", "missing.yml", "abc123") is None
+        with pytest.raises(ValueError, match="Unsupported content encoding"):
+            client.get_file_content("org/repo", "bad-enc.txt", "abc123")
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            client.get_file_content("org/repo", "boom.txt", "abc123")
+        assert exc_info.value.response.status_code == 500
+        for bad_path in ("", "/", "../secret.txt", "a\\b.txt", "a//b.txt"):
+            with pytest.raises(ValueError, match="Invalid repository file path"):
+                client.get_file_content("org/repo", bad_path, "abc123")
+
+    assert seen[0] == (b"/repos/org/repo/contents/.github/workflows/ci.yml?ref=abc123", {"ref": "abc123"})

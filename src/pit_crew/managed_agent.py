@@ -212,7 +212,7 @@ def _execute_tool_step(
         }
     try:
         output = tools.call(step.name, ledger, dict(step.arguments or {}))
-    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+    except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
         return {
             "type": "function_result",
             "call_id": step.id,

@@ -6,6 +6,7 @@
     GITHUB_TOKEN=... uv run python -m pit_crew.lanes.analysis.history fastapi/fastapi test.yml > runs.json
 """
 
+import base64
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 API = "https://api.github.com"
 DEFAULT_RUNS = 150  # the architect's audit window
@@ -130,6 +131,33 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     with ThreadPoolExecutor(max_workers=_JOB_FETCHERS) as pool:
         jobs = list(pool.map(lambda run: _fetch_jobs(get, repo, run["id"]), selected))
     return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
+
+
+def fetch_workflow_content(
+    repo: str,
+    workflow: str,
+    *,
+    ref: str | None = None,
+    token: str | None = None,
+    get: Getter | None = None,
+) -> str:
+    """Fetch ``.github/workflows/<workflow>`` from GitHub's Contents API for ``repo`` at ``ref``."""
+    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
+    url = f"{API}/repos/{repo}/contents/.github/workflows/{quote(workflow, safe='')}"
+    if ref:
+        url = f"{url}?{urlencode({'ref': ref})}"
+    body, _ = get(url)
+    if not isinstance(body, dict):
+        msg = f"unexpected response reading workflow {workflow!r} from {repo!r}"
+        raise TypeError(msg)
+    raw_content = body.get("content")
+    if not isinstance(raw_content, str):
+        msg = f"workflow {workflow!r} in {repo!r} has no text content"
+        raise TypeError(msg)
+    encoding = body.get("encoding")
+    if encoding == "base64":
+        return base64.b64decode(raw_content).decode("utf-8")
+    return raw_content
 
 
 def parse_runs(raw: list[dict[str, Any]]) -> list[WorkflowRun]:
