@@ -78,6 +78,8 @@ _SAFE_FLAG = re.compile(
     r"--?(?:ci|q|quiet|v|verbose|silent|no-cache|frozen|locked|offline|bail|x|exitfirst|no-fail-fast|"
     r"nocapture|show-output|runInBand|forceExit|detectOpenHandles|logHeapUsage)"
 )
+_NO_ERREXIT_SHELL = re.compile(r"\{0\}")
+_ERREXIT = re.compile(r"(?:^|\s)-[a-z]*e|errexit")
 _ALWAYS = re.compile(r"^\s*(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?\s*$")
 _JQ_GATE = re.compile(r'toJSON\(needs\).*\|\s*jq\s+-e\b.*\ball\(.*\.result\s*==\s*"success"')
 _GATE_ACTION = "re-actors/alls-green"
@@ -95,6 +97,7 @@ WEAKENING_FLAGS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("ignores test paths", re.compile(r"--testPathIgnorePatterns\b")),
     ("skips tests", re.compile(r"(?:^|\s)--?skip(?:\s|=)")),
     ("retries failed tests", re.compile(r"--(?:reruns|retries)\b")),
+    ("excludes tests", re.compile(r"--(?:grep-invert|exclude)\b")),
 )
 
 Workflow = dict[Any, Any]
@@ -526,7 +529,7 @@ def _matrix_kept(old: Workflow, new: Workflow) -> list[str]:
             continue
         before, after = _matrix_values(job), _matrix_values(new_jobs[job_id])
         for key, values in before.items():
-            if key == "exclude":
+            if key in ("include", "exclude"):  # include rows are compared row by row in _checks_kept
                 continue
             if lost := values - after.get(key, set()):
                 problems.append(f"job `{job_id}` drops matrix {key} values {sorted(lost)}")
@@ -541,15 +544,55 @@ def _matrix_values(job: Workflow) -> dict[str, set[str]]:
 
 def _no_new_weakening(old: Workflow, new: Workflow) -> list[str]:
     problems = []
-    before, after = "\n".join(_command_lines(old)), "\n".join(_command_lines(new))
+    # Flags can hide in env too, e.g. PYTEST_ADDOPTS: -k smoke.
+    before = "\n".join([*_command_lines(old), *_env_lines(old)])
+    after = "\n".join([*_command_lines(new), *_env_lines(new)])
     for label, pattern in WEAKENING_FLAGS:
         if len(pattern.findall(after)) > len(pattern.findall(before)):
             problems.append(f"adds a command that {label}")
     if _count(new, _continues_on_error) > _count(old, _continues_on_error):
         problems.append("adds `continue-on-error`, which hides failures")
+    problems += _continue_on_error_widened(old, new)
     if _count(new, _disabled) > _count(old, _disabled):
         problems.append("adds `if: false`, which turns a check off")
+    if _no_errexit_shells(new) > _no_errexit_shells(old):
+        problems.append("adds a custom `shell:` without `-e`, so a failing line in a step no longer fails it")
     return problems
+
+
+def _continue_on_error_widened(old: Workflow, new: Workflow) -> list[str]:
+    """A job whose `continue-on-error` changes to a value that can be true more often.
+
+    `${{ matrix.xfail && true || false }}` becoming `true` lets every row fail, not only xfail rows;
+    counting keys misses that, so kept jobs are compared value by value.
+    """
+    new_jobs = _jobs(new)
+    return [
+        f"job `{job_id}` widens `continue-on-error` to {after!r}"
+        for job_id, job in _jobs(old).items()
+        if job_id in new_jobs
+        and (after := new_jobs[job_id].get("continue-on-error")) != job.get("continue-on-error")
+        and _continues_on_error({"continue-on-error": after})
+    ]
+
+
+def _env_lines(workflow: Workflow) -> list[str]:
+    blocks = [workflow, *_blocks(workflow)]
+    return [f"{k}: {_text(v)}" for b in blocks if isinstance(b.get("env"), dict) for k, v in b["env"].items()]
+
+
+def _no_errexit_shells(workflow: Workflow) -> int:
+    """Steps and run defaults whose custom shell template (`bash {0}`) drops fail-on-error."""
+    shells = [step.get("shell") for step in _steps(workflow)]
+    for block in [workflow, *_jobs(workflow).values()]:
+        defaults = block.get("defaults")
+        run = defaults.get("run") if isinstance(defaults, dict) else None
+        shells.append(run.get("shell") if isinstance(run, dict) else None)
+    return sum(
+        1
+        for shell in shells
+        if isinstance(shell, str) and _NO_ERREXIT_SHELL.search(shell) and not _ERREXIT.search(shell)
+    )
 
 
 def _count(workflow: Workflow, predicate: Callable[[Workflow], bool]) -> int:

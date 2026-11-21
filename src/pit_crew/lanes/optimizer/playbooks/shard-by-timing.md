@@ -18,6 +18,11 @@ arguments to it; the guard accepts a command that gains arguments, not one that 
 Pick N from the measured suite time so each shard lands near the target, and buy cores before
 shards: a bigger runner with more workers can beat more machines that each pay setup again.
 
+If the matrix has `include` entries, add `shard` to **every** entry too (one copy per shard).
+GitHub adds a new axis only to the rows the axes produce. An include row that matches no axis
+value, or a matrix built only from `include`, never gets `matrix.shard` and would run
+`--shard=/2`. A matrix that is only `include` gets no `shard` axis at all, just the copies.
+
 ## Keep
 
 - Every test runs in exactly one shard. Use timing-balanced splitting (pytest-split durations,
