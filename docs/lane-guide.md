@@ -49,12 +49,26 @@ Add tests under `tests/` (e.g., `tests/test_<lane>.py`) covering:
 2. **Tool contracts** via `tools.call("<tool_name>", InMemoryLedger(), {...})`, including error cases (missing foreign keys, empty/invalid inputs).
 3. **Prompt/request wiring** via `managed_agent.build_request("<lane>", ...)` to confirm your skill and tools register cleanly.
 
-To smoke-test a skill against the live Gemini Managed Agent API (optional):
-```sh
-export GEMINI_API_KEY=...
-uv run python -c 'from pit_crew.managed_agent import run_lane; print(run_lane("analysis", "..."))'
-```
-*(Note: the live loop in `managed_agent.py` is still a stub—check with the Dispatcher owner before relying on live runs.)*
+### Live smoke test (Milestone 2)
+
+`python -m pit_crew.cli smoke-lane` runs one lane against the live Managed Agents API and checks that it wrote its record to a SQLite ledger. It prints one JSON line (`lane`, `interaction_id`, `status`, `expected_record`, `records_written`, `elapsed_seconds`, plus `error` on failure). It exits 0 only when the interaction ends `completed` **and** at least one new expected record (`Hypothesis`, `Candidate` or `ReplayPlan`) was written.
+
+The default prompts chain the lanes: `optimizer` targets the newest `Hypothesis` for `--repo` in the ledger, and `proof` targets the newest `Candidate`. Run them in order against one ledger. Pass `--task "..."` to send your own prompt instead (this skips the lookup).
+
+Manual M2 verification checklist:
+
+1. Use a fork you own as `--repo`, and keep the ledger outside the repo (for example under `~/pit-crew-smoke/`).
+2. `export GEMINI_API_KEY=...`
+3. Analysis:
+   ```sh
+   uv run python -m pit_crew.cli smoke-lane --lane analysis --repo <owner/name> --ledger ~/pit-crew-smoke/ledger.db
+   ```
+   Check: exit code 0, `"status": "completed"`, `"records_written"` ≥ 1.
+4. Optimizer, same ledger: `--lane optimizer`. Check the same three things. The `Candidate` is recorded only. Nothing is pushed.
+5. Proof, same ledger: `--lane proof`. Check the same three things.
+6. Note each `interaction_id` and `elapsed_seconds` in the PR or issue that records the M2 run.
+
+If you re-run analysis on the same ledger, the agent can hit the duplicate-hypothesis refusal and write nothing (non-zero exit). Use a fresh ledger path to start over. Without `GEMINI_API_KEY`, the command fails fast with `"error": "KeyError: 'GEMINI_API_KEY'"`.
 
 ---
 
@@ -111,7 +125,7 @@ uv run python -c 'from pit_crew.managed_agent import run_lane; print(run_lane("a
 - **Goal:** Glue everything together—receive triggers, run lanes, execute GitHub Actions timing/replay runs, collect `Evidence`, invoke `rater.rate()`, and persist state.
 - **Reads/Writes:** All ledger records.
 - **Starting points (from `TODO`):**
-  - Complete the live `managed_agent.run_lane()` loop: mount the fork repository source, run asynchronously/in background, and handle `requires_action` tool calls via `tools.call()`.
+  - Run `managed_agent.run_lane()` asynchronously/in the background (the synchronous loop, repo mounting and `requires_action` tool servicing are done; see the smoke test above).
   - Build the GitHub webhook receiver + Actions runner orchestration (triggering paired baseline/candidate runs and bug replays, then aggregating results into `Evidence`).
   - Implement a persistent `Ledger` backend once the storage decision is finalized.
   - Add concurrency/idempotency guards (e.g., avoid launching duplicate runs for the same webhook delivery or hypothesis).
