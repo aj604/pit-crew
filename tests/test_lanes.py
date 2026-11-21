@@ -244,3 +244,10 @@ def test_run_lane_omits_repository_source_when_repo_is_omitted() -> None:
     sources = environment["sources"]
     assert isinstance(sources, list)
     assert not any(source.get("type") == "repository" for source in sources)
+
+
+def test_run_lane_forwards_repo_to_the_request() -> None:
+    fake_client = _FakeClient(responses=[_FakeInteraction(id="int-1", status="completed", steps=[])])
+    run_lane("analysis", "analyze", repo="org/fork", client=fake_client)
+    sources = fake_client.interactions.calls[0]["environment"]["sources"]  # type: ignore[index]
+    assert managed_agent.repository_source("org/fork") in sources

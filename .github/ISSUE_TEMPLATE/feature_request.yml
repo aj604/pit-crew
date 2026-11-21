@@ -1,0 +1,31 @@
+name: "🟣 Pit Strategy — Feature or Playbook Proposal"
+description: Propose a new Optimizer playbook, lane capability, or architecture improvement
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: lane
+    attributes:
+      label: Target Lane / Area
+      options:
+        - "ANA — Analysis"
+        - "OPT — Optimizer Playbook"
+        - "PRF — Proof"
+        - "DSP — Dispatcher / Pit Wall"
+        - "RAT — Rater"
+        - "Contracts / Ledger"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Pit Crew do, and what measurable CI impact or safety improvement does it unlock?
+    validations:
+      required: true
+  - type: textarea
+    id: contract_impact
+    attributes:
+      label: Contract / Trust-Boundary Impact
+      description: Does this require changes to `contracts.py`, `ledger.py`, or sandbox permissions?
+    validations:
+      required: false

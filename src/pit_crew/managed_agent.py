@@ -149,7 +149,7 @@ def build_request(
     }
 
 
-def run_lane(  # noqa: PLR0913  keyword-only request and client options mirror build_request
+def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus the injectable client
     lane: str,
     task: str,
     ledger: Ledger | None = None,
