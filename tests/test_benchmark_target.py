@@ -157,3 +157,26 @@ def test_calibrated_bottlenecks_fall_in_their_ranges() -> None:
     assert set(savings) <= set(PLAYBOOK_SKILLS)
     for skill, (low, high) in ranges.items():
         assert low <= savings[skill] <= high, (skill, savings[skill])
+
+
+def test_planted_bottlenecks_are_in_the_workflow() -> None:
+    jobs = _workflow()["jobs"]
+    for job_id, job in jobs.items():
+        for step in job["steps"]:
+            assert "cache" not in str(step.get("uses")), job_id
+            assert "cache" not in (step.get("with") or {}), job_id
+        assert "strategy" not in job, job_id
+    assert "concurrency" not in _workflow()  # repeated benchmark runs on one ref must not cancel each other
+    assert jobs["typecheck"]["needs"] == "lint"
+    assert jobs["unit-test"]["needs"] == "typecheck"
+
+
+def test_optimizer_guard_allows_sharding_integration() -> None:
+    doc = _workflow()
+    job = doc["jobs"]["unit-test"]
+    job["strategy"] = {"matrix": {"group": [1, 2]}}
+    for step in job["steps"]:
+        if step.get("run") == "python -m pytest tests/integration":
+            step["run"] += " --splits 2 --group ${{ matrix.group }}"
+    report = check_change(TARGET_PATH, WORKFLOW_TEXT, yaml.safe_dump(doc, sort_keys=False))
+    assert report.ok, report.problems
