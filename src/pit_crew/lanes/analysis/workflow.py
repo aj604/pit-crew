@@ -29,19 +29,23 @@ def _tokenize(text: str) -> tuple[list[str], list[str]]:
     expressions: list[str] = []
     start = 0  # where the current literal piece began
     pos = text.find("${{")
+    newline = -1  # next "\n" at or after pos (len(text) when there is none)
     close = -1  # first "}}" at or after the last position searched from; reused while still ahead of pos
     while pos != -1:
         if close < pos + 3:
             close = text.find("}}", pos + 3)
             if close == -1:
                 break  # nothing closes any later `${{` either
-        if text.find("\n", pos, close) == -1:
+        if newline < pos:  # the next newline at or after pos, found once and reused while still ahead
+            newline = text.find("\n", pos)
+            newline = len(text) if newline == -1 else newline
+        if newline > close:
             literals.append(text[start:pos])
             expressions.append(text[pos : close + 2])
             start = close + 2
             pos = text.find("${{", start)
-        else:
-            pos = text.find("${{", pos + 1)
+        else:  # no opener before the newline can reach a closer without crossing it
+            pos = text.find("${{", newline + 1)
     literals.append(text[start:])
     return literals, expressions
 

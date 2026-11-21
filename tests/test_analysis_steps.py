@@ -1,5 +1,7 @@
 import gzip
 import json
+import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -9,7 +11,7 @@ import pytest
 from pit_crew.lanes.analysis.critical_path import profile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
 from pit_crew.lanes.analysis.history import parse_runs
-from pit_crew.lanes.analysis.workflow import match_step_name, parse_workflow
+from pit_crew.lanes.analysis.workflow import _tokenize, match_step_name, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -291,3 +293,30 @@ def test_unclosed_expression_is_literal_text() -> None:
 def test_expression_does_not_span_a_newline() -> None:
     assert not match_step_name("a ${{ x\n}} b", "a z b")
     assert match_step_name("a ${{ x\n}} b", "a ${{ x\n}} b")
+
+
+@pytest.mark.parametrize(
+    ("text", "expressions"),
+    [
+        ("${{" * 20_000 + "\n}}", 0),
+        (("${{" * 5_000 + "\n") * 4 + "}}", 0),
+        ("${{ a }}" * 8_000, 8_000),
+        ("${{ a }}\n" * 3_000 + "${{" * 5_000, 3_000),
+    ],
+)
+def test_tokenizer_newline_handling_is_linear(text: str, expressions: int) -> None:
+    start = time.perf_counter()
+    literals, found = _tokenize(text)
+    assert time.perf_counter() - start < 0.5
+    assert len(found) == expressions
+    assert len(literals) == expressions + 1
+    assert "".join(a + b for a, b in zip(literals, [*found, ""], strict=True)) == text
+
+
+def test_tokenizer_matches_the_regex_it_replaced() -> None:
+    expression = re.compile(r"\$\{\{.*?\}\}")
+    rng = random.Random(1)  # noqa: S311  seeded for a repeatable test, not for security
+    pieces = ["${{", "}}", "$", "{", "}", "\n", "a", " ", "${{{"]
+    for _ in range(5_000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        assert _tokenize(text) == (expression.split(text), expression.findall(text)), text
