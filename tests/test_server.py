@@ -720,20 +720,50 @@ def test_api_token_enforces_bearer_auth_on_api_and_triggers() -> None:
             ("GET", "/api/repos/acme/widget/records"),
             ("GET", "/api/repos/acme/widget/status"),
         ):
-            assert client.request(method, path).status_code == 401
-            assert client.request(method, path, headers={"Authorization": "Bearer wrong"}).status_code == 401
-            assert client.request(method, path, headers={"Authorization": "Basic secret-api-token"}).status_code == 401
+            missing = client.request(method, path)
+            assert missing.status_code == 401
+            assert missing.headers.get("www-authenticate") == "Bearer"
+
+            wrong = client.request(method, path, headers={"Authorization": "Bearer wrong"})
+            assert wrong.status_code == 401
+            assert wrong.headers.get("www-authenticate") == "Bearer"
+
+            basic = client.request(method, path, headers={"Authorization": "Basic secret-api-token"})
+            assert basic.status_code == 401
+            assert basic.headers.get("www-authenticate") == "Bearer"
+
             assert client.request(method, path, headers=auth_headers).status_code == 200
 
-        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 401
-        assert (
-            client.post(
-                "/triggers/cycle",
-                json={"repo": "acme/widget"},
-                headers={"Authorization": "Bearer wrong"},
-            ).status_code
-            == 401
+        missing_trigger = client.post("/triggers/cycle", json={"repo": "acme/widget"})
+        assert missing_trigger.status_code == 401
+        assert missing_trigger.headers.get("www-authenticate") == "Bearer"
+
+        wrong_trigger = client.post(
+            "/triggers/cycle",
+            json={"repo": "acme/widget"},
+            headers={"Authorization": "Bearer wrong"},
         )
+        assert wrong_trigger.status_code == 401
+        assert wrong_trigger.headers.get("www-authenticate") == "Bearer"
+
         ok = client.post("/triggers/cycle", json={"repo": "acme/widget"}, headers=auth_headers)
         assert ok.status_code == 202
         assert dispatcher.done.wait(timeout=5)
+
+
+def test_openapi_declares_http_bearer_security_scheme() -> None:
+    app = create_app(ledger=InMemoryLedger(), api_token="secret-api-token")  # noqa: S106
+    schema = app.openapi()
+
+    security_schemes = schema.get("components", {}).get("securitySchemes", {})
+    assert security_schemes.get("HTTPBearer") == {"type": "http", "scheme": "bearer"}
+
+    for path, method in (
+        ("/triggers/cycle", "post"),
+        ("/api/repos/{owner}/{name}/attempts", "get"),
+        ("/api/repos/{owner}/{name}/records", "get"),
+        ("/api/repos/{owner}/{name}/status", "get"),
+    ):
+        assert {"HTTPBearer": []} in schema["paths"][path][method].get("security", [])
+
+    assert "security" not in schema["paths"]["/health"]["get"]

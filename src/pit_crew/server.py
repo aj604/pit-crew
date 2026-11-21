@@ -6,9 +6,10 @@ import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
@@ -119,22 +120,27 @@ def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str,
     }
 
 
-def _make_api_token_dependency(api_token: str | None) -> Callable[[str | None], None]:
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _make_api_token_dependency(api_token: str | None) -> Callable[[HTTPAuthorizationCredentials | None], None]:
     """Build a FastAPI dependency that enforces Bearer token auth when ``api_token`` is set."""
 
-    def _require_api_token(authorization: str | None = Header(default=None)) -> None:
+    def _require_api_token(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+    ) -> None:
         if api_token is None:
             return
-        if not authorization:
+        if (
+            credentials is None
+            or credentials.scheme.lower() != "bearer"
+            or not credentials.credentials
+            or not hmac.compare_digest(credentials.credentials, api_token)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing or invalid bearer token",
-            )
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not token or not hmac.compare_digest(token, api_token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing or invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
             )
 
     return _require_api_token
