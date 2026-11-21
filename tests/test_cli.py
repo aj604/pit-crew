@@ -101,7 +101,7 @@ def test_analysis_success_prints_summary_and_exits_zero(tmp_path: Path, capsys: 
     )
     assert "record_hypothesis" in str(request["input"])
     sources = request["environment"]["sources"]  # type: ignore[index]
-    assert managed_agent.repository_source("org/fork") in sources
+    assert {"type": "repository", "source": "https://github.com/org/fork", "target": "/workspace"} in sources
 
 
 def test_task_override_replaces_default_prompt(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -209,7 +209,8 @@ def test_failed_lane_exits_nonzero_even_with_a_record(tmp_path: Path, capsys: py
     code, summary = _run(_argv("analysis", tmp_path / "l.db"), client, capsys)
 
     assert code == 1
-    assert summary["status"] == "failed"
+    assert summary["status"] == "error"
+    assert summary["error"] == "InteractionFailedError: lane 'analysis' interaction 'int-2' ended with status 'failed'"
     assert summary["records_written"] == 1
 
 
