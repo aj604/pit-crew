@@ -406,6 +406,40 @@ def test_job_level_if_is_kept_as_text() -> None:
     assert wf.jobs["b"].if_ is None
 
 
+def _runner_pair(runs_a: str, runs_b: str, extra_a: str = "", extra_b: str = "") -> str:
+    return (
+        f"jobs:\n  a:\n    runs-on: {runs_a}\n{extra_a}    steps: [{{run: pytest}}]\n"
+        f"  b:\n    runs-on: {runs_b}\n{extra_b}    steps: [{{run: pytest}}]\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("runs_a", "runs_b", "extra_a", "extra_b"),
+    [
+        ("[self-hosted, 1]", "[self-hosted, 2]", "", ""),
+        ("{group: gpu}", "{group: cpu}", "", ""),
+        ("ubuntu-latest", "ubuntu-latest", "    environment: prod\n", "    environment: staging\n"),
+        (
+            "ubuntu-latest",
+            "ubuntu-latest",
+            "    permissions: {contents: read}\n",
+            "    permissions: {contents: write}\n",
+        ),
+        ("ubuntu-latest", "ubuntu-latest", "    if: 2024-01-01\n", ""),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_runner_environment_permissions_or_if(
+    runs_a: str, runs_b: str, extra_a: str, extra_b: str
+) -> None:
+    assert _findings(_runner_pair(runs_a, runs_b, extra_a, extra_b)) == 0
+
+
+def test_dedupe_still_flags_identical_runner_environment_and_permissions() -> None:
+    extra = "    environment: prod\n    permissions: {contents: read}\n    if: 2024-01-01\n"
+    assert _findings(_runner_pair("[self-hosted, 1]", "[self-hosted, 1]", extra, extra)) == 1
+    assert _findings(_runner_pair("{group: gpu}", "{group: gpu}")) == 1
+
+
 def test_recursive_anchor_is_refused_without_hanging() -> None:
     start = time.perf_counter()
     with pytest.raises(ValueError, match="expands beyond"):

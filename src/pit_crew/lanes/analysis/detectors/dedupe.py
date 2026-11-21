@@ -36,12 +36,22 @@ def _step_signature(s: StepSpec) -> StepSig:
 
 
 def _job_extras(job: JobSpec) -> tuple[str, ...]:
-    return (job.env, job.container, job.services, job.defaults, job.timeout_minutes, job.continue_on_error)
+    return (
+        job.env,
+        job.container,
+        job.services,
+        job.defaults,
+        job.timeout_minutes,
+        job.continue_on_error,
+        job.environment,
+        job.permissions,
+        job.if_definition,
+    )
 
 
 def _unknown(job: JobSpec) -> bool:
     """True when any compared field was too large to canonicalise (or a `with:` value was not a scalar)."""
-    fields = [job.matrix_definition, *_job_extras(job)]
+    fields = [job.matrix_definition, job.runs_on_definition, *_job_extras(job)]
     for s in job.steps:
         fields += [s.env, s.working_directory, s.shell, s.timeout_minutes, s.continue_on_error, *s.with_.values()]
     return MATRIX_TOO_LARGE in fields or NON_SCALAR in fields
@@ -51,7 +61,15 @@ def _signature(job: JobSpec) -> Signature:
     """What a job does and where: runner, matrix, `if:`, job settings and each step's command, inputs and settings."""
     steps = tuple(_step_signature(s) for s in job.steps)
     matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
-    return (job.runs_on, job.matrix_keys, matrix, steps, job.matrix_definition, job.if_ or "", _job_extras(job))
+    return (
+        job.runs_on_definition,
+        job.matrix_keys,
+        matrix,
+        steps,
+        job.matrix_definition,
+        job.if_ or "",
+        _job_extras(job),
+    )
 
 
 def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:

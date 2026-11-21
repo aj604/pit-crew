@@ -107,6 +107,10 @@ class JobSpec:
     defaults: str = ""
     timeout_minutes: str = ""
     continue_on_error: str = ""
+    runs_on_definition: str = ""  # the whole `runs-on` (list, dict form, expression), unlike the display string runs_on
+    environment: str = ""
+    permissions: str = ""
+    if_definition: str = ""  # the raw `if:` when it is not a plain scalar (a date, say), else ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,10 @@ def parse_workflow(text: str) -> Workflow:
             defaults=_canonical(body.get("defaults")),
             timeout_minutes=_canonical(body.get("timeout-minutes")),
             continue_on_error=_canonical(body.get("continue-on-error")),
+            runs_on_definition=_canonical(body.get("runs-on")),
+            environment=_canonical(body.get("environment")),
+            permissions=_canonical(body.get("permissions")),
+            if_definition=_canonical(body.get("if")) if _scalar(body.get("if")) is None else "",
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
