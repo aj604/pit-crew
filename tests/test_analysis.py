@@ -1,8 +1,10 @@
 import base64
 import gzip
 import json
+import urllib.error
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, 
 from pit_crew.lanes.analysis.critical_path import critical_path, job_timings, max_saving, profile
 from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, fetch_workflow, next_link, parse_runs
 from pit_crew.lanes.analysis.stats import percentile
+from pit_crew.lanes.analysis.tools import WorkflowNotFoundError
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow, topological_order
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import build_request
@@ -534,3 +537,98 @@ def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
 
     assert fetched == [("fastapi/fastapi", "test.yml", "master")]
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.github.com/repos/o/r", code, "err", Message(), None)
+
+
+def test_profile_ci_resolves_deleted_branch_workflow_from_run_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    yaml_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    raw = fastapi_raw()
+    expected_sha = next(r["head_sha"] for r in raw if r.get("head_sha"))
+    refs_tried: list[str | None] = []
+
+    def fake_fetch_workflow(_repo: str, _workflow: str, *, ref: str | None = None) -> str:
+        refs_tried.append(ref)
+        if ref == "release/1.2":
+            raise _http_error(404)
+        assert ref == expected_sha
+        return yaml_text
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "release/1.2"}
+    )
+
+    assert refs_tried == ["release/1.2", expected_sha]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def test_profile_ci_errors_explicitly_when_deleted_branch_has_no_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(404)))
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [])
+
+    build_request("analysis", "")
+    with pytest.raises(WorkflowNotFoundError, match="no completed runs record a commit"):
+        tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml", "branch": "release/1.2"})
+
+
+def test_profile_ci_errors_explicitly_when_deleted_branch_commit_is_also_404(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(404)))
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+
+    build_request("analysis", "")
+    with pytest.raises(WorkflowNotFoundError, match="deadbeef"):
+        tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml", "branch": "release/1.2"})
+
+
+@pytest.mark.parametrize(
+    ("branch", "first_code", "second_code"),
+    [
+        (None, 404, None),
+        ("release/1.2", 403, None),
+        ("release/1.2", 404, 403),
+    ],
+)
+def test_profile_ci_propagates_non_fallback_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    branch: str | None,
+    first_code: int,
+    second_code: int | None,
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    codes = [first_code] if second_code is None else [first_code, second_code]
+
+    def fake_fetch_workflow(*_args: object, **_kwargs: object) -> str:
+        raise _http_error(codes.pop(0))
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(
+        history,
+        "fetch_history",
+        (lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+        if second_code is not None
+        else (lambda *_args, **_kwargs: pytest.fail("must not fetch history")),
+    )
+
+    build_request("analysis", "")
+    args: dict[str, Any] = {"repo": "o/r", "workflow": "ci.yml"}
+    if branch is not None:
+        args["branch"] = branch
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        tools.call("profile_ci", InMemoryLedger(), args)
+    assert exc_info.value.code == (second_code if second_code is not None else first_code)
