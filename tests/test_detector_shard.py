@@ -51,19 +51,25 @@ def raw_run(run_id: int, steps: Sequence[tuple[str, float]], job_name: str = "te
     }
 
 
-def workflow_yaml(step_names: Sequence[str], matrix: str = "") -> str:
-    steps = "\n".join(f"      - name: {n}\n        run: echo {i}" for i, n in enumerate(step_names))
+def workflow_yaml(step_names: Sequence[str], matrix: str = "", runs: dict[str, str] | None = None) -> str:
+    commands = runs or {}
+    steps = "\n".join(
+        f"      - name: {n}\n        run: {commands.get(n, f'echo {i}')}" for i, n in enumerate(step_names)
+    )
     strategy = f"    strategy:\n      matrix:\n        {matrix}\n" if matrix else ""
     return f"name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n{strategy}    steps:\n{steps}\n"
 
 
 def build(
-    step_seconds: Sequence[tuple[str, float]], yaml_steps: Sequence[str] | None = None, matrix: str = ""
+    step_seconds: Sequence[tuple[str, float]],
+    yaml_steps: Sequence[str] | None = None,
+    matrix: str = "",
+    runs: dict[str, str] | None = None,
 ) -> tuple[CIProfile, Workflow]:
     names = yaml_steps if yaml_steps is not None else [n for n, _ in step_seconds]
-    wf = parse_workflow(workflow_yaml(names, matrix))
-    runs = parse_runs([raw_run(i, step_seconds, "test (1)" if matrix else "test") for i in range(1, 4)])
-    return profile(wf, runs), wf
+    wf = parse_workflow(workflow_yaml(names, matrix, runs))
+    history = parse_runs([raw_run(i, step_seconds, "test (1)" if matrix else "test") for i in range(1, 4)])
+    return profile(wf, history), wf
 
 
 def test_shard_flags_a_long_test_step() -> None:
@@ -94,6 +100,17 @@ def test_shard_skips_setup_steps() -> None:
     assert detect_shard_by_timing(prof, wf, PATH) == []
 
 
+def test_shard_ignores_long_non_test_steps() -> None:
+    prof, wf = build([("Coverage report", 240.0)], runs={"Coverage report": "uv run coverage html"})
+    assert detect_shard_by_timing(prof, wf, PATH) == []
+
+
+def test_shard_flags_a_test_command_under_a_neutral_name() -> None:
+    prof, wf = build([("End to end", 240.0)], runs={"End to end": "npx playwright test"})
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert finding.step == "End to end"
+
+
 def test_shard_skips_unmeasured_steps() -> None:
     prof, wf = build([("Other", 5.0)], yaml_steps=["Run npm test"])
     assert detect_shard_by_timing(prof, wf, PATH) == []
@@ -109,9 +126,8 @@ def test_shard_fastapi() -> None:
         raw: list[Raw] = json.load(f)
     wf = parse_workflow((FIXTURES / "fastapi" / "test.yml").read_text())
     prof = profile(wf, parse_runs(raw))
-    findings = detect_shard_by_timing(prof, wf, PATH)
-    (finding,) = [x for x in findings if (x.job, x.step) == ("test", "Test")]
-    for found in findings:
-        max_saving = next(j.max_saving_seconds for j in prof.jobs if j.job_id == found.job)
-        assert 0 < found.expected_savings_seconds <= max_saving
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert (finding.job, finding.step) == ("test", "Test")
+    max_saving = next(j.max_saving_seconds for j in prof.jobs if j.job_id == "test")
+    assert 0 < finding.expected_savings_seconds <= max_saving
     assert finding.evidence["step_p50_seconds"] == 129.0

@@ -11,6 +11,9 @@ from pit_crew.lanes.analysis.workflow import Workflow
 SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
 TARGET_SHARD_SECONDS = 30.0  # the brief: tests under 30 seconds per shard
 MAX_SHARDS = 8
+TEST_STEP = re.compile(
+    r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test)\b", re.IGNORECASE
+)
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
 
@@ -25,6 +28,8 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
             continue
         for step in spec.steps:
             if is_setup_step(step.name):
+                continue
+            if not (TEST_STEP.search(step.name) or (step.run and TEST_STEP.search(step.run))):
                 continue
             timing = step_profile(profile, job_id, step)
             if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:
