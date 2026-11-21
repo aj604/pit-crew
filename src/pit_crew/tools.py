@@ -13,6 +13,8 @@ from pit_crew.ledger import Ledger
 
 @dataclass(frozen=True)
 class Tool:
+    """Metadata and callable for a registered agent tool."""
+
     lane: str
     name: str
     description: str
@@ -34,8 +36,10 @@ def tool(lane: str, parameters: dict[str, Any]) -> Callable[[Callable[..., Any]]
 
 
 def for_lane(lane: str) -> list[Tool]:
+    """Return all registered tools belonging to ``lane``."""
     return [t for t in _TOOLS.values() if t.lane == lane]
 
 
-def call(name: str, ledger: Ledger, arguments: dict[str, Any]) -> Any:
+def call(name: str, ledger: Ledger, arguments: dict[str, Any]) -> Any:  # noqa: ANN401
+    """Invoke a registered tool by name with ``ledger`` injected first."""
     return _TOOLS[name].fn(ledger, **arguments)

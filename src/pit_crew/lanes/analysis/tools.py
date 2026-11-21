@@ -1,21 +1,78 @@
-"""Analysis lane: find where the minutes go and record hypotheses."""
+"""Analysis lane: find where the minutes go and record hypotheses.
 
-from collections import defaultdict
+Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job graph) and
+`critical_path.py` (profiling). This module only wraps it as agent tools.
+"""
+
+import os
+import re
+from pathlib import Path
+from typing import Any
 
 from pit_crew.contracts import Hypothesis
+from pit_crew.lanes.analysis import history
+from pit_crew.lanes.analysis.critical_path import profile
+from pit_crew.lanes.analysis.workflow import parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_WORKFLOW_FILE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
 
-def slowest_jobs(job_runs: list[dict]) -> list[tuple[str, float]]:
-    """Total seconds per job across runs, slowest first.
 
-    Each item needs "name" and "seconds".
+def workspace() -> Path:
+    """Where the fork is checked out: /workspace in the managed-agent sandbox."""
+    return Path(os.environ.get("PIT_CREW_WORKSPACE", "/workspace"))
+
+
+def workflow_path(workflow: str) -> Path:
+    """The workflow file inside the workspace. Rejects anything but a bare .yml/.yaml file name."""
+    if not _WORKFLOW_FILE.fullmatch(workflow) or workflow.startswith("."):
+        msg = f"workflow must be a file name like ci.yml, got {workflow!r}"
+        raise ValueError(msg)
+    folder = (workspace() / ".github" / "workflows").resolve()
+    path = (folder / workflow).resolve()
+    if path.parent != folder:  # a symlink pointing out of the folder
+        msg = f"workflow {workflow!r} resolves outside .github/workflows"
+        raise ValueError(msg)
+    return path
+
+
+@tool(
+    lane="analysis",
+    parameters={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "owner/name whose Actions history to read"},
+            "workflow": {"type": "string", "description": "File name under .github/workflows, e.g. ci.yml"},
+            "runs": {"type": "integer", "description": "How many recent completed runs to read (default 150)"},
+            "branch": {"type": "string", "description": "Only runs on this branch, e.g. main"},
+        },
+        "required": ["repo", "workflow"],
+    },
+)
+def profile_ci(
+    ledger: Ledger,  # noqa: ARG001  every tool takes the ledger first
+    repo: str,
+    workflow: str,
+    runs: int = history.DEFAULT_RUNS,
+    branch: str | None = None,
+) -> dict[str, Any]:
+    """Profile one workflow from its recent successful runs.
+
+    Returns the critical path (the chain of jobs that sets wall-clock time) with its time split
+    into waiting (for a runner), setup (checkout, toolchain, installs, caches) and running (the
+    checks themselves) at p50/p95, and biggest_bucket / biggest_bucket_p95: the one to fix first. Per job it returns
+    the same split, how often the job was on the critical path, and max_saving_seconds: the most
+    wall-clock time any change to that job can save. Jobs with max_saving_seconds of 0 are off
+    the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
-    totals: dict[str, float] = defaultdict(float)
-    for run in job_runs:
-        totals[run["name"]] += run["seconds"]
-    return sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    if not _REPO.fullmatch(repo) or ".." in repo:
+        msg = f"repo must be owner/name, got {repo!r}"
+        raise ValueError(msg)
+    spec = parse_workflow(workflow_path(workflow).read_text())
+    raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
+    return profile(spec, history.parse_runs(raw)).to_dict()
 
 
 @tool(
@@ -31,9 +88,7 @@ def slowest_jobs(job_runs: list[dict]) -> list[tuple[str, float]]:
         "required": ["repo", "description", "skill", "expected_savings_seconds"],
     },
 )
-def record_hypothesis(
-    ledger: Ledger, repo: str, description: str, skill: str, expected_savings_seconds: float
-) -> str:
+def record_hypothesis(ledger: Ledger, repo: str, description: str, skill: str, expected_savings_seconds: float) -> str:
     """Record one bottleneck worth fixing. Returns the hypothesis id."""
     hypothesis = Hypothesis(repo, description, skill, expected_savings_seconds)
     ledger.add(hypothesis)

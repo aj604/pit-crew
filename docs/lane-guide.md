@@ -9,8 +9,13 @@ This guide is for teammates owning individual lanes in Pit Crew. Read [architect
 3. **No API key required for tests:** Every lane must be 100% unit-testable offline using `InMemoryLedger` and local fixtures under `tests/fixtures/`. Only `managed_agent.py` talks to the Gemini API.
 4. **Keep CI green on every PR:** Before requesting review, run:
    ```sh
+   uv run ruff format --check
    uv run ruff check
-   uv run pytest -q
+   uv run mypy src tests
+   uv run deptry src
+   uv run lint-imports
+   uv run zizmor .github/workflows
+   uv run pytest
    ```
 5. **Respect the trust boundary:** Agent lanes (`analysis`, `optimizer`, `proof`) must never write `Evidence` or `Verdict` records, and must never modify `rater.py`.
 
@@ -64,7 +69,8 @@ uv run python -c 'from pit_crew.managed_agent import run_lane; print(run_lane("a
   - Build helpers/tools to fetch or parse GitHub Actions run/job/step history (test against fixture JSON first).
   - Compute the **critical path** across DAG dependencies (`needs:`), not just total job duration—speeding up a non-critical job won't reduce wall-clock CI time.
   - Detect common patterns: cache misses, unsharded slow test suites, serial jobs that can parallelize, redundant/duplicate jobs, flaky retries.
-  - Align `Hypothesis.skill` names with the Optimizer owner's playbook list (`dep-cache`, `shard-by-timing`, `affected-tests`, `fail-fast-order`, `flake-quarantine`, `dedupe-jobs`).
+  - Align `Hypothesis.skill` names with the shared `PLAYBOOK_SKILLS` catalog in `contracts.py` (`dep-cache`, `parallelize-dag`, `shard-by-timing`, `dedupe-jobs`, `affected-tests`).
+  - Query `ledger.prior_attempts(repo)` so you don't emit duplicate hypotheses for bottlenecks already open or rejected.
 - **Watch out for:** Don't edit repo files in this lane; avoid duplicate hypotheses for bottlenecks already recorded in the ledger.
 
 ### 2. Optimizer Lane (`src/pit_crew/lanes/optimizer/`)
@@ -73,21 +79,20 @@ uv run python -c 'from pit_crew.managed_agent import run_lane; print(run_lane("a
 - **Reads:** Target `Hypothesis`, repository files, and prior attempts/verdicts for this repo in the ledger.
 - **Writes:** Pushes a branch to the fork + `Candidate` via `report_candidate`.
 - **Starting points (from `TODO`):**
-  - Build playbook skills for each fix category (`dep-cache`, `shard-by-timing`, `affected-tests`, `fail-fast-order`, `flake-quarantine`, `dedupe-jobs`).
-  - Coordinate with the Dispatcher/platform owner on how sub-skills are mounted in `managed_agent.build_request()`.
-  - Add a read-only ledger tool (e.g., `list_prior_attempts`) so the agent can inspect previously rejected candidates and avoid repeating them.
-  - Add lightweight static validation (YAML parsing, basic GitHub Actions workflow sanity checks) before pushing.
+  - Drop playbook markdown files under `src/pit_crew/lanes/optimizer/playbooks/*.md` (`dep-cache`, `parallelize-dag`, `shard-by-timing`, `dedupe-jobs`, `affected-tests`) — `managed_agent.build_request()` mounts them automatically at `.agents/skills/optimizer/playbooks/`.
+  - Expose a read-only ledger tool wrapping `ledger.prior_attempts(repo)` so `gemini-4-neon` sees previously rejected candidates and avoids repeating them.
+  - Validate changed paths with `contracts.is_allowed_candidate_path(path)` (`.github/**` + runner configs only, never `src/` or `tests/`) and submit modified `files: dict[str, str]` via `report_candidate` so the host publishes the fork branch with zero secrets in the sandbox.
 - **Watch out for:** Strictly **one change per candidate** so the rater can attribute speedups/regressions cleanly. Never weaken, skip, or delete checks to gain speed.
 
 ### 3. Proof Lane (`src/pit_crew/lanes/proof/`)
 
 - **Goal:** Select the set of bugs a `Candidate` must still catch so the Rater can verify safety.
-- **Reads:** `Candidate` diff + repository git/CI history.
+- **Reads:** `Candidate` diff/files + repository git/CI history + failure artifacts mounted at `/workspace/.pit-crew/artifacts/`.
 - **Writes:** `ReplayPlan` via `plan_replays`.
 - **Starting points (from `TODO`):**
   - Build a miner for historical commits that turned CI red, mapping which workflow/job/check caught each failure.
-  - Prioritize bugs that exercise the exact checks/paths touched by the candidate diff (especially regressions the optimization could accidentally hide, like stale caches or misconfigured test selection).
-  - Design a mutation-injection fallback for areas with no recorded red commits, and coordinate with the architecture owner if `ReplayPlan` needs a new field for synthetic mutations.
+  - Inspect multimodal CI failure artifacts (Playwright failure screenshots, traces, visual build outputs) with `gemini-4-carbon` to diagnose failure modes text logs lose, recording `artifact_ref` on `BugCase`.
+  - Populate `ReplayPlan.cases` using `BugCase(kind="commit", commit_sha=...)` for historical red commits and `BugCase(kind="mutation", mutated_files=...)` as fallback (`ReplayPlan` stays backwards-compatible with `bug_shas`).
 - **Watch out for:** `rater.py` automatically rejects any candidate with `bugs_total == 0`, so an empty `ReplayPlan` guarantees rejection. Proof chooses *what* to replay—it never executes replays or decides verdicts.
 
 ### 4. Rater (`src/pit_crew/rater.py`)

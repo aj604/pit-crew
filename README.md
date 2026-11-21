@@ -41,13 +41,17 @@ agent may call). Each has a `TODO(<lane> owner)` marking where to start.
 
 ```sh
 uv sync
-uv run pytest -q
+uv run ruff format --check
 uv run ruff check
+uv run mypy src tests
+uv run deptry src
+uv run lint-imports
+uv run zizmor .github/workflows
+uv run pytest
 ```
 
 You do not need Managed Agents access to work on a lane. Tools are ordinary Python tested
-against fixtures and an in-memory ledger. Only `managed_agent.py` and the proof lane's
-`verify.py` (Gemini 4 Neon watching replay recordings) call the Gemini API; to
+against fixtures and an in-memory ledger. Only `managed_agent.py` calls the Gemini API; to
 try a skill against the live agent, set `GEMINI_API_KEY` and call
 `pit_crew.managed_agent.run_lane("<lane>", "<task>")`. That path has not been run against
 the live API yet.
@@ -61,8 +65,8 @@ record in `contracts.py`, open a separate PR, because every lane depends on it.
 - [Lane Owner Guide](docs/lane-guide.md) — working agreements, `@tool` and `SKILL.md` conventions, testing, and per-lane starting points.
 - [TODO](TODO.md) — tasks, deliverables, and integration milestones per lane.
 
-## Open decisions
+## Locked Architecture Decisions
 
-- Gemini API or the Cloud Agent Platform surface for Managed Agents.
-- Which database backs the ledger.
-- Whether tools stay custom functions or move behind a remote MCP server.
+- **Models (Gemini 4 Managed Agents via Interactions API):** `gemini-4-hydrogen` (`analysis`), `gemini-4-neon` (`optimizer`), and `gemini-4-carbon` (`proof`, including multimodal CI failure artifact inspection).
+- **Target CI Goal:** Compounding verified optimizations toward **`median <= 60s` and `p95 <= 120s`** (`MIN_SPEEDUP = 1.05x`, `p <= 0.05`, `100%` replayed bugs caught).
+- **Ledger & Transport:** Event-driven `workflow_run` webhook + Pit Wall FastAPI server backed by WAL-mode `SqliteLedger` (`src/pit_crew/ledger.py`) and host-mediated `@tool` gates (`src/pit_crew/tools.py`) with zero secrets inside the remote sandbox.
