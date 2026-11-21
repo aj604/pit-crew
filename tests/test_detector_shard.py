@@ -179,3 +179,22 @@ def test_shard_classifies_adversarial_commands_in_linear_time(command: str) -> N
     findings = detect_shard_by_timing(p, wf, PATH)
     assert time.perf_counter() - start < 0.5
     assert [f.job for f in findings] == ["test"]
+
+
+def test_shard_flags_tox_test_suites() -> None:
+    prof, wf = build([("Run tests", 200.0)], runs={"Run tests": "tox -e py312"})
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert finding.step == "Run tests"
+
+
+def test_shard_name_fallback_flags_an_unknown_test_wrapper() -> None:
+    prof, wf = build([("Run tests", 200.0)], runs={"Run tests": "./scripts/ci.sh"})
+    assert [f.step for f in detect_shard_by_timing(prof, wf, PATH)] == ["Run tests"]
+
+
+def test_shard_name_fallback_skips_known_non_test_commands() -> None:
+    prof, wf = build(
+        [("Upload test results", 240.0), ("Run tests", 240.0)],
+        runs={"Upload test results": "aws s3 cp test-results s3://x", "Run tests": "mypy tests/"},
+    )
+    assert detect_shard_by_timing(prof, wf, PATH) == []

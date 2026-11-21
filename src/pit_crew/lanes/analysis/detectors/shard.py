@@ -19,20 +19,24 @@ SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
 TARGET_SHARD_SECONDS = 30.0  # the brief: tests under 30 seconds per shard
 MAX_SHARDS = 8
 TEST_STEP = re.compile(
-    r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test)\b", re.IGNORECASE
+    r"\b(test|tests|pytest|jest|vitest|mocha|ava|rspec|phpunit|nextest|go test|cargo test|bun test|tox|nox|ctest)\b",
+    re.IGNORECASE,
 )
 _WRAPPERS = frozenset({"uv", "poetry", "pipenv", "npx", "pnpm", "yarn", "python", "python3", "run", "exec", "dlx"})
 _STATIC_TOOLS = frozenset(
     {"mypy", "ruff", "pyright", "tsc", "eslint", "flake8", "black", "isort", "pylint", "prettier", "biome"}
 )  # linters and type checkers take `tests/` as a path to read, not a suite to run
+_NON_TEST_COMMANDS = _STATIC_TOOLS | frozenset(
+    {"cp", "mv", "rsync", "tar", "zip", "aws", "gsutil", "az", "curl", "wget", "echo", "cat", "ls", "mkdir"}
+)
 _WORD = re.compile(r"\w+")
 _SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 NO_COMMAND_ACTIONS = ("actions/upload-artifact", "actions/download-artifact", "actions/cache")
 ALREADY_SHARDED = re.compile(r"shard|split|group|chunk|partition|slice", re.IGNORECASE)
 
 
-def _is_static_check(segment: str) -> bool:
-    """Whether the command, past its wrappers, flags and `KEY=VALUE` assignments, is a linter or type checker.
+def _first_command(segment: str) -> str:
+    """The command word of a shell segment, past its wrappers, flags and `KEY=VALUE` assignments; "" if none.
 
     A plain token loop: a regex with nested quantifiers backtracks exponentially on workflow text it does not control.
     """
@@ -40,15 +44,31 @@ def _is_static_check(segment: str) -> bool:
         if token in _WRAPPERS or token.startswith("-") or ("=" in token and not token.startswith("=")):
             continue
         word = _WORD.match(token)
-        return word is not None and word.group() in _STATIC_TOOLS
-    return False
+        return word.group() if word is not None else token
+    return ""
+
+
+def _is_static_check(segment: str) -> bool:
+    """Whether the segment's command is a linter or type checker."""
+    return _first_command(segment) in _STATIC_TOOLS
+
+
+def _is_non_test_command(segment: str) -> bool:
+    """Whether the segment's command is a static check or a file-moving/printing tool, never a test runner."""
+    return _first_command(segment) in _NON_TEST_COMMANDS
 
 
 def _runs_tests(step: StepSpec) -> bool:
-    """Whether the step runs a test suite: judged by its command, or by its name when it has none (a `uses:` step)."""
+    """Whether the step runs a test suite: judged by its command, or by its name when it has none (a `uses:` step).
+
+    A shell step with no recognised test command still counts when its name says tests and none of its
+    commands is a known non-test one (a wrapper script such as `./scripts/ci.sh`).
+    """
     if step.run is not None:
-        segments = (seg.strip() for seg in _SEGMENTS.split(step.run))
-        return any(TEST_STEP.search(seg) and not _is_static_check(seg) for seg in segments)
+        segments = [seg.strip() for seg in _SEGMENTS.split(step.run)]
+        if any(TEST_STEP.search(seg) and not _is_non_test_command(seg) for seg in segments):
+            return True
+        return TEST_STEP.search(step.name) is not None and not any(_is_non_test_command(seg) for seg in segments)
     if (step.uses or "").startswith(NO_COMMAND_ACTIONS):
         return False  # moving files around, however the step is named
     return TEST_STEP.search(step.name) is not None
