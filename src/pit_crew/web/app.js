@@ -2,6 +2,7 @@
 // Shared state lives in store.js; live polling and POST /triggers/cycle land in #53.
 
 import { DEMO_SCENARIO_IDS, DEMO_SCENARIOS, DEMO_STAGE_LABELS } from "./demo_scenarios.js";
+import { createLapHistory } from "./lap_history.js";
 import { createPitWallStore, resolveInitialBoot } from "./store.js";
 
 export const SLA_MEDIAN_TARGET_SECONDS = 60;
@@ -160,6 +161,43 @@ export function createDemoSwitcher(root, slot, store) {
   return { slot, scenarioButtons, stageItems, playButton, stepButton, resetButton };
 }
 
+/** Derive Header Bar status payload, reflecting `state.selectedAttempt` when selected. */
+export function statusForHeader(state) {
+  const status = state?.status ?? null;
+  const attempt = state?.selectedAttempt ?? null;
+  if (!attempt) return status;
+  const baseSha =
+    (attempt.rated === true && attempt.keep === true && attempt.head_sha) ||
+    attempt.base_sha ||
+    status?.base_sha ||
+    null;
+  const hasMetrics =
+    attempt.rated === true ||
+    attempt.median_seconds != null ||
+    attempt.p95_seconds != null ||
+    attempt.sla_met != null;
+  let latestVerdict = status?.latest_verdict ?? null;
+  let slaMet = status?.sla_met === true;
+  if (hasMetrics) {
+    latestVerdict = {
+      ...(status?.latest_verdict ?? {}),
+      median_seconds: attempt.median_seconds ?? null,
+      p95_seconds: attempt.p95_seconds ?? null,
+      sla_met: attempt.sla_met === true,
+    };
+    slaMet = attempt.sla_met === true;
+  } else if (attempt.rated === false) {
+    latestVerdict = null;
+    slaMet = false;
+  }
+  return {
+    ...(status ?? {}),
+    base_sha: baseSha,
+    latest_verdict: latestVerdict,
+    sla_met: slaMet,
+  };
+}
+
 /** Wire the Header Bar to `store`; header mode clicks update the store without echoing events back. */
 export function bindHeaderToStore(header, modeToggle, store) {
   let prevMode = null;
@@ -169,11 +207,12 @@ export function bindHeaderToStore(header, modeToggle, store) {
     if (prevMode === "live") liveRepo = header.repoInput.value;
     if (prevRepo !== state.repo) liveRepo = state.repo;
     if (header.mode !== state.mode) header.setMode(state.mode);
+    const effectiveStatus = statusForHeader(state);
     if (state.mode === "demo") {
-      header.applyStatus(state.status);
+      header.applyStatus(effectiveStatus);
       header.setRunning(state.isPlaying);
     } else {
-      header.applyStatus(state.status ? { ...state.status, repo: "" } : null);
+      header.applyStatus(effectiveStatus ? { ...effectiveStatus, repo: "" } : null);
       if (header.repoInput.value !== liveRepo) header.setRepo(liveRepo);
     }
     prevMode = state.mode;
@@ -193,7 +232,8 @@ export function bootPitWall(root, search) {
   const store = createPitWallStore(resolveInitialBoot(search));
   bindHeaderToStore(header, root.getElementById("mode-toggle"), store);
   const switcher = createDemoSwitcher(root, root.getElementById("demo-switcher"), store);
-  return { header, store, switcher };
+  const lapHistory = createLapHistory(root, root.getElementById("lap-history"), store);
+  return { header, store, switcher, lapHistory };
 }
 
 if (typeof document !== "undefined") {
