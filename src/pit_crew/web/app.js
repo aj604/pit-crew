@@ -4,6 +4,7 @@
 import { DEMO_SCENARIO_IDS, DEMO_SCENARIOS, DEMO_STAGE_LABELS } from "./demo_scenarios.js";
 import { createLapHistory } from "./lap_history.js";
 import { createPitWallStore, resolveInitialBoot } from "./store.js";
+import { createTelemetryCenter } from "./telemetry.js";
 
 export const SLA_MEDIAN_TARGET_SECONDS = 60;
 export const SLA_P95_TARGET_SECONDS = 120;
@@ -232,8 +233,9 @@ export function bootPitWall(root, search) {
   const store = createPitWallStore(resolveInitialBoot(search));
   bindHeaderToStore(header, root.getElementById("mode-toggle"), store);
   const switcher = createDemoSwitcher(root, root.getElementById("demo-switcher"), store);
+  const telemetry = createTelemetryCenter(root, root.getElementById("telemetry-center"), store);
   const lapHistory = createLapHistory(root, root.getElementById("lap-history"), store);
-  return { header, store, switcher, lapHistory };
+  return { header, store, switcher, telemetry, lapHistory };
 }
 
 if (typeof document !== "undefined") {
