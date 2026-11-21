@@ -4,9 +4,10 @@ Everything else in the repo runs and tests without an API key.
 """
 
 import base64
+import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -74,6 +75,11 @@ class InteractionLike(Protocol):
     @property
     def continuation_token(self) -> str | None:
         """Opaque continuation token when decoding pauses."""
+        ...
+
+    @property
+    def environment_id(self) -> str | None:
+        """Remote sandbox identifier allocated for the interaction."""
         ...
 
 
@@ -148,11 +154,12 @@ def build_request(
     }
 
 
-def run_lane(
+def run_lane(  # noqa: PLR0913  keyword-only options keep the call site explicit
     lane: str,
     task: str,
     ledger: Ledger | None = None,
     *,
+    repo: str | None = None,
     extra_sources: list[dict[str, Any]] | None = None,
     client: InteractionsClientLike | None = None,
 ) -> InteractionLike:
@@ -167,7 +174,7 @@ def run_lane(
         )
     )
 
-    request = build_request(lane, task, extra_sources=extra_sources)
+    request = build_request(lane, task, repo=repo, extra_sources=extra_sources)
     allowed_tool_names = {t["name"] for t in request["tools"]}
 
     interaction = active_client.interactions.create(**request)
@@ -178,9 +185,7 @@ def run_lane(
 
         if interaction.status == "requires_continuation" and interaction.continuation_token:
             interaction = active_client.interactions.create(
-                agent=BASE_AGENT,
-                previous_interaction_id=interaction.id,
-                continuation_token=interaction.continuation_token,
+                **_follow_up_request(request, interaction, continuation_token=interaction.continuation_token),
             )
             continue
 
@@ -193,12 +198,39 @@ def run_lane(
 
         results = [_execute_tool_step(lane, allowed_tool_names, active_ledger, step) for step in call_steps]
         interaction = active_client.interactions.create(
-            agent=BASE_AGENT,
-            previous_interaction_id=interaction.id,
-            input=results,
+            **_follow_up_request(request, interaction, input=results),
         )
 
     raise MaxTurnsExceededError(lane, MAX_TOOL_TURNS)
+
+
+def _follow_up_request(
+    request: Mapping[str, Any],
+    interaction: InteractionLike,
+    **extra: object,
+) -> dict[str, Any]:
+    environment = (
+        {"type": "remote", "environment_id": interaction.environment_id}
+        if interaction.environment_id
+        else request["environment"]
+    )
+    return {
+        "agent": request["agent"],
+        "agent_config": request["agent_config"],
+        "environment": environment,
+        "tools": request["tools"],
+        "previous_interaction_id": interaction.id,
+        **extra,
+    }
+
+
+def _serialize_tool_result(output: object) -> str | dict[str, Any]:
+    """Coerce a tool return value into a payload accepted by ``FunctionResultStep``."""
+    if isinstance(output, (str, dict)):
+        return output
+    if isinstance(output, (list, tuple, int, float, bool)) or output is None:
+        return json.dumps(output, default=str)
+    return str(output)
 
 
 def _execute_tool_step(
@@ -229,7 +261,7 @@ def _execute_tool_step(
         "type": "function_result",
         "call_id": step.id,
         "name": step.name,
-        "result": output if isinstance(output, (str, dict, list, int, float, bool)) else str(output),
+        "result": _serialize_tool_result(output),
     }
 
 
