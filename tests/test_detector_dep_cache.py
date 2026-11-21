@@ -4,8 +4,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
-from pit_crew.lanes.analysis.detectors.dep_cache import detect_dep_cache
+from pit_crew.lanes.analysis.detectors.dep_cache import INSTALL_COMMANDS, detect_dep_cache
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -31,7 +33,7 @@ def at(seconds: float) -> str:
 
 def job(name: str, end: float, steps: tuple[tuple[str, float], ...] = ()) -> dict[str, Any]:
     return {
-        "id": hash(name),
+        "id": int.from_bytes(name.encode(), "big") % 10**9,
         "name": name,
         "run_attempt": 1,
         "conclusion": "success",
@@ -136,6 +138,8 @@ jobs:
 def test_dep_cache_skips_reusable_jobs() -> None:
     yaml_text = "jobs:\n  call:\n    uses: org/repo/.github/workflows/x.yml@main\n"
     wf, prof = make_profile(yaml_text, [job("call", 200)])
+    assert wf.jobs["call"].uses is not None
+    assert wf.jobs["call"].steps == ()
     assert detect_dep_cache(prof, wf, PATH) == []
 
 
@@ -165,3 +169,42 @@ def test_dep_cache_fastapi_already_caches() -> None:
     with gzip.open(FIXTURES / "fastapi" / "runs.json.gz", "rt") as fh:
         runs = parse_runs(json.load(fh))
     assert detect_dep_cache(profile(wf, runs), wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "command", ["yarn test", "yarn build", "yarn lint", "cargo build --release", "cat yarn.lock", "npm install-test"]
+)
+def test_install_regex_rejects_non_installs(command: str) -> None:
+    assert INSTALL_COMMANDS.search(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "yarn",
+        "yarn --frozen-lockfile",
+        "yarn install --immutable",
+        "cargo fetch",
+        "npm ci && npm test",
+        "yarn && yarn test",
+    ],
+)
+def test_install_regex_accepts_installs(command: str) -> None:
+    assert INSTALL_COMMANDS.search(command) is not None
+
+
+def test_dep_cache_setup_go_cache_false_is_flagged() -> None:
+    yaml_text = (
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        '      - uses: actions/setup-go@v5\n        with:\n          cache: "false"\n'
+        "      - run: go mod download\n"
+    )
+    wf, prof = make_profile(yaml_text, [job("test", 200, (("Run go mod download", 100),))])
+    (f,) = detect_dep_cache(prof, wf, PATH)
+    assert f.step == "Run go mod download"
+
+
+def test_dep_cache_inline_unquoted_enable_cache_counts() -> None:
+    extra = "      - uses: astral-sh/setup-uv@v5\n        with: {enable-cache: true}\n"
+    wf, prof = make_profile(BASE.format(extra=extra), [NPM_JOB])
+    assert detect_dep_cache(prof, wf, PATH) == []

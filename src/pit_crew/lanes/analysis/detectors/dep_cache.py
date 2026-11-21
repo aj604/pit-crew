@@ -7,8 +7,12 @@ from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_wo
 from pit_crew.lanes.analysis.workflow import JobSpec, StepSpec, Workflow
 
 INSTALL_COMMANDS = re.compile(
-    r"\b(npm (ci|install)|pnpm (i|install)|yarn( install)?|bun install|pip install"
-    r"|uv (sync|pip install)|poetry install|cargo (fetch|build)|go mod download|bundle install)\b"
+    r"(?<![\w./-])("
+    r"npm (ci|install)|pnpm (i|install)|yarn install|bun install|pip install"
+    r"|uv (sync|pip install)|poetry install|cargo fetch|go mod download|bundle install"
+    r"|yarn(?=\s*($|&&|;|\|\||\s-))"  # bare `yarn` is an install; `yarn test` is not
+    r")(?![\w-])",
+    re.MULTILINE,
 )
 SAVED_FRACTION = 0.7  # share of the install a warm cache typically removes
 CONFIDENT_RUNS = 20  # runs needed before the estimate is trusted
@@ -20,7 +24,8 @@ def _caches(step: StepSpec) -> bool:
         return True
     if not uses.split("@", 1)[0].rsplit("/", 1)[-1].startswith("setup-"):
         return False
-    return bool(step.with_.get("cache")) or step.with_.get("enable-cache", "").lower() == "true"
+    cache = step.with_.get("cache", "").strip().lower()
+    return cache not in {"", "false"} or step.with_.get("enable-cache", "").lower() == "true"
 
 
 def _job_caches(job: JobSpec) -> bool:
