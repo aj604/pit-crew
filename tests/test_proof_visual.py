@@ -84,6 +84,27 @@ def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
     assert record.record([sys.executable, "-c", script], tmp_path / "r.cast", io.BytesIO()) == 128 + 15
 
 
+def test_a_check_that_reads_stdin_gets_the_jobs_own(tmp_path: Path) -> None:
+    # Given the terminal as stdin, the check would wait forever for input; here it reads end of file.
+    script = "import sys; print(f'read {len(sys.stdin.read())} bytes')"
+    wrapper = [
+        sys.executable,
+        "-I",
+        record.__file__,
+        "--cast",
+        str(tmp_path / "r.cast"),
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    ]
+    done = subprocess.run(  # noqa: S603  runs this repo's recorder on a fixed command
+        wrapper, stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False
+    )
+    assert done.returncode == 0
+    assert b"read 0 bytes" in done.stdout
+
+
 def test_record_keeps_a_character_cut_off_at_the_end(tmp_path: Path) -> None:
     cast = tmp_path / "r.cast"
     script = "import sys; sys.stdout.buffer.write(b'cut \\xe2\\x82')"  # first two bytes of the euro sign
