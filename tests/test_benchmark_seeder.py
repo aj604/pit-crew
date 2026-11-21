@@ -31,8 +31,15 @@ class _Clock:
 
 
 def _seed(gh: FakeGitHubClient, **kwargs: Any) -> bs.SeedReport:  # noqa: ANN401
+    """Seed with a fake clock; baseline-only (no bug pairs) unless ``bug_pairs`` is passed."""
     clock = _Clock()
-    options: dict[str, Any] = {"poll_seconds": 1.0, "timeout_seconds": 1000.0, "sleep": clock.sleep, "clock": clock}
+    options: dict[str, Any] = {
+        "poll_seconds": 1.0,
+        "timeout_seconds": 1000.0,
+        "sleep": clock.sleep,
+        "clock": clock,
+        "bug_pairs": (),
+    }
     return bs.seed_target(gh, REPO, **{**options, **kwargs})
 
 
@@ -176,7 +183,9 @@ def test_never_more_than_max_concurrent_runs_in_flight() -> None:
         def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> None:
             nonlocal peak
             super().dispatch_workflow(repo, workflow, ref)
-            pending = len(self._hidden) + sum(r.status != "completed" for r in self.repos[repo].runs)
+            hidden = [run for _, run, _ in self._hidden]
+            runs = [r for r in [*hidden, *self.repos[repo].runs] if r.event == bs.DISPATCH_EVENT]
+            pending = sum(r.status != "completed" for r in runs)
             peak = max(peak, pending)
 
     gh = Watching(complete_after=3)
@@ -344,7 +353,7 @@ class _Transport:
         self.refs: dict[str, str] = {}
         self.files: dict[str, str] = {}
 
-    def __call__(self, method: str, url: str, body: Mapping[str, Any] | None) -> tuple[int, Any]:  # noqa: C901, PLR0911
+    def __call__(self, method: str, url: str, body: Mapping[str, Any] | None) -> tuple[int, Any]:  # noqa: C901, PLR0911, PLR0912
         self.calls.append((method, url, body))
         path = url.removeprefix(f"{bs.API}/repos/{REPO}")
         if url == f"{bs.API}/user":
@@ -372,6 +381,13 @@ class _Transport:
             return 201, {}
         if path.endswith("/dispatches"):
             return 204, None
+        if "/jobs?" in path:
+            return 200, {"jobs": [{"name": "Lint", "conclusion": "failure"}, {"name": "Typecheck", "conclusion": None}]}
+        if path.startswith("/commits?"):
+            return 200, [
+                {"sha": "f1", "commit": {"message": "f1: fix\n\nbody"}},
+                {"sha": "c", "commit": {"message": "c0"}},
+            ]
         if "/runs?" in path:
             run = {"id": 7, "head_sha": "c", "head_branch": "main", "event": "workflow_dispatch"}
             return 200, {"workflow_runs": [{**run, "path": bs.WORKFLOW_PATH, "status": "queued", "conclusion": None}]}
@@ -393,6 +409,15 @@ def test_rest_client_reads_and_handles_missing() -> None:
     (run,) = client.list_workflow_runs(REPO, "ci.yml", branch="main", event="workflow_dispatch")
     assert (run.id, run.status, run.green) == (7, "queued", False)
     assert "branch=main&event=workflow_dispatch" in t.calls[-1][1]
+
+
+def test_rest_client_lists_run_jobs_and_commits() -> None:
+    t = _Transport()
+    client = bs.RestGitHubClient(t)
+    assert client.list_run_jobs(REPO, 7) == {"Lint": "failure", "Typecheck": None}
+    assert t.calls[-1][1] == f"{bs.API}/repos/{REPO}/actions/runs/7/jobs?per_page=100"
+    assert client.list_commits(REPO, "main") == [("f1", "f1: fix\n\nbody"), ("c", "c0")]
+    assert t.calls[-1][1] == f"{bs.API}/repos/{REPO}/commits?sha=main&per_page=100"
 
 
 def test_rest_client_creates_repo_under_user_or_org() -> None:
@@ -461,8 +486,13 @@ def test_cli_seed_target_seeds_and_prints_json(capsys: pytest.CaptureFixture[str
     assert out["provisioning"] == "created"
     assert out["workflow_sha"] == FROZEN
     assert len(out["green_runs"]) == 3
+    assert [p["key"] for p in out["bug_pairs"]] == ["b1", "b2", "b3", "b4"]
+    assert all(p["created"] for p in out["bug_pairs"])
+    writes = len(gh.writes)
     code, out = _cli(["--baseline-runs", "3"], gh, capsys)
     assert (code, out["provisioning"], out["dispatched"]) == (0, "existing", 0)
+    assert not any(p["created"] for p in out["bug_pairs"])
+    assert gh.writes[writes:] == []
 
 
 def test_cli_seed_target_reports_failure_as_json(capsys: pytest.CaptureFixture[str]) -> None:

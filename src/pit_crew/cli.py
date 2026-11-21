@@ -3,8 +3,9 @@
 ``smoke-lane`` runs one lane live against the Managed Agents API and checks it wrote its record
 to a SQLite ledger. It is the Milestone 2 check that a lane works end to end; see docs/lane-guide.md.
 
-``seed-target`` provisions a benchmark target repository from ``benchmarks/target_template`` and
-waits for its green ``workflow_dispatch`` baseline runs; see ``pit_crew.benchmark_seeder``.
+``seed-target`` provisions a benchmark target repository from ``benchmarks/target_template``, seeds
+its red-to-green bug/fix commit pairs, and waits for its green ``workflow_dispatch`` baseline runs;
+see ``pit_crew.benchmark_seeder``.
 
 ``check-target`` is the readiness preflight for a seeded target: Analysis must rank enough findings
 and Proof must have a fixed red commit for every required check; see ``pit_crew.check_target``.
@@ -230,7 +231,9 @@ def _positive_int(value: str) -> int:
 
 
 def _add_seed_target(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    seed = commands.add_parser("seed-target", help="provision a benchmark target repo and seed its green baseline")
+    seed = commands.add_parser(
+        "seed-target", help="provision a benchmark target repo and seed its bug pairs and green baseline"
+    )
     seed.add_argument("--repo", required=True, type=_repo, help="target repository, owner/name")
     seed.add_argument(
         "--baseline-runs",
@@ -244,7 +247,9 @@ def _add_seed_target(commands: "argparse._SubParsersAction[argparse.ArgumentPars
     seed.add_argument("--private", action="store_true", help="create the repository as private if it is missing")
     seed.add_argument("--max-concurrent", type=_positive_int, default=2, help="baseline runs in flight at once")
     seed.add_argument("--poll-seconds", type=float, default=30.0, help="seconds between run-status polls")
-    seed.add_argument("--timeout", type=float, default=3600.0, help="seconds to wait for the baseline")
+    seed.add_argument(
+        "--timeout", type=float, default=3600.0, help="seconds to wait for each bug/fix run and for the baseline"
+    )
 
 
 def _add_check_target(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

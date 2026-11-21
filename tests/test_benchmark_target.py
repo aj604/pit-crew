@@ -12,6 +12,8 @@ from typing import Any
 import pytest
 import yaml
 
+from fake_github import TEMPLATE_CI
+from pit_crew.benchmark_seeder import BUG_PAIRS, load_template
 from pit_crew.contracts import PLAYBOOK_SKILLS
 from pit_crew.lanes.analysis.workflow import parse_workflow
 from pit_crew.lanes.optimizer.validate import check_change
@@ -195,3 +197,54 @@ def test_optimizer_guard_allows_sharding_integration() -> None:
             step["run"] += " --splits 2 --group ${{ matrix.group }}"
     report = check_change(TARGET_PATH, WORKFLOW_TEXT, yaml.safe_dump(doc, sort_keys=False))
     assert report.ok, report.problems
+
+
+# --- the seeded bug pairs, against the template's real job commands ------------------------------
+
+
+def _job_command(step: str) -> list[str]:
+    argv = step.split()
+    argv = [sys.executable, *argv[1:]] if argv[0] == "python" else [sys.executable, "-m", *argv]
+    return [*argv, "-p", "no:cacheprovider"] if "pytest" in argv else argv
+
+
+def _run_ci(checkout: Path) -> dict[str, str]:
+    """Run each ci.yml job's commands in ``checkout`` (skipping installs), honouring ``needs``."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    conclusions: dict[str, str] = {}
+    by_id: dict[str, str] = {}
+    for job_id, job in _workflow()["jobs"].items():
+        needs = job.get("needs", [])
+        if any(by_id[n] != "success" for n in ([needs] if isinstance(needs, str) else needs)):
+            by_id[job_id] = "skipped"
+        else:
+            steps = [s["run"] for s in job["steps"] if "run" in s and "pip install" not in s["run"]]
+            ok = all(
+                subprocess.run(  # noqa: S603
+                    _job_command(step), cwd=checkout, env=env, capture_output=True, check=False, timeout=300
+                ).returncode
+                == 0
+                for step in steps
+            )
+            by_id[job_id] = "success" if ok else "failure"
+        conclusions[job["name"]] = by_id[job_id]
+    return conclusions
+
+
+@pytest.mark.parametrize("key", ["clean", *(p.key for p in BUG_PAIRS)])
+def test_seeded_bug_fails_exactly_the_jobs_the_fake_ci_models(key: str, tmp_path: Path) -> None:
+    checkout = tmp_path / "target"
+    for path, content in load_template(TEMPLATE).items():
+        (checkout / path).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / path).write_bytes(content)
+    calibration = {**CALIBRATION, "e2e_seconds_per_case": 0, "integration_seconds_per_case": 0}
+    (checkout / "calibration.json").write_text(json.dumps(calibration), encoding="utf-8")
+    pair = next((p for p in BUG_PAIRS if p.key == key), None)
+    if pair is not None:
+        for path, content in pair.bug_files(load_template(TEMPLATE)).items():
+            (checkout / path).write_bytes(content)
+    assert _run_ci(checkout) == TEMPLATE_CI[key]
+    snapshots = list((checkout / "ui-snapshots").glob("*.svg"))
+    assert len(snapshots) == (key == "b4")
+    if snapshots:
+        assert "inconsistent status" in snapshots[0].read_text(encoding="utf-8")
