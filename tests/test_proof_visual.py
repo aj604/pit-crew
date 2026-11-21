@@ -162,6 +162,90 @@ def test_record_persists_masks_file_across_steps_with_private_permissions(tmp_pa
     assert "caf\xe9 leaked=***" in recorded
 
 
+def test_record_preserves_short_trivial_large_and_many_explicit_masks_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    masks_file = tmp_path / "masks" / "job.masks"
+    large_secret = "PEM-" + ("Z" * 5000) + "-END"
+
+    # 1. Short (<4 chars), trivial ("true"), >4 KiB, and >256 explicit masks all survive into Step 2.
+    monkeypatch.setenv("LARGE_EXPLICIT", large_secret)
+    monkeypatch.setenv(record.SECRET_ENV_VARS_KEY, "LARGE_EXPLICIT")
+    step1_script = (
+        "print('::add-mask::q9')\n"
+        "print('::add-mask::true')\n"
+        "for i in range(270):\n"
+        "    print(f'::add-mask::many-secret-{i:03d}')\n"
+    )
+    assert (
+        record.record([sys.executable, "-c", step1_script], tmp_path / "s1.cast", io.BytesIO(), masks_file=masks_file)
+        == 0
+    )
+    raw_masks = masks_file.read_text(encoding="utf-8")
+    for leaked in ("q9", "many-secret-269", large_secret):
+        assert leaked not in raw_masks
+
+    monkeypatch.delenv("LARGE_EXPLICIT", raising=False)
+    monkeypatch.delenv(record.SECRET_ENV_VARS_KEY, raising=False)
+    step2_cast = tmp_path / "s2.cast"
+    step2_script = f"print('short=q9 flag=true tail=many-secret-269 big={large_secret}')\nraise SystemExit(3)\n"
+    assert record.record([sys.executable, "-c", step2_script], step2_cast, io.BytesIO(), masks_file=masks_file) == 3
+    _, *events = [json.loads(line) for line in step2_cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    assert "q9" not in recorded
+    assert "true" not in recorded
+    assert "many-secret-269" not in recorded
+    assert large_secret not in recorded
+    assert "short=*** flag=*** tail=*** big=***" in recorded
+
+    # 2. Verbose output exceeding exact hash scan budget fails closed: deletes .cast and skips video rendering.
+    rendered: list[str] = []
+    monkeypatch.setattr(record, "render_video", lambda c, v: rendered.append(f"{c}->{v}"))
+    monkeypatch.setattr(record, "_MAX_HASH_WINDOW_CHECKS", 50)
+    verbose_cast = tmp_path / "verbose.cast"
+    verbose_video = tmp_path / "verbose.mp4"
+    code = record.main(
+        [
+            "--cast",
+            str(verbose_cast),
+            "--video",
+            str(verbose_video),
+            "--masks-file",
+            str(masks_file),
+            "--",
+            sys.executable,
+            "-c",
+            "print('x' * 200 + 'many-secret-269'); raise SystemExit(4)",
+        ]
+    )
+    assert code == 4
+    assert not verbose_cast.exists()
+    assert rendered == []
+    assert "redaction incomplete" in capsys.readouterr().err
+
+    # 3. Corrupted masks file also fails closed without producing .cast or .mp4.
+    monkeypatch.setattr(record, "_MAX_HASH_WINDOW_CHECKS", 5_000_000)
+    masks_file.write_text("not-valid-json\n", encoding="utf-8")
+    corrupt_cast = tmp_path / "corrupt.cast"
+    corrupt_code = record.main(
+        [
+            "--cast",
+            str(corrupt_cast),
+            "--video",
+            str(tmp_path / "corrupt.mp4"),
+            "--masks-file",
+            str(masks_file),
+            "--",
+            sys.executable,
+            "-c",
+            "print('secret'); raise SystemExit(5)",
+        ]
+    )
+    assert corrupt_code == 5
+    assert not corrupt_cast.exists()
+    assert rendered == []
+
+
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
     script = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
     assert record.record([sys.executable, "-c", script], tmp_path / "r.cast", io.BytesIO()) == 128 + 15
