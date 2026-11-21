@@ -9,7 +9,9 @@ import pytest
 
 from pit_crew import tools
 from pit_crew.lanes.analysis import history
+from pit_crew.lanes.analysis import tools as analysis_tools
 from pit_crew.lanes.analysis.detectors import DETECTORS
+from pit_crew.lanes.analysis.detectors.base import Finding
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import build_request
 
@@ -94,7 +96,9 @@ def test_find_bottlenecks_ranks_findings() -> None:
     savings = [f["expected_savings_seconds"] for f in result["findings"]]
     assert savings == sorted(savings, reverse=True)
     assert result["profile_summary"]["runs_analyzed"] == 5
+    assert result["profile_summary"]["base_sha"] == "a" * 40
     assert set(result["profile_summary"]) == {
+        "base_sha",
         "runs_analyzed",
         "wall_clock_median_seconds",
         "wall_clock_p95_seconds",
@@ -141,3 +145,37 @@ def test_every_detector_is_registered() -> None:
         "detect_parallelize_dag",
         "detect_dedupe_jobs",
     }
+
+
+def fake_finding(seconds: float, job_id: str) -> Finding:
+    return Finding(
+        skill="dep-cache",
+        workflow_path=".github/workflows/ci.yml",
+        job=job_id,
+        step="",
+        bucket="setup",
+        description="x",
+        expected_savings_seconds=seconds,
+        evidence={"max_saving_seconds": 100.0},
+        confidence=0.5,
+        risk="low",
+    )
+
+
+@pytest.mark.usefixtures("synthetic")
+def test_find_bottlenecks_drops_findings_under_ten_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    small, zero, big = fake_finding(5.0, "a"), fake_finding(0.0, "b"), fake_finding(40.0, "c")
+    monkeypatch.setattr(analysis_tools, "DETECTORS", (lambda *_args: [small, zero, big],))
+
+    assert [f["job"] for f in find(InMemoryLedger())["findings"]] == ["c"]
+
+
+@pytest.mark.usefixtures("synthetic")
+def test_find_bottlenecks_with_no_analyzed_runs_says_nothing_was_measured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [])
+
+    result = find(InMemoryLedger())
+
+    assert result["uncovered"] == ["No runs analyzed (all excluded or none fetched); nothing was measured."]
+    assert result["profile_summary"]["base_sha"] == ""
+    assert result["findings"] == []

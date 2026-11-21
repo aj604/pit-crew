@@ -17,7 +17,8 @@ Input: a repository. Output: hypotheses, most valuable first.
    would remove or weaken a check: Pit Crew never checks less and never hides failures.
 3. Record the top 5 at most, highest `expected_savings_seconds` first, with `record_hypothesis`,
    passing every field from the finding (skill, workflow_path, job, step, bucket, description,
-   expected_savings_seconds, evidence, confidence, risk) plus `base_sha`.
+   expected_savings_seconds, evidence, confidence, risk) plus `base_sha`, which is
+   `profile_summary.base_sha` from `find_bottlenecks` (the commit of the newest analyzed run).
 4. Report each `uncovered` note in your final message. Example: when the biggest bucket is
    waiting, no playbook skill shrinks runner queueing, so say so rather than inventing a fix.
 5. If no finding survives, record nothing and say why.

@@ -16,6 +16,7 @@ from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.dedupe_ledger import DuplicateHypothesisError, hypothesis_key, recorded_keys
 from pit_crew.lanes.analysis.detectors import DETECTORS
+from pit_crew.lanes.analysis.detectors.base import keep_worthwhile
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
@@ -185,6 +186,8 @@ def _profile_workflow(
 def _uncovered(ci: CIProfile) -> list[str]:
     """Plain-language notes on time no playbook skill can shrink."""
     notes: list[str] = []
+    if ci.runs_analyzed == 0:  # with nothing measured the buckets are all zero and "waiting" would win by default
+        return ["No runs analyzed (all excluded or none fetched); nothing was measured."]
     if "waiting" in {ci.biggest_bucket, ci.biggest_bucket_p95}:
         notes.append(
             "The critical path's biggest bucket is waiting for a runner "
@@ -217,28 +220,31 @@ def find_bottlenecks(
     """Profile one workflow, run every bottleneck detector, and rank what is left.
 
     Returns profile_summary (wall-clock p50/p95, the critical path and its waiting/setup/running
-    split), findings (each ready to pass to record_hypothesis; biggest expected_savings_seconds
-    first; bottlenecks already in the ledger are left out) and uncovered (time no playbook skill
-    can shrink, such as runner queueing: report these).
+    split, and base_sha: the commit of the newest analyzed run), findings (each ready to pass to
+    record_hypothesis; biggest expected_savings_seconds first, none under 10 seconds; bottlenecks
+    already in the ledger are left out) and uncovered (time no playbook skill can shrink, such as
+    runner queueing: report these).
     """
     ci, spec = _profile_workflow(repo, workflow, runs, branch)
     path = f".github/workflows/{workflow}"
     seen = recorded_keys(ledger, repo)
-    found = [f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen]
-    found.sort(key=lambda f: f.expected_savings_seconds, reverse=True)
+    found = keep_worthwhile(f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen)
     summary = ci.to_dict()
     return {
         "profile_summary": {
-            key: summary[key]
-            for key in (
-                "runs_analyzed",
-                "wall_clock_median_seconds",
-                "wall_clock_p95_seconds",
-                "critical_path",
-                "critical_path_buckets",
-                "biggest_bucket",
-                "biggest_bucket_p95",
-            )
+            "base_sha": ci.newest_head_sha,
+            **{
+                key: summary[key]
+                for key in (
+                    "runs_analyzed",
+                    "wall_clock_median_seconds",
+                    "wall_clock_p95_seconds",
+                    "critical_path",
+                    "critical_path_buckets",
+                    "biggest_bucket",
+                    "biggest_bucket_p95",
+                )
+            },
         },
         "findings": [f.to_dict() for f in found],
         "uncovered": _uncovered(ci),

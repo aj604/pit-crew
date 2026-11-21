@@ -14,6 +14,7 @@ import json
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from statistics import median
 from typing import Any
 
@@ -87,6 +88,7 @@ class CIProfile:
     jobs: tuple[JobProfile, ...]  # largest max_saving_seconds first
     steps: tuple[StepProfile, ...]  # slowest median first
     unmatched_jobs: tuple[str, ...] = field(default=())  # API job names not found in the workflow file
+    newest_head_sha: str = ""  # commit of the most recent analyzed run: what the measurements were taken on
 
     def to_dict(self, max_steps: int = 15) -> dict[str, Any]:
         """JSON-ready summary for the agent, keeping only the slowest steps."""
@@ -144,6 +146,9 @@ def critical_path(workflow: Workflow, seconds: Mapping[str, float]) -> CriticalP
         chain.append(last)
         last = previous[last]
     return CriticalPath(total, tuple(reversed(chain)))
+
+
+_EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
 def max_saving(workflow: Workflow, seconds: Mapping[str, float], job_id: str) -> float:
@@ -215,6 +220,7 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
         jobs=tuple(jobs),
         steps=tuple(step_profiles(workflow, kept)),
         unmatched_jobs=tuple(sorted(unmatched)),
+        newest_head_sha=max(kept, key=lambda r: r.run_started_at or _EPOCH).head_sha if kept else "",
     )
 
 
