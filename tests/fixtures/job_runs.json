@@ -1,0 +1,8 @@
+[
+  {"name": "lint", "seconds": 30.0},
+  {"name": "build", "seconds": 250.0},
+  {"name": "test", "seconds": 760.0},
+  {"name": "lint", "seconds": 30.0},
+  {"name": "build", "seconds": 250.0},
+  {"name": "test", "seconds": 740.0}
+]
