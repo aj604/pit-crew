@@ -237,7 +237,14 @@ def _single_check_matches(expected: str, actual: str) -> bool:
 def _exact_or_short_match(expected_low: str, actual_low: str) -> bool:
     if expected_low == actual_low:
         return True
-    return _short_check_name(expected_low) == _short_check_name(actual_low)
+    return _has_workflow_prefix(expected_low, actual_low) or _has_workflow_prefix(actual_low, expected_low)
+
+
+def _has_workflow_prefix(full: str, bare: str) -> bool:
+    if not bare or not full.endswith(f"/{bare}"):
+        return False
+    prefix = full[: -(len(bare) + 1)]
+    return bool(prefix) and prefix.count("(") == prefix.count(")")
 
 
 def compare_bundles(  # noqa: PLR0913  explicit bundle + optional guard inputs
@@ -397,10 +404,6 @@ def _bundle_parts(side: str, bundle: ArtifactBundle) -> list[Part]:
 
 def _normalize_check_key(check: str) -> str:
     return _MATRIX_SUFFIX.sub("", check.strip()).strip().lower()
-
-
-def _short_check_name(normalized_key: str) -> str:
-    return normalized_key.rsplit("/", maxsplit=1)[-1].strip()
 
 
 def _describe(error: Exception) -> str:

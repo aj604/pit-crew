@@ -359,6 +359,13 @@ def test_expected_checks_guard_rejects_mismatched_check_before_calling_model() -
     # Matrix-qualified expected checks must not fold across different matrix legs.
     assert expected_checks_matched(("CI/test (node-26, ubuntu-latest)",), ("test (node-20, ubuntu-latest)",)) is False
     assert expected_checks_matched(("CI/test (node-26, ubuntu-latest)",), ("test (node-26, ubuntu-latest)",)) is True
+    # Shard fractions like `(1/4)` must never be split on `/` into `"4)"` to match unrelated jobs!
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("Unit tests (1/4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("UI check (2/4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("UI check (1/4)",)) is True
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("OtherWF/UI check (1/4)",)) is False
+    assert expected_checks_matched(("CI/UI check",), ("UI check (1/4)",)) is True
 
     def must_not_be_called(_m: str, _p: Sequence[tuple[str, str | bytes]], _s: Mapping[str, object]) -> str:
         raise AssertionError

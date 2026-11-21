@@ -888,3 +888,98 @@ def test_metadata_step_writes_check_identity_and_extract_verifies_metadata(tmp_p
         )
         == ()
     )
+
+
+def test_secret_masking_skips_inline_secret_steps_and_scrubs_recorded_output(tmp_path: Path) -> None:
+    wf_yaml = """\
+name: CI
+on: [push]
+env:
+  WORKFLOW_CRED: ${{ secrets.WORKFLOW_CRED }}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      JOB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inline secret step stays unwrapped
+        run: echo "${{ secrets.INLINE_SECRET }}"
+      - name: Masked test step
+        env:
+          STEP_KEY: ${{ secrets.STEP_KEY }}
+        run: |
+          echo "::add-mask::dyn-masked-secret-987"
+          echo "wf=$WORKFLOW_CRED job=$JOB_TOKEN step=$STEP_KEY dyn=dyn-masked-secret-987"
+          echo "raw_gh=ghp_1234567890abcdefghij1234567890"
+          echo "child_var=${PIT_CREW_SECRET_ENV_VARS:-unset}"
+          exit 2
+"""
+    overlay = build_replay_overlay(".github/workflows/ci.yml", wf_yaml, {})
+    parsed = yaml.safe_load(overlay[".github/workflows/ci.yml"])
+    steps = parsed["jobs"]["test"]["steps"]
+
+    # Step 2 (inline ${{ secrets.INLINE_SECRET }}) is left completely unwrapped!
+    inline_step = steps[2]
+    assert inline_step["name"] == "Inline secret step stays unwrapped"
+    assert inline_step["run"] == 'echo "${{ secrets.INLINE_SECRET }}"'
+    assert RECORD_SCRIPT_PATH not in inline_step["run"]
+
+    # Step 3 receives only env var NAMES (never secret values) via PIT_CREW_SECRET_ENV_VARS.
+    masked_step = steps[3]
+    assert masked_step["env"]["PIT_CREW_SECRET_ENV_VARS"] == "JOB_TOKEN,STEP_KEY,WORKFLOW_CRED"  # noqa: S105
+
+    # Upload step publishes ONLY *.mp4 and replay-meta.json (never raw .cast files!).
+    upload_step = steps[-1]
+    assert upload_step["uses"] == UPLOAD_ARTIFACT_ACTION
+    upload_path = str(upload_step["with"]["path"])
+    assert "*.mp4" in upload_path
+    assert REPLAY_META_FILENAME in upload_path
+    assert ".cast" not in upload_path
+
+    # Execute the wrapped step in a real shell + record.py and confirm secrets are scrubbed from .cast.
+    workspace = tmp_path / "ws"
+    runner_temp = tmp_path / "tmp"
+    runner_temp.mkdir()
+    script_file = workspace / RECORD_SCRIPT_PATH
+    script_file.parent.mkdir(parents=True)
+    script_file.write_text(overlay[RECORD_SCRIPT_PATH], encoding="utf-8")
+
+    env = {
+        **os.environ,
+        "GITHUB_WORKSPACE": str(workspace),
+        "RUNNER_TEMP": str(runner_temp),
+        "WORKFLOW_CRED": "wf-secret-alpha-111",
+        "JOB_TOKEN": "job-secret-beta-222",
+        "STEP_KEY": "step-secret-gamma-333",
+        "PIT_CREW_SECRET_ENV_VARS": masked_step["env"]["PIT_CREW_SECRET_ENV_VARS"],
+        "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+    }
+    sh_bin = shutil.which("sh") or "/bin/sh"
+    proc = subprocess.run(  # noqa: S603  executes generated replay wrapper
+        [sh_bin, "-e", "-c", masked_step["run"]],
+        cwd=workspace,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 2
+    # Job log still receives raw ::add-mask:: so GitHub Actions masks its own log!
+    assert "::add-mask::dyn-masked-secret-987" in proc.stdout
+    # Child process does not see PIT_CREW_SECRET_ENV_VARS in its environment.
+    assert "child_var=unset" in proc.stdout
+
+    cast_text = (runner_temp / "pit-crew-replay" / "test" / "step-2.cast").read_text(encoding="utf-8")
+    for secret in (
+        "wf-secret-alpha-111",
+        "job-secret-beta-222",
+        "step-secret-gamma-333",
+        "dyn-masked-secret-987",
+        "ghp_1234567890abcdefghij1234567890",
+    ):
+        assert secret not in cast_text
+    assert "wf=*** job=*** step=*** dyn=***" in cast_text
+    assert "::add-mask::***" in cast_text
+    assert "raw_gh=***" in cast_text

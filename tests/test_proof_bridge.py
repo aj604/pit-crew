@@ -20,6 +20,7 @@ from pit_crew.proof_bridge import (
     ProofBridgeError,
     ProofPRConfig,
     ReplayRunPair,
+    verify_replay_run_pairs,
 )
 
 BASE_CI = """\
@@ -898,3 +899,157 @@ def test_multimodal_replay_verifier_rejects_unrelated_job_failures_and_metadata_
     assert bridge_res.bugs_caught == 0
     assert bridge_res.replays[0].status == "unverified"
     assert fake_client.models.calls == []
+
+
+class _HttpxProofAdapter:
+    def __init__(self, inner: object) -> None:
+        from pit_crew.github import HttpxGitHubClient  # noqa: PLC0415
+
+        assert isinstance(inner, HttpxGitHubClient)
+        self._inner = inner
+
+    def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
+        return self._inner.get_file_content(repo, path, ref)
+
+    def list_workflow_job_runs(self, _repo: str) -> list[JobRun]:
+        return []
+
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        return self._inner.get_run_failure_output(repo, run_id)
+
+    def list_run_artifacts(self, repo: str, run_id: int | str) -> list[object]:
+        return list(self._inner.list_run_artifacts(repo, run_id))
+
+    def download_artifact(self, repo: str, artifact_id: int) -> bytes:
+        return self._inner.download_artifact(repo, artifact_id)
+
+    def get_failed_job_logs(  # noqa: PLR0913
+        self,
+        repo: str,
+        run_id: int | str,
+        *,
+        check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
+        max_bytes: int = 262_144,
+    ) -> bytes:
+        return self._inner.get_failed_job_logs(
+            repo,
+            run_id,
+            check=check,
+            expected_checks=expected_checks,
+            check_aliases=check_aliases,
+            max_bytes=max_bytes,
+        )
+
+    def list_failed_job_names(self, repo: str, run_id: int | str) -> list[str]:
+        return self._inner.list_failed_job_names(repo, run_id)
+
+
+def test_untargeted_sha_only_replay_and_job_id_aliases_verify_cleanly() -> None:
+    import httpx  # noqa: PLC0415
+
+    from pit_crew.github import HttpxGitHubClient  # noqa: PLC0415
+
+    repo = "acme/repo"
+    base_zip = _zip_bytes({"step-1.mp4": b"\x00\x00\x00\x18ftypmp42base"})
+    cand_zip = _zip_bytes({"step-1.mp4": b"\x00\x00\x00\x18ftypmp42cand"})
+    downloaded_log_jobs: list[str] = []
+
+    routes: dict[str, httpx.Response] = {
+        # Runs 101/102: untargeted SHA-only replay (pair.check='ci.yml', expected_checks=()).
+        "/repos/acme/repo/actions/runs/101/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 1, "name": "pit-crew-replay-unit-test-0", "expired": False}]},
+        ),
+        "/repos/acme/repo/actions/runs/102/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 2, "name": "pit-crew-replay-unit-test-0", "expired": False}]},
+        ),
+        "/repos/acme/repo/actions/artifacts/1/zip": httpx.Response(200, content=base_zip),
+        "/repos/acme/repo/actions/artifacts/2/zip": httpx.Response(200, content=cand_zip),
+        # Runs 201/202: logs-only replay where expected_checks lists job ID before display name.
+        "/repos/acme/repo/actions/runs/201/artifacts": httpx.Response(200, json={"artifacts": []}),
+        "/repos/acme/repo/actions/runs/202/artifacts": httpx.Response(200, json={"artifacts": []}),
+        "/repos/acme/repo/actions/runs/201/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 21, "name": "Unit test", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 22, "name": "Lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/acme/repo/actions/runs/202/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 31, "name": "Unit test", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 32, "name": "Lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/repos/acme/repo/actions/jobs/") and path.endswith("/logs"):
+            downloaded_log_jobs.append(path.split("/")[-2])
+            return httpx.Response(200, content=b"AssertionError: boom\n")
+        return routes.get(path, httpx.Response(404))
+
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError: boom",
+                "candidate_failure": "AssertionError: boom",
+                "reason": "Matched.",
+                "visual_evidence_seen": False,
+                "visual_summary": "",
+            }
+        )
+    )
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+
+    with HttpxGitHubClient(token="ghp_test", transport=httpx.MockTransport(handler)) as gh:  # noqa: S106
+        # 1. Untargeted SHA-only replay succeeds via verify_replay_run_pairs without filtering by 'ci.yml'.
+        untargeted = verify_replay_run_pairs(
+            gh,
+            repo,
+            [
+                ReplayRunPair(
+                    sha="deadbeef",
+                    check="ci.yml",
+                    baseline_conclusion="failure",
+                    candidate_conclusion="failure",
+                    baseline_run_id="101",
+                    candidate_run_id="102",
+                )
+            ],
+            ask=ask,
+        )
+        assert untargeted.bugs_total == 1
+        assert untargeted.bugs_caught == 1
+        assert untargeted.replays[0].status == "caught"
+
+        # 2. ProofBridge resolves job-id-before-display-name aliases for logs-only runs and skips unrelated Lint logs.
+        bridge = ProofBridge(_HttpxProofAdapter(gh), ask=ask)
+        aliased = bridge.verify_replay_runs(
+            repo,
+            [
+                ReplayRunPair(
+                    sha="cafebabe",
+                    check="CI/unit-test",
+                    baseline_conclusion="failure",
+                    candidate_conclusion="failure",
+                    baseline_run_id="201",
+                    candidate_run_id="202",
+                    expected_checks=("CI/unit-test", "CI/Unit test"),
+                )
+            ],
+        )
+        assert aliased.bugs_total == 1
+        assert aliased.bugs_caught == 1
+        assert aliased.replays[0].status == "caught"
+        assert downloaded_log_jobs == ["21", "31"]

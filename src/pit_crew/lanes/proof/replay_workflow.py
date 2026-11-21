@@ -36,6 +36,7 @@ from pit_crew.lanes.proof.miner import check_key
 
 RECORD_SCRIPT_PATH = ".pit-crew/record.py"
 REPLAY_RECORD_ENV = "PIT_CREW_RECORD"
+SECRET_ENV_VARS_KEY = "PIT_CREW_SECRET_ENV_VARS"  # noqa: S105  env var name, not a secret
 REPLAY_ARTIFACT_PREFIX = "pit-crew-replay-"
 REPLAY_META_FILENAME = "replay-meta.json"
 REPLAY_OUTPUT_DIR = "${{ runner.temp }}/pit-crew-replay"
@@ -63,6 +64,10 @@ _TEMPLATE_EXPR_RE = re.compile(r"\$\{\{.*?\}\}")
 _MATRIX_SUFFIX_RE = re.compile(r"\s*\(.*\)$")
 _WIN_EQ_RE = re.compile(r"^\s*runner\.os\s*==\s*['\"]windows['\"]\s*$", re.IGNORECASE)
 _WIN_NEQ_RE = re.compile(r"^\s*runner\.os\s*!=\s*['\"]windows['\"]\s*$", re.IGNORECASE)
+_SECRET_EXPR_RE = re.compile(
+    r"\$\{\{[^}]*\b(?:secrets(?:\.[A-Za-z0-9_]+|\[[^\]]+\])?|github\.token)\b[^}]*\}\}",
+    re.IGNORECASE,
+)
 _REPLAY_REPO_EXPRS = frozenset({"github.repository"})
 _REPLAY_REF_EXPRS = frozenset({"github.sha", "github.ref", "github.ref_name"})
 _POSIX_RUNNER_PREFIXES = (
@@ -236,6 +241,7 @@ def instrument_workflow(
         return workflow_yaml
 
     workflow_shell = _default_shell(doc)
+    workflow_secret_env = _secret_env_var_names(doc.get("env"))
     selected_ids = _select_job_ids(parsed, jobs, target_checks)
     for job_id in selected_ids:
         job = jobs.get(job_id)
@@ -246,6 +252,7 @@ def instrument_workflow(
                 job,
                 workflow_name=parsed.name,
                 workflow_shell=workflow_shell,
+                workflow_secret_env=workflow_secret_env,
                 agg_version=agg_version,
                 runner_kind=runner_kind,
             )
@@ -449,9 +456,9 @@ def _exact_job_name_match(target_low: str, job_low: str, wf_low: str) -> bool:
         return True
     if wf_low and target_low == f"{wf_low}/{job_low}":
         return True
-    if "/" in target_low:
-        prefix, _, suffix = target_low.partition("/")
-        if suffix.strip() == job_low and (not wf_low or prefix.strip() == wf_low):
+    if target_low.endswith(f"/{job_low}"):
+        prefix = target_low[: -(len(job_low) + 1)].strip()
+        if prefix and prefix.count("(") == prefix.count(")") and (not wf_low or prefix == wf_low):
             return True
     return False
 
@@ -715,6 +722,7 @@ def _instrument_job(  # noqa: PLR0913
     *,
     workflow_name: str,
     workflow_shell: str | None,
+    workflow_secret_env: frozenset[str],
     agg_version: str,
     runner_kind: RunnerKind,
 ) -> None:
@@ -726,6 +734,7 @@ def _instrument_job(  # noqa: PLR0913
     safe_job_id = _safe_job_slug(job_id)
     job_default = _default_shell(job)
     effective_default = job_default if job_default is not None else workflow_shell
+    inherited_secret_env = workflow_secret_env | _secret_env_var_names(job.get("env"))
     new_steps: list[Any] = []
     recorder_checkout_path: str | None = None
     installed_tools = False
@@ -757,6 +766,7 @@ def _instrument_job(  # noqa: PLR0913
                 step_idx=step_idx,
                 default_shell=effective_default,
                 recorder_expr=_recorder_shell_expr(recorder_checkout_path),
+                secret_env_vars=inherited_secret_env | _secret_env_var_names(raw_step.get("env")),
                 mixed=mixed,
             )
             if emitted is not None:
@@ -882,6 +892,16 @@ def _recorder_shell_expr(checkout_rel_path: str) -> str:
     return f'"$GITHUB_WORKSPACE/"{shlex.quote(rel)}'
 
 
+def _secret_env_var_names(raw_env: object) -> frozenset[str]:
+    if not isinstance(raw_env, Mapping):
+        return frozenset()
+    names: set[str] = set()
+    for key, value in raw_env.items():
+        if isinstance(key, str) and key.strip() and isinstance(value, str) and _SECRET_EXPR_RE.search(value):
+            names.add(key.strip())
+    return frozenset(names)
+
+
 def _instrument_run_step(  # noqa: PLR0913
     step: Mapping[str, Any],
     *,
@@ -889,6 +909,7 @@ def _instrument_run_step(  # noqa: PLR0913
     step_idx: int,
     default_shell: str | None,
     recorder_expr: str,
+    secret_env_vars: frozenset[str],
     mixed: bool,
 ) -> list[dict[str, Any]] | None:
     if mixed:
@@ -903,6 +924,7 @@ def _instrument_run_step(  # noqa: PLR0913
             step_idx=step_idx,
             default_shell=default_shell,
             recorder_expr=recorder_expr,
+            secret_env_vars=secret_env_vars,
         )
         if wrapped is None:
             return None
@@ -919,20 +941,22 @@ def _instrument_run_step(  # noqa: PLR0913
         step_idx=step_idx,
         default_shell=default_shell,
         recorder_expr=recorder_expr,
+        secret_env_vars=secret_env_vars,
     )
     return [wrapped] if wrapped is not None else None
 
 
-def _wrap_run_step(
+def _wrap_run_step(  # noqa: PLR0913
     step: Mapping[str, Any],
     *,
     safe_job_id: str,
     step_idx: int,
     default_shell: str | None,
     recorder_expr: str,
+    secret_env_vars: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     script = step.get("run")
-    if not isinstance(script, str) or RECORD_SCRIPT_PATH in script:
+    if not isinstance(script, str) or RECORD_SCRIPT_PATH in script or _SECRET_EXPR_RE.search(script):
         return None
     resolved = _resolve_step_shell(step, default_shell)
     if resolved is None:
@@ -960,6 +984,11 @@ def _wrap_run_step(
     updated = dict(step)
     updated["run"] = wrapped_script
     updated["shell"] = outer_shell
+    if secret_env_vars:
+        existing_env = updated.get("env")
+        merged_env = dict(existing_env) if isinstance(existing_env, Mapping) else {}
+        merged_env[SECRET_ENV_VARS_KEY] = ",".join(sorted(secret_env_vars))
+        updated["env"] = merged_env
     return updated
 
 
@@ -1144,13 +1173,14 @@ def _prepare_metadata_step(
 
 def _upload_artifact_step(safe_job_id: str, *, mixed: bool = False) -> dict[str, Any]:
     fallback_name = f"format('{REPLAY_ARTIFACT_PREFIX}{safe_job_id}-{{0}}', strategy.job-index)"
+    job_dir = f"{REPLAY_OUTPUT_DIR}/{safe_job_id}"
     return {
         "name": "Upload Pit Crew replay recording",
         "if": "failure() && runner.os != 'Windows'" if mixed else "failure()",
         "uses": UPLOAD_ARTIFACT_ACTION,
         "with": {
             "name": f"${{{{ steps.pit_crew_replay_meta.outputs.artifact_name || {fallback_name} }}}}",
-            "path": f"{REPLAY_OUTPUT_DIR}/{safe_job_id}",
+            "path": f"{job_dir}/*.mp4\n{job_dir}/{REPLAY_META_FILENAME}",
             "retention-days": 7,
             "if-no-files-found": "ignore",
         },

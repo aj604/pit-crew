@@ -4174,14 +4174,34 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
         cases=(BugCase(kind="commit", commit_sha="deadbeef", expected_checks=("CI/test",)),),
     )
 
-    run_scripts: dict[int, list[WorkflowRunResult]] = {}
-    for pair_idx in range(5):
-        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
-        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
-    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
-    run_scripts[12] = [_make_run(12, conclusion="failure", duration_seconds=11.0)]
+    class _ParallelBridgeGitHub(_FakeGitHubClient):
+        @override
+        def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
+            run_id = super().dispatch_workflow(repo, workflow, ref)
+            if ref.startswith("pc/base-"):
+                pair_idx = int(ref.rsplit("-", maxsplit=1)[-1])
+                result = _make_run(run_id, duration_seconds=100.0 + pair_idx)
+            elif ref.startswith("pc/cand-"):
+                pair_idx = int(ref.rsplit("-", maxsplit=1)[-1])
+                result = _make_run(run_id, duration_seconds=45.0 + pair_idx)
+            else:
+                result = _make_run(run_id, conclusion="failure", duration_seconds=12.0)
+            with self._lock:
+                self._run_scripts[run_id] = [result]
+            return run_id
 
-    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts, require_known_branch=True)
+    base_ci = (
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - uses: actions/checkout@v4\n      - run: pytest\n"
+    )
+    github = _ParallelBridgeGitHub(
+        {"org/repo": "base-sha"},
+        file_contents={
+            ("org/repo", "base-sha", ".github/workflows/ci.yml"): base_ci,
+            ("org/repo", "deadbeef", ".github/workflows/ci.yml"): base_ci,
+        },
+        require_known_branch=True,
+    )
     proof_gh = _FakeProofHistoryAndPR()
     ask = partial(managed_agent.ask_multimodal, client=_FakeModelsClient(same=True))
     # Construct ProofBridge without run_lane to also exercise Dispatcher's fallback to self.lane_runner!
@@ -4212,15 +4232,30 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
     assert verdict is not None
     assert verdict.keep is True
     assert "## Required replays\n- deadbeef" in proof_prompts[0]
+    # Live ProofBridge cycles default to replay recording instrumentation on replay branches!
+    replay_commits = [c for c in github.commits if str(c["branch"]).startswith("pc/replay-")]
+    assert len(replay_commits) == 2
+    for commit in replay_commits:
+        committed_files = commit["files"]
+        assert isinstance(committed_files, dict)
+        assert RECORD_SCRIPT_PATH in committed_files
+        assert REPLAY_RECORD_ENV in committed_files[".github/workflows/ci.yml"]
     assert len(proof_gh.committed_cards) == 1
     assert ".github/pit-crew/proof-card.svg" in proof_gh.committed_cards[0][2]
     assert len(proof_gh.opened_prs) == 1
     assert "![Proof card for pc/c1]" in proof_gh.opened_prs[0]["body"]
     assert github.pull_requests == []
 
-    # Now verify fail-closed rejection when Gemini 4 Carbon reports a different failure!
+    # Now verify fail-closed rejection when Gemini 4 Carbon reports a different failure,
+    # and explicit record_replays=False opt-out skips replay instrumentation!
+    run_scripts_seq: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts_seq[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
+        run_scripts_seq[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts_seq[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    run_scripts_seq[12] = [_make_run(12, conclusion="failure", duration_seconds=11.0)]
     ledger_bad = InMemoryLedger()
-    github_bad = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    github_bad = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts_seq)
     bridge_bad = ProofBridge(
         proof_gh,
         run_lane=lambda _lane, _task, *, repo="", ledger=None: ledger.add(plan) if (ledger and repo != "!") else None,
@@ -4232,12 +4267,17 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
             "optimizer": lambda active, _t, _r: active.add(cand),
         }
     )
-    verdict_bad = Dispatcher(ledger_bad, github_bad, lane_runner=runner_bad, proof_bridge=bridge_bad).run_cycle(
-        "org/repo"
-    )
+    verdict_bad = Dispatcher(
+        ledger_bad,
+        github_bad,
+        lane_runner=runner_bad,
+        proof_bridge=bridge_bad,
+        record_replays=False,
+    ).run_cycle("org/repo")
     assert verdict_bad is not None
     assert verdict_bad.keep is False
     assert verdict_bad.reason == "caught 0/1 bugs"
+    assert not any(isinstance(c["files"], dict) and RECORD_SCRIPT_PATH in c["files"] for c in github_bad.commits)
 
 
 def test_dispatcher_falls_back_to_github_pr_when_proof_bridge_has_no_pr_client() -> None:

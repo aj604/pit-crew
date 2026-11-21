@@ -1343,3 +1343,118 @@ def test_httpx_get_run_failure_output_resolves_expected_check_and_rejects_unrela
 
         # get_failed_job_logs with non-matching check returns empty bytes rather than another job's logs.
         assert client.get_failed_job_logs("org/repo", "602", check="CI/Build&Test: node-26, ubuntu-latest") == b""
+
+
+def test_httpx_check_resolution_handles_multi_target_matrices_browser_fallback_and_log_aliases() -> None:
+    test20_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps({"workflow": "CI", "job_id": "test", "job_name": "test (20)"}).encode(),
+            "step-1.mp4": b"test20-mp4",
+        }
+    )
+    ui_browser_zip = _make_artifact_zip({"test-results/cart/video.webm": b"\x1a\x45\xdf\xa3browser-webm"})
+    ui_terminal_zip = _make_artifact_zip({"step-1.mp4": b"ui-terminal-mp4"})
+    lint_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps({"workflow": "CI", "job_id": "lint", "job_name": "lint"}).encode(),
+            "step-1.mp4": b"lint-mp4",
+        }
+    )
+    fetched_logs: list[str] = []
+
+    routes: dict[str, httpx.Response] = {
+        # Run 701: `lint` matched exactly and PASSED, while `test (20)` FAILED under target `CI/test`.
+        "/repos/org/repo/actions/runs/701/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 1, "name": "lint", "conclusion": "success", "workflow_name": "CI"},
+                    {"id": 2, "name": "test (20)", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/701/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 7011, "name": "pit-crew-replay-test-test-20-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/7011/zip": httpx.Response(200, content=test20_zip),
+        # Run 702: Windows `ui` uploaded `failure-recordings-ui-0`, while unrelated `lint` uploaded `pit-crew-replay-*`.
+        "/repos/org/repo/actions/runs/702/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 10, "name": "ui", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 11, "name": "lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/702/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 7021, "name": "pit-crew-replay-lint-0", "expired": False},
+                    {"id": 7022, "name": "failure-recordings-ui-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/7021/zip": httpx.Response(200, content=lint_zip),
+        "/repos/org/repo/actions/artifacts/7022/zip": httpx.Response(200, content=ui_browser_zip),
+        # Run 703: Both primary and fallback exist for `ui` -> primary still wins.
+        "/repos/org/repo/actions/runs/703/jobs": httpx.Response(
+            200,
+            json={"jobs": [{"id": 20, "name": "ui", "conclusion": "failure", "workflow_name": "CI"}]},
+        ),
+        "/repos/org/repo/actions/runs/703/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 7031, "name": "failure-recordings-ui-0", "expired": False},
+                    {"id": 7032, "name": "pit-crew-replay-ui-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/7031/zip": httpx.Response(200, content=ui_browser_zip),
+        "/repos/org/repo/actions/artifacts/7032/zip": httpx.Response(200, content=ui_terminal_zip),
+        # Run 704: Failed job display name `Unit test` matched via expected_checks / check_aliases; `Lint` excluded.
+        "/repos/org/repo/actions/runs/704/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 41, "name": "Unit test", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 42, "name": "Lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_github_headers(request)
+        if request.url.path.startswith("/repos/org/repo/actions/jobs/") and request.url.path.endswith("/logs"):
+            jid = request.url.path.split("/")[-2]
+            fetched_logs.append(jid)
+            return httpx.Response(200, content=f"log-{jid}\n".encode())
+        return routes.get(request.url.path, httpx.Response(404))
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        # Passing exact `CI/lint` must not hide failing matrix leg `test (20)` for `CI/test`.
+        assert client.get_run_failure_output("org/repo", "701", expected_checks=("CI/test", "CI/lint")) == test20_zip
+        # Specific matrix leg that did not fail still fails closed.
+        with pytest.raises(FileNotFoundError, match="did not fail"):
+            client.get_run_failure_output("org/repo", "701", expected_checks=("CI/test (22)", "CI/lint"))
+
+        # Unrelated `pit-crew-replay-lint-0` must not hide `failure-recordings-ui-0` for `CI/ui`.
+        assert client.get_run_failure_output("org/repo", "702", expected_checks=("CI/ui",)) == ui_browser_zip
+        # When both exist for the resolved job, primary `pit-crew-replay-*` wins.
+        assert client.get_run_failure_output("org/repo", "703", expected_checks=("CI/ui",)) == ui_terminal_zip
+
+        # get_failed_job_logs resolves expected_checks/check_aliases while still excluding unrelated failed jobs.
+        logs = client.get_failed_job_logs(
+            "org/repo",
+            "704",
+            check="CI/unit-test",
+            expected_checks=("CI/unit-test", "CI/Unit test"),
+        )
+        assert b"=== Unit test ===" in logs
+        assert b"log-41" in logs
+        assert b"Lint" not in logs
+        assert fetched_logs == ["41"]

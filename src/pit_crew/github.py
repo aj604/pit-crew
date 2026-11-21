@@ -569,13 +569,13 @@ class HttpxGitHubClient:
             f"/repos/{repo_path}/actions/runs/{normalized_run_id}/artifacts",
             params={"per_page": _ARTIFACTS_PER_PAGE},
         )
-        candidates = _collect_replay_artifacts(artifacts_data)
-        if not candidates:
+        primary, fallback = _collect_replay_artifacts(artifacts_data)
+        if not primary and not fallback:
             msg = f"No replay recording artifact found for {repo} run {run_id}."
             raise FileNotFoundError(msg)
 
         if not targets:
-            artifact_id = _select_unambiguous_artifact_id(candidates, repo=repo, run_id=run_id)
+            artifact_id = _select_unambiguous_artifact_id(primary or fallback, repo=repo, run_id=run_id)
             return self.download_artifact(repo, artifact_id)
 
         jobs = self.list_run_jobs(repo, normalized_run_id)
@@ -587,7 +587,8 @@ class HttpxGitHubClient:
         return self._download_matching_replay_artifact(
             repo=repo,
             run_id=run_id,
-            candidates=candidates,
+            primary=primary,
+            fallback=fallback,
             resolved_jobs=failed_resolved,
             targets=targets,
             check_aliases=check_aliases,
@@ -598,21 +599,61 @@ class HttpxGitHubClient:
         *,
         repo: str,
         run_id: str,
-        candidates: list[tuple[int, str]],
+        primary: list[tuple[int, str]],
+        fallback: list[tuple[int, str]],
         resolved_jobs: list[RunJob],
         targets: list[str],
         check_aliases: Sequence[str],
     ) -> bytes:
-        matched = _filter_artifacts_for_jobs(candidates, resolved_jobs, targets, check_aliases)
-        if not matched:
+        matched_primary = _filter_artifacts_for_jobs(primary, resolved_jobs, targets, check_aliases)
+        matched_fallback = _filter_artifacts_for_jobs(fallback, resolved_jobs, targets, check_aliases)
+        if not matched_primary and not matched_fallback:
             msg = f"No replay recording artifact matching {', '.join(targets)!r} found for {repo} run {run_id}."
             raise FileNotFoundError(msg)
 
+        if matched_primary:
+            payload = self._resolve_artifact_pool(
+                repo=repo,
+                run_id=run_id,
+                matched=matched_primary,
+                resolved_jobs=resolved_jobs,
+                targets=targets,
+                check_aliases=check_aliases,
+                allow_mismatch_fallback=bool(matched_fallback),
+            )
+            if payload is not None:
+                return payload
+
+        payload = self._resolve_artifact_pool(
+            repo=repo,
+            run_id=run_id,
+            matched=matched_fallback,
+            resolved_jobs=resolved_jobs,
+            targets=targets,
+            check_aliases=check_aliases,
+            allow_mismatch_fallback=False,
+        )
+        assert payload is not None  # noqa: S101  allow_mismatch_fallback=False always returns or raises
+        return payload
+
+    def _resolve_artifact_pool(  # noqa: PLR0913
+        self,
+        *,
+        repo: str,
+        run_id: str,
+        matched: list[tuple[int, str]],
+        resolved_jobs: list[RunJob],
+        targets: list[str],
+        check_aliases: Sequence[str],
+        allow_mismatch_fallback: bool,
+    ) -> bytes | None:
         # Deduplicate repeated uploads of the exact same artifact name by keeping the newest ID.
         by_name = {name: artifact_id for artifact_id, name in matched}
         if len(by_name) == 1:
             payload = self.download_artifact(repo, next(iter(by_name.values())))
             if not _zip_metadata_matches_jobs(payload, resolved_jobs, targets, check_aliases):
+                if allow_mismatch_fallback:
+                    return None
                 msg = f"Replay recording artifact metadata did not match {', '.join(targets)!r} in {repo} run {run_id}."
                 raise FileNotFoundError(msg)
             return payload
@@ -627,32 +668,41 @@ class HttpxGitHubClient:
                 verified_payloads.append(payload)
         if len(verified_payloads) == 1:
             return verified_payloads[0]
+        if not verified_payloads and allow_mismatch_fallback:
+            return None
         msg = (
             f"Ambiguous replay recording artifacts ({', '.join(sorted(by_name))}) "
             f"for {', '.join(targets)!r} in {repo} run {run_id}."
         )
         raise FileNotFoundError(msg)
 
-    def get_failed_job_logs(
+    def get_failed_job_logs(  # noqa: PLR0913
         self,
         repo: str,
         run_id: int | str,
         *,
         check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
         max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
     ) -> bytes:
         """Download logs for failed jobs in ``run_id`` (auth-stripped redirects), capped at ``max_bytes``."""
-        failed_jobs = self._list_failed_jobs(repo, run_id)
-        if not failed_jobs:
+        jobs = self.list_run_jobs(repo, run_id)
+        if not any(job.conclusion == "failure" for job in jobs):
             return b""
-        selected = _filter_jobs_for_check(failed_jobs, check)
+        targets = _normalize_target_checks(check, expected_checks)
+        selected = (
+            _resolve_failed_jobs_for_checks(jobs, targets, check_aliases)
+            if targets
+            else [job for job in jobs if job.conclusion == "failure"]
+        )
         repo_path = _repo_path(repo)
         sections: list[bytes] = []
-        for job_id, job_name in selected:
-            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job_id}/logs"
+        for job in selected:
+            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job.id}/logs"
             raw_log = self._download_with_stripped_redirect(url, max_bytes=max_bytes, allow_not_found=True)
             if raw_log:
-                sections.append(f"=== {job_name} ===\n".encode() + raw_log)
+                sections.append(f"=== {job.name} ===\n".encode() + raw_log)
         combined = b"\n".join(sections)
         if len(combined) > max_bytes:
             return combined[-max_bytes:]
@@ -842,11 +892,13 @@ def _normalize_target_checks(check: str | None, expected_checks: Sequence[str]) 
     return []
 
 
-def _collect_replay_artifacts(artifacts_data: Mapping[str, object]) -> list[tuple[int, str]]:
-    """Return non-expired primary ``pit-crew-replay-*`` (or fallback ``failure-recordings-*``) artifacts."""
+def _collect_replay_artifacts(
+    artifacts_data: Mapping[str, object],
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Return non-expired primary (``pit-crew-replay-*``) and fallback (``failure-recordings-*``) artifacts."""
     raw_artifacts = artifacts_data.get("artifacts")
     if not isinstance(raw_artifacts, list):
-        return []
+        return [], []
     primary: list[tuple[int, str]] = []
     fallback: list[tuple[int, str]] = []
     for item in raw_artifacts:
@@ -860,7 +912,7 @@ def _collect_replay_artifacts(artifacts_data: Mapping[str, object]) -> list[tupl
             primary.append((artifact_id, name))
         elif name.startswith(_FALLBACK_RECORDING_PREFIX):
             fallback.append((artifact_id, name))
-    return primary or fallback
+    return primary, fallback
 
 
 def _select_unambiguous_artifact_id(candidates: list[tuple[int, str]], *, repo: str, run_id: str) -> int:
@@ -879,17 +931,23 @@ def _resolve_failed_jobs_for_checks(
     targets: Sequence[str],
     check_aliases: Sequence[str],
 ) -> list[RunJob]:
-    """Resolve ``targets`` (and ``check_aliases``) against ``jobs`` and return matching failed jobs.
+    """Resolve each target/alias independently against ``jobs`` and return deduplicated failed matches.
 
-    Exact matches take precedence over folded matrix-parent matches so a specific matrix leg
-    that passed is never masked by another failing leg.
+    Exact matches take precedence over folded matrix-parent matches per target so a passing
+    exact check never hides another expected check's failing matrix leg, while a specific
+    matrix leg that passed is never masked by another failing leg.
     """
     all_targets = [item.strip() for item in (*targets, *check_aliases) if item.strip()]
-    exact = [job for job in jobs if any(_job_matches_target(job, target, allow_fold=False) for target in all_targets)]
-    if exact:
-        return [job for job in exact if job.conclusion == "failure"]
-    folded = [job for job in jobs if any(_job_matches_target(job, target, allow_fold=True) for target in all_targets)]
-    return [job for job in folded if job.conclusion == "failure"]
+    seen_ids: set[int] = set()
+    failed: list[RunJob] = []
+    for target in all_targets:
+        exact = [job for job in jobs if _job_matches_target(job, target, allow_fold=False)]
+        matched = exact or [job for job in jobs if _job_matches_target(job, target, allow_fold=True)]
+        for job in matched:
+            if job.conclusion == "failure" and job.id not in seen_ids:
+                seen_ids.add(job.id)
+                failed.append(job)
+    return failed
 
 
 def _job_matches_target(job: RunJob, target: str, *, allow_fold: bool) -> bool:
@@ -908,11 +966,21 @@ def _exact_job_match(target_low: str, job_low: str, wf_low: str) -> bool:
         return True
     if wf_low and target_low == f"{wf_low}/{job_low}":
         return True
-    if "/" in target_low:
-        prefix, _, suffix = target_low.partition("/")
-        if suffix.strip() == job_low and (not wf_low or prefix.strip() == wf_low):
+    if target_low.endswith(f"/{job_low}"):
+        prefix = target_low[: -(len(job_low) + 1)].strip()
+        if prefix and prefix.count("(") == prefix.count(")") and (not wf_low or prefix == wf_low):
             return True
     return False
+
+
+def _strip_workflow_prefix(name: str) -> str:
+    stripped = name.strip()
+    match = _MATRIX_SUFFIX.search(stripped)
+    if match is None:
+        return stripped.rsplit("/", maxsplit=1)[-1].strip()
+    head = stripped[: match.start()]
+    suffix = stripped[match.start() :]
+    return f"{head.rsplit('/', maxsplit=1)[-1].strip()}{suffix}"
 
 
 def _filter_artifacts_for_jobs(
@@ -928,7 +996,7 @@ def _filter_artifacts_for_jobs(
 
     alias_slugs = set(display_slugs)
     for raw in (*targets, *check_aliases):
-        bare = raw.rsplit("/", maxsplit=1)[-1].strip()
+        bare = _strip_workflow_prefix(raw)
         slug = _slugify(bare)
         if slug:
             alias_slugs.add(slug)
@@ -1026,11 +1094,18 @@ def _require_http_url(url: str) -> None:
         raise ValueError(msg)
 
 
-def _filter_jobs_for_check(failed_jobs: list[tuple[int, str]], check: str | None) -> list[tuple[int, str]]:
-    if not check or not check.strip():
+def _filter_jobs_for_check(
+    failed_jobs: list[tuple[int, str]],
+    check: str | None,
+    *,
+    expected_checks: Sequence[str] = (),
+    check_aliases: Sequence[str] = (),
+) -> list[tuple[int, str]]:
+    targets = _normalize_target_checks(check, expected_checks)
+    if not targets:
         return failed_jobs
     run_jobs = [RunJob(id=job_id, name=name, conclusion="failure") for job_id, name in failed_jobs]
-    matched = _resolve_failed_jobs_for_checks(run_jobs, (check,), ())
+    matched = _resolve_failed_jobs_for_checks(run_jobs, targets, check_aliases)
     return [(job.id, job.name) for job in matched]
 
 

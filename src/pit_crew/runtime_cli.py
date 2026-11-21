@@ -260,15 +260,26 @@ class _LiveProofGitHubAdapter:
         msg = "Underlying GitHub client does not support download_artifact"
         raise RuntimeError(msg)
 
-    def get_failed_job_logs(
+    def get_failed_job_logs(  # noqa: PLR0913
         self,
         repo: str,
         run_id: int | str,
         *,
         check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
         max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
     ) -> bytes:
         """Forward failed job log retrieval when the underlying client implements ``RunArtifactsClient``."""
+        if isinstance(self._github, HttpxGitHubClient):
+            return self._github.get_failed_job_logs(
+                repo,
+                run_id,
+                check=check,
+                expected_checks=expected_checks,
+                check_aliases=check_aliases,
+                max_bytes=max_bytes,
+            )
         if isinstance(self._github, RunArtifactsClient):
             return self._github.get_failed_job_logs(repo, run_id, check=check, max_bytes=max_bytes)
         return self._download_failed_job_logs(_repo_api_path(repo), str(run_id))

@@ -2,21 +2,24 @@ import argparse
 import io
 import json
 import zipfile
+from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from pit_crew import runtime_cli
+from pit_crew import managed_agent, runtime_cli
 from pit_crew import workspace as host_workspace
-from pit_crew.contracts import Evidence, Verdict
-from pit_crew.dispatcher import Dispatcher
-from pit_crew.github import HttpxGitHubClient, PullRequestClient
+from pit_crew.contracts import BugCase, Candidate, Evidence, ReplayPlan, Verdict
+from pit_crew.dispatcher import Dispatcher, DispatcherConfig
+from pit_crew.github import HttpxGitHubClient, PullRequestClient, WorkflowRunResult
 from pit_crew.ledger import SqliteLedger
-from pit_crew.proof_bridge import ProofBridge, ProofHistoryClient
+from pit_crew.proof_bridge import RECORD_SCRIPT_PATH, REPLAY_RECORD_ENV, ProofBridge, ProofHistoryClient
+from pit_crew.run_tracker import RunTracker
 
 
 class _FakeDispatcher:
@@ -144,10 +147,12 @@ def test_run_cycle_builds_live_dispatcher_when_not_injected(tmp_path: Path, monk
     ws.mkdir()
 
     # Patch Dispatcher.run_cycle to verify live wiring parameters without calling Gemini.
-    seen_configs: list[tuple[int, bool, object]] = []
+    seen_configs: list[tuple[int, bool, object, bool]] = []
 
     def fake_run_cycle(self: Dispatcher, _repo: str) -> Verdict | None:
-        seen_configs.append((self.config.max_parallel_runs, self._use_host_workspace, self._proof_bridge))
+        seen_configs.append(
+            (self.config.max_parallel_runs, self._use_host_workspace, self._proof_bridge, self._record_replays)
+        )
         return None
 
     monkeypatch.setattr(Dispatcher, "run_cycle", fake_run_cycle)
@@ -174,6 +179,7 @@ def test_run_cycle_builds_live_dispatcher_when_not_injected(tmp_path: Path, monk
     assert seen_configs[0][0] == 12
     assert seen_configs[0][1] is True
     assert seen_configs[0][2] is not None
+    assert seen_configs[0][3] is True
 
 
 def test_serve_runs_without_github_token_and_wires_live_when_configured(
@@ -215,6 +221,7 @@ def test_serve_runs_without_github_token_and_wires_live_when_configured(
     app_live, _, _ = captured[0]
     assert app_live.state.dispatcher is not None
     assert app_live.state.dispatcher.config.max_parallel_runs == 8
+    assert app_live.state.dispatcher._record_replays is True  # noqa: SLF001
     assert app_live.state.webhook_secret == "whsec_123"  # noqa: S105
     assert app_live.state.api_token == "apitok_456"  # noqa: S105
     with TestClient(app_live) as client:
@@ -403,3 +410,160 @@ def test_live_proof_github_adapter_satisfies_protocols_and_fetches_artifacts_and
 
     with pytest.raises(ValueError, match="Invalid repository"):
         runtime_cli._repo_api_path("invalid-slug")  # noqa: SLF001
+
+
+class _LiveRecordingGitHub(HttpxGitHubClient):
+    def __init__(self, workflow_yaml: str, *, transport: httpx.BaseTransport) -> None:
+        super().__init__(token="ghs_tok", transport=transport)  # noqa: S106
+        self._workflow_yaml = workflow_yaml
+        self.recorded_commits: list[tuple[str, dict[str, str]]] = []
+        self.recorded_dispatches: list[str] = []
+
+    @override
+    def create_branch(self, repo: str, branch: str, base_sha: str) -> str:
+        _ = (repo, branch)
+        return base_sha
+
+    @override
+    def delete_branch(self, repo: str, branch: str) -> None:
+        _ = (repo, branch)
+
+    @override
+    def commit_files(
+        self,
+        repo: str,
+        branch: str,
+        base_sha: str,
+        files: Mapping[str, str | bytes],
+        message: str,
+    ) -> str:
+        _ = (repo, base_sha, message)
+        text_files = {k: v if isinstance(v, str) else v.decode("utf-8", errors="replace") for k, v in files.items()}
+        self.recorded_commits.append((branch, text_files))
+        return f"sha-{len(self.recorded_commits)}"
+
+    @override
+    def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
+        _ = (repo, workflow)
+        self.recorded_dispatches.append(ref)
+        return len(self.recorded_dispatches)
+
+    @override
+    def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
+        return WorkflowRunResult(
+            run_id=run_id,
+            status="completed",
+            conclusion="failure",
+            duration_seconds=10.0,
+            html_url=f"https://github.com/{repo}/actions/runs/{run_id}",
+            head_sha="sha",
+            head_branch="replay",
+        )
+
+    @override
+    def get_file_content(self, repo: str, path: str, ref: str) -> str | None:
+        _ = (repo, ref)
+        return self._workflow_yaml if path == ".github/workflows/ci.yml" else None
+
+
+def _make_live_replay_transport(seen_log_job_ids: list[str]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in {"/repos/org/fork/actions/runs/1/artifacts", "/repos/org/fork/actions/runs/2/artifacts"}:
+            return httpx.Response(200, json={"artifacts": []})
+        if path in {"/repos/org/fork/actions/runs/1/jobs", "/repos/org/fork/actions/runs/2/jobs"}:
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"id": 501, "name": "Unit test", "conclusion": "failure", "workflow_name": "CI"},
+                        {"id": 502, "name": "Lint", "conclusion": "failure", "workflow_name": "CI"},
+                    ]
+                },
+            )
+        if path.startswith("/repos/org/fork/actions/jobs/") and path.endswith("/logs"):
+            seen_log_job_ids.append(path.split("/")[-2])
+            return httpx.Response(200, content=b"AssertionError: expected 2 got 1\n")
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+def test_build_live_dispatcher_records_replays_and_forwards_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_yaml = (
+        "name: CI\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  unit-test:\n"
+        "    name: Unit test\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: pytest\n"
+    )
+    seen_log_job_ids: list[str] = []
+
+    def fake_ask(
+        _model: str,
+        _parts: Sequence[tuple[str, str | bytes]],
+        _schema: Mapping[str, object],
+    ) -> str:
+        return json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError: expected 2 got 1",
+                "candidate_failure": "AssertionError: expected 2 got 1",
+                "reason": "Identical unit-test assertion failure.",
+                "visual_evidence_seen": False,
+                "visual_summary": "",
+            }
+        )
+
+    monkeypatch.setattr(managed_agent, "ask_multimodal", fake_ask)
+    ledger = SqliteLedger(tmp_path / "live_rec.db")
+    with (
+        _LiveRecordingGitHub(workflow_yaml, transport=_make_live_replay_transport(seen_log_job_ids)) as gh,
+        ExitStack() as stack,
+    ):
+        dispatcher = runtime_cli._build_live_dispatcher(  # noqa: SLF001
+            ledger,
+            RunTracker(),
+            DispatcherConfig(timing_pairs=0, max_parallel_runs=2),
+            github=gh,
+            stack=stack,
+        )
+        cand = Candidate(
+            id="cand-live",
+            hypothesis_id="h1",
+            branch="pc/live",
+            summary="cache",
+            repo="org/fork",
+            base_sha="base-sha",
+            head_sha="head-sha",
+            files={".github/workflows/ci.yml": workflow_yaml.replace("pytest", "pytest -q")},
+        )
+        plan = ReplayPlan(
+            candidate_id=cand.id,
+            cases=(
+                BugCase(
+                    kind="commit",
+                    commit_sha="deadbeef",
+                    # Job ID listed before display name to exercise alias-aware log collection!
+                    expected_checks=("CI/unit-test", "CI/Unit test"),
+                ),
+            ),
+        )
+        ev = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+        recorded_commits = list(gh.recorded_commits)
+
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert len(recorded_commits) == 2
+    for branch, files in recorded_commits:
+        assert branch.startswith("pc/replay-")
+        assert RECORD_SCRIPT_PATH in files
+        assert REPLAY_RECORD_ENV in files[".github/workflows/ci.yml"]
+    # Only the resolved failed job 501 ("Unit test") had its logs downloaded; unrelated 502 ("Lint") was skipped.
+    assert seen_log_job_ids == ["501", "501"]

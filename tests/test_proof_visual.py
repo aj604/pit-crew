@@ -84,6 +84,37 @@ def test_record_keeps_the_checks_exit_code_and_output(tmp_path: Path) -> None:
     assert b"expected 3, got 2" in echo.getvalue()  # still streams to the job log
 
 
+def test_record_scrubs_chunk_split_and_late_add_mask_secrets_from_cast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cast = tmp_path / "secret.cast"
+    echo = io.BytesIO()
+    monkeypatch.setenv("CUSTOM_API_TOKEN", "env-tok-secret-999")
+    monkeypatch.setenv("ALL_SECRETS_JSON", json.dumps({"nested": "json-secret-888"}))
+    monkeypatch.setenv(record.SECRET_ENV_VARS_KEY, "ALL_SECRETS_JSON")
+    script = (
+        "import sys, time\n"
+        "sys.stdout.write('before=late-secret-777 split=env-tok-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-999 json=json-secret-888\\n'); sys.stdout.flush()\n"
+        "sys.stdout.write('::add-mask::late-sec'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('ret-777\\n'); sys.stdout.flush()\n"
+        "raise SystemExit(1)\n"
+    )
+    assert record.record([sys.executable, "-c", script], cast, echo) == 1
+    _, *events = [json.loads(line) for line in cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    for secret in ("env-tok-secret-999", "json-secret-888", "late-secret-777"):
+        assert secret not in recorded
+    assert "before=***" in recorded
+    assert "split=***" in recorded
+    assert "json=***" in recorded
+    assert "::add-mask::***" in recorded
+    # Raw output still echoed to stdout for GitHub Actions runner processing.
+    assert b"::add-mask::late-secret-777" in echo.getvalue()
+
+
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
     script = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
     assert record.record([sys.executable, "-c", script], tmp_path / "r.cast", io.BytesIO()) == 128 + 15

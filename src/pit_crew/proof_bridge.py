@@ -307,7 +307,7 @@ def _verify_replay_run_pair(
             github,
             repo,
             run_id,
-            check=pair.check,
+            check=pair.check if expected else "",
             expected_checks=expected,
             check_aliases=pair.check_aliases,
         )
@@ -553,12 +553,14 @@ class ProofBridge:
         result = self._run_lane("proof", prompt, **kwargs)
         return context, result
 
-    def collect_run_failure_bundle(
+    def collect_run_failure_bundle(  # noqa: PLR0913
         self,
         repo: str,
         run_id: str,
         *,
         check: str = "",
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
         run_url: str = "",
     ) -> ArtifactBundle:
         """Collect a typed, shard-aware ``ArtifactBundle`` for workflow run ``run_id``.
@@ -570,16 +572,34 @@ class ProofBridge:
         """
         resolved_url = run_url or _default_run_url(repo, run_id)
         if not isinstance(self._github, RunArtifactsClient):
-            raw = self._github.get_run_failure_output(repo, run_id)
+            raw = _load_failure_output(
+                self._github,
+                repo,
+                run_id,
+                check=check,
+                expected_checks=tuple(expected_checks),
+                check_aliases=tuple(check_aliases),
+            )
             return bundle_from_raw(raw, run_id=str(run_id), run_url=run_url, fallback_mime="video/mp4")
 
         parts: list[MediaPart] = []
         artifacts = self._github.list_run_artifacts(repo, run_id)
-        ranked = _rank_active_artifacts(artifacts, check=check)[:MAX_SHARD_ARTIFACTS]
+        ranked = _rank_active_artifacts(
+            artifacts,
+            check=check,
+            check_aliases=tuple(dict.fromkeys((*expected_checks, *check_aliases))),
+        )[:MAX_SHARD_ARTIFACTS]
         for artifact in ranked:
             parts.extend(self._extract_run_artifact(repo, artifact, fallback_url=resolved_url))
 
-        log_bytes = self._github.get_failed_job_logs(repo, run_id, check=check or None)
+        log_bytes = _load_failed_job_logs(
+            self._github,
+            repo,
+            run_id,
+            check=check or None,
+            expected_checks=tuple(expected_checks),
+            check_aliases=tuple(check_aliases),
+        )
         if log_bytes:
             parts.append(
                 MediaPart(
@@ -715,6 +735,7 @@ class ProofBridge:
         if not (base_replay.baseline_failed and base_replay.candidate_failed):
             return base_replay, []
 
+        effective_expected = _effective_expected_checks(pair)
         expected_with_aliases = tuple(dict.fromkeys((*pair.expected_checks, *pair.check_aliases)))
         if expected_with_aliases:
             base_failed = pair.baseline_failed_checks or self._fetch_failed_checks(
@@ -726,17 +747,22 @@ class ProofBridge:
                 note = f"not verified: expected check(s) ({expected_list}) did not fail on baseline ({actual_list})"
                 return replace(base_replay, note=note), []
 
+        filter_check = pair.check if effective_expected else ""
         try:
             baseline_bundle = self.collect_run_failure_bundle(
                 repo,
                 pair.baseline_run_id,
-                check=pair.check,
+                check=filter_check,
+                expected_checks=effective_expected,
+                check_aliases=pair.check_aliases,
                 run_url=pair.baseline_run_url,
             )
             candidate_bundle = self.collect_run_failure_bundle(
                 repo,
                 pair.candidate_run_id,
-                check=pair.check,
+                check=filter_check,
+                expected_checks=effective_expected,
+                check_aliases=pair.check_aliases,
                 run_url=pair.candidate_run_url,
             )
             failed_checks = pair.candidate_failed_checks or self._fetch_failed_checks(
@@ -879,9 +905,38 @@ class ProofBridge:
         return touched_checks(changes)
 
 
-def _rank_active_artifacts(artifacts: Sequence[RunArtifact], *, check: str = "") -> list[RunArtifact]:
+def _load_failed_job_logs(  # noqa: PLR0913
+    github: RunArtifactsClient,
+    repo: str,
+    run_id: str,
+    *,
+    check: str | None,
+    expected_checks: tuple[str, ...],
+    check_aliases: tuple[str, ...],
+) -> bytes:
+    loader: Any = github.get_failed_job_logs
+    kwargs: dict[str, Any] = {"check": check}
+    if _accepts_kwarg(loader, "expected_checks"):
+        kwargs["expected_checks"] = expected_checks
+    if _accepts_kwarg(loader, "check_aliases"):
+        kwargs["check_aliases"] = check_aliases
+    return bytes(loader(repo, run_id, **kwargs))
+
+
+def _rank_active_artifacts(
+    artifacts: Sequence[RunArtifact],
+    *,
+    check: str = "",
+    check_aliases: Sequence[str] = (),
+) -> list[RunArtifact]:
     active = [a for a in artifacts if not a.expired and 0 < a.size_in_bytes <= MAX_ZIP_DOWNLOAD_BYTES]
-    return sorted(active, key=lambda artifact: (*score_artifact_name(artifact.name, check), artifact.id))
+    labels = tuple(dict.fromkeys(label for label in (check, *check_aliases) if label and label.strip()))
+    if not labels:
+        return sorted(active, key=lambda artifact: (*score_artifact_name(artifact.name, ""), artifact.id))
+    return sorted(
+        active,
+        key=lambda artifact: (min(score_artifact_name(artifact.name, label) for label in labels), artifact.id),
+    )
 
 
 def _extract_preview_pair(
