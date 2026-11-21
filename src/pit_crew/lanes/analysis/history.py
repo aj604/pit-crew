@@ -17,7 +17,7 @@ import urllib.request
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from http.client import HTTPMessage
 from typing import IO, Any, override
 from urllib.parse import quote, urlencode
@@ -107,23 +107,38 @@ class WorkflowRun:
         return _span(self.run_started_at, max(ends)) if ends else 0.0
 
 
-def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query parameters
+def _run_timestamp(run: dict[str, Any]) -> float:
+    raw = run.get("run_started_at") or run.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        return float("-inf")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return float("-inf")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def newest_first_key(run: dict[str, Any]) -> tuple[float, int]:
+    """Sort key ordering runs newest first, breaking timestamp ties by numeric run id."""
+    raw_id = run.get("id")
+    return _run_timestamp(run), raw_id if isinstance(raw_id, int) else 0
+
+
+def _fetch_run_list(  # noqa: PLR0913  mirrors the API's query parameters
+    get: Getter,
     repo: str,
     workflow: str,
     *,
-    runs: int = DEFAULT_RUNS,
+    runs: int,
     branch: str | None = None,
     event: str | None = None,
-    token: str | None = None,
-    get: Getter | None = None,
 ) -> list[dict[str, Any]]:
-    """The most recent completed runs of one workflow, newest first, each with its jobs and steps.
-
-    `workflow` is the file name under .github/workflows (e.g. "ci.yml") or the numeric id.
-    Jobs from every attempt are included, so re-runs (a flake signal) stay visible.
-    """
-    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
-    query = {"status": "completed", "per_page": min(runs, 100)}
+    """List up to `runs` completed workflow runs (metadata only, no jobs)."""
+    if runs <= 0:
+        return []
+    query: dict[str, str | int] = {"status": "completed", "per_page": min(runs, 100)}
     if branch:
         query["branch"] = branch
     if event:
@@ -134,11 +149,67 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     while url and len(found) < runs:
         body, url = get(url)
         found.extend(body["workflow_runs"])
+    return found[:runs]
 
-    selected = found[:runs]
+
+def _fetch_merged_runs(  # noqa: PLR0913  mirrors the API's query parameters
+    get: Getter,
+    repo: str,
+    workflow: str,
+    *,
+    runs: int,
+    branch: str | None,
+    events: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """List up to `runs` metadata entries per event, deduplicate by id, sort newest first, and take top `runs`."""
+    collected: dict[object, dict[str, Any]] = {}
+    for idx_ev, ev in enumerate(dict.fromkeys(events)):
+        for idx_run, run in enumerate(_fetch_run_list(get, repo, workflow, runs=runs, branch=branch, event=ev)):
+            key: object = ("id", run["id"]) if run.get("id") is not None else ("pos", idx_ev, idx_run)
+            collected.setdefault(key, run)
+    return sorted(collected.values(), key=newest_first_key, reverse=True)[:runs]
+
+
+def _attach_jobs(get: Getter, repo: str, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not selected:
+        return []
     with ThreadPoolExecutor(max_workers=_JOB_FETCHERS) as pool:
         jobs = list(pool.map(lambda run: _fetch_jobs(get, repo, run["id"]), selected))
     return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
+
+
+def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query parameters
+    repo: str,
+    workflow: str,
+    *,
+    runs: int = DEFAULT_RUNS,
+    branch: str | None = None,
+    event: str | None = None,
+    events: Iterable[str] | None = None,
+    token: str | None = None,
+    get: Getter | None = None,
+) -> list[dict[str, Any]]:
+    """The most recent completed runs of one workflow, newest first, each with its jobs and steps.
+
+    `workflow` is the file name under .github/workflows (e.g. "ci.yml") or the numeric id.
+    When `events` is given, metadata is listed for each event up to `runs`, merged, deduplicated by id,
+    and sorted newest first before jobs are fetched for only the top `runs`.
+    Jobs from every attempt are included, so re-runs (a flake signal) stay visible.
+    """
+    if event is not None and events is not None:
+        msg = "pass either event or events, not both"
+        raise ValueError(msg)
+    if runs <= 0:
+        return []
+    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
+    if events is not None:
+        event_list = tuple(events)
+        if not event_list:
+            return []
+        selected = _fetch_merged_runs(get, repo, workflow, runs=runs, branch=branch, events=event_list)
+    else:
+        selected = _fetch_run_list(get, repo, workflow, runs=runs, branch=branch, event=event)
+    return _attach_jobs(get, repo, selected)
 
 
 def workflow_blob_sha(text: str) -> str:

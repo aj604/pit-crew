@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="200" viewBox="0 0 360 200" role="img" aria-label="Candidate failure screenshot: cart total rounding">
+  <rect width="360" height="200" rx="8" fill="#15151E" stroke="#2D2D44"/>
+  <rect x="0" y="0" width="360" height="28" rx="8" fill="#1C1C28"/>
+  <circle cx="16" cy="14" r="4" fill="#FF1E00"/>
+  <circle cx="30" cy="14" r="4" fill="#FFD000"/>
+  <circle cx="44" cy="14" r="4" fill="#00E676"/>
+  <text x="64" y="18" fill="#B84DFF" font-family="monospace" font-size="11">CANDIDATE · /checkout/summary</text>
+  <text x="18" y="56" fill="#F4F4F7" font-family="sans-serif" font-size="14" font-weight="bold">Order Summary</text>
+  <rect x="18" y="68" width="324" height="58" rx="6" fill="#0B0B11" stroke="#FF1E00"/>
+  <text x="30" y="90" fill="#C6C6D6" font-family="monospace" font-size="12">Subtotal (3 items): $39.99</text>
+  <text x="30" y="112" fill="#FF1E00" font-family="monospace" font-size="13" font-weight="bold">Total Rendered: $42.01 (expected $42.00)</text>
+  <rect x="18" y="140" width="324" height="44" rx="6" fill="#1C1C28" stroke="#00E676"/>
+  <text x="28" y="159" fill="#FF1E00" font-family="monospace" font-size="11">AssertionError: [data-testid="cart-total"]</text>
+  <text x="28" y="175" fill="#00E676" font-family="monospace" font-size="11">MATCH · Same DOM failure state verified</text>
+</svg>

@@ -154,7 +154,11 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
     the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
     profiled = _profile_workflow(repo, workflow, runs, branch, workflow_content=workflow_content, ref=ref)
-    return {**profiled.ci.to_dict(), "runs_excluded_revision": profiled.excluded}
+    return {
+        **profiled.ci.to_dict(),
+        "runs_excluded_revision": profiled.excluded,
+        "runs_excluded_event": profiled.excluded_event,
+    }
 
 
 @dataclass(frozen=True)
@@ -163,6 +167,30 @@ class _Profiled:
     spec: Workflow
     excluded: int  # runs dropped because their workflow file differs from the checkout's
     matched: int  # runs whose workflow file is byte-identical to the checkout's
+    excluded_event: int  # runs dropped because their event does not execute the workflow at head_sha
+    fetched: int  # runs the history returned before any exclusion
+
+
+# Events whose run executes the workflow file as committed at head_sha, in the order they are fetched.
+_HEAD_SHA_EVENT_ORDER = ("push", "merge_group", "workflow_dispatch", "schedule")
+_HEAD_SHA_EVENTS = frozenset(_HEAD_SHA_EVENT_ORDER)
+
+
+def _fetch_trusted_history(repo: str, workflow: str, runs: int, branch: str | None) -> list[dict[str, Any]]:
+    """The newest `runs` runs among the trusted events, newest first.
+
+    Lists up to `runs` metadata entries per trusted event, merges and de-duplicates them by id, sorts by recency,
+    and fetches jobs only for the global top `runs`, so pull-request runs never use up the window and older
+    runs of an earlier event never displace newer runs of another trusted event.
+    """
+    if runs <= 0:
+        return []
+    fetched = history.fetch_history(repo, workflow, runs=runs, branch=branch, events=_HEAD_SHA_EVENT_ORDER)
+    deduped: dict[object, dict[str, Any]] = {}
+    for idx, run in enumerate(fetched):
+        key: object = ("id", run["id"]) if run.get("id") is not None else ("pos", idx)
+        deduped.setdefault(key, run)
+    return sorted(deduped.values(), key=history.newest_first_key, reverse=True)[:runs]
 
 
 def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
@@ -177,7 +205,10 @@ def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
     """Validate the arguments, read the workflow file and its run history, and profile it.
 
     Only runs whose workflow file is byte-identical to the checkout's are profiled: a run of another
-    revision may have a same-named step that runs a different command.
+    revision may have a same-named step that runs a different command. Only events that execute the
+    workflow at head_sha count: pull_request runs the merge commit's file and pull_request_target the
+    base branch's, so the blob at head_sha says nothing about what ran. The history is fetched per trusted
+    event, so pull-request runs cannot fill the window; the event filter below stays as defence in depth.
     """
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
@@ -186,20 +217,38 @@ def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
         workflow_path(workflow)  # reject a bad workflow name before any network call
     else:
         _validate_workflow_name(workflow)
-    raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
+    fetched = _fetch_trusted_history(repo, workflow, runs, branch)
+    raw = [r for r in fetched if r.get("event") in _HEAD_SHA_EVENTS]
     text = _load_workflow_text(repo, workflow, branch, raw, workflow_content=workflow_content, ref=ref)
     spec = parse_workflow(text)
     local = history.workflow_blob_sha(text)
-    remote = history.fetch_workflow_blob_shas(
-        repo, f".github/workflows/{workflow}", {str(r.get("head_sha", "")) for r in raw}
+    remote = (
+        history.fetch_workflow_blob_shas(
+            repo, f".github/workflows/{workflow}", {str(r.get("head_sha", "")) for r in raw}
+        )
+        if raw
+        else {}
     )
     same = [r for r in raw if remote.get(str(r.get("head_sha", ""))) == local]
-    return _Profiled(profile(spec, history.parse_runs(same)), spec, len(raw) - len(same), len(same))
+    return _Profiled(
+        profile(spec, history.parse_runs(same)),
+        spec,
+        len(raw) - len(same),
+        len(same),
+        len(fetched) - len(raw),
+        len(fetched),
+    )
 
 
 _NO_MATCHING_REVISION = (
     "No run in the history used this exact workflow file, so nothing can be measured against the checkout. "
     "Analyse the branch the history comes from: check that branch out and pass it as `branch`."
+)
+
+_NO_TRUSTED_EVENT_RUNS = (
+    "No push, workflow_dispatch, schedule or merge_group runs were found. Pull-request and other runs "
+    "cannot be matched to the checkout's workflow file; profile the default branch (branch=<default>) "
+    "or push/workflow_dispatch runs."
 )
 
 
@@ -250,9 +299,10 @@ def find_bottlenecks(
     path = f".github/workflows/{workflow}"
     seen = recorded_keys(ledger, repo)
     no_match = profiled.matched == 0 and profiled.excluded > 0
+    only_other_events = profiled.excluded_event == profiled.fetched  # includes nothing fetched at all
     found = (
         []
-        if no_match
+        if no_match or only_other_events
         else keep_worthwhile(f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen)
     )
     summary = ci.to_dict()
@@ -272,10 +322,17 @@ def find_bottlenecks(
                 )
             },
             "runs_excluded_revision": profiled.excluded,
+            "runs_excluded_event": profiled.excluded_event,
         },
         "findings": [f.to_dict() for f in found],
-        "uncovered": [_NO_MATCHING_REVISION] if no_match else _uncovered(ci),
+        "uncovered": _uncovered_notes(ci, no_match=no_match, only_other_events=only_other_events),
     }
+
+
+def _uncovered_notes(ci: CIProfile, *, no_match: bool, only_other_events: bool) -> list[str]:
+    if only_other_events:
+        return [_NO_TRUSTED_EVENT_RUNS]
+    return [_NO_MATCHING_REVISION] if no_match else _uncovered(ci)
 
 
 class InvalidRecordError(ValueError):

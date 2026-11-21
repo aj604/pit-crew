@@ -620,7 +620,7 @@ def test_profile_ci_resolves_deleted_branch_workflow_from_run_commit(
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
     yaml_text = (FIXTURES / "fastapi" / "test.yml").read_text()
     raw = fastapi_raw()
-    expected_sha = next(r["head_sha"] for r in raw if r.get("head_sha"))
+    expected_sha = max((r for r in raw if r.get("event") == "push"), key=lambda r: r["run_started_at"])["head_sha"]
     refs_tried: list[str | None] = []
 
     def fake_fetch_workflow(_repo: str, _workflow: str, *, ref: str | None = None) -> str:
@@ -660,7 +660,9 @@ def test_profile_ci_errors_explicitly_when_deleted_branch_commit_is_also_404(
 ) -> None:
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
     monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(404)))
-    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+    monkeypatch.setattr(
+        history, "fetch_history", lambda *_args, **_kwargs: [{"id": 1, "event": "push", "head_sha": "deadbeef"}]
+    )
 
     build_request("analysis", "")
     with pytest.raises(WorkflowNotFoundError, match="deadbeef"):
@@ -692,7 +694,7 @@ def test_profile_ci_propagates_non_fallback_http_errors(
     monkeypatch.setattr(
         history,
         "fetch_history",
-        (lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+        (lambda *_args, **_kwargs: [{"id": 1, "event": "push", "head_sha": "deadbeef"}])
         if second_code is not None
         else (lambda *_args, **_kwargs: []),
     )

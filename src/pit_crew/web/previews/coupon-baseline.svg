@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="200" viewBox="0 0 360 200" role="img" aria-label="Baseline video keyframe: coupon double-apply">
+  <rect width="360" height="200" rx="8" fill="#15151E" stroke="#2D2D44"/>
+  <rect x="0" y="0" width="360" height="28" rx="8" fill="#1C1C28"/>
+  <text x="16" y="18" fill="#00F0FF" font-family="monospace" font-size="11">BASELINE VIDEO · 00:04.2 · /checkout/promo</text>
+  <text x="18" y="56" fill="#F4F4F7" font-family="sans-serif" font-size="14" font-weight="bold">Applied Promo Codes</text>
+  <rect x="18" y="68" width="110" height="28" rx="4" fill="#242435" stroke="#FF1E00"/>
+  <text x="32" y="86" fill="#FFD000" font-family="monospace" font-size="12">SAVE20 (-20%)</text>
+  <rect x="138" y="68" width="110" height="28" rx="4" fill="#242435" stroke="#FF1E00"/>
+  <text x="152" y="86" fill="#FFD000" font-family="monospace" font-size="12">SAVE20 (-20%)</text>
+  <rect x="18" y="114" width="324" height="68" rx="6" fill="#0B0B11" stroke="#434361"/>
+  <text x="28" y="136" fill="#FF1E00" font-family="monospace" font-size="11">Playwright: locator('.promo-chip').count()</text>
+  <text x="28" y="156" fill="#C6C6D6" font-family="monospace" font-size="11">Expected: 1 · Received: 2 (duplicate badge)</text>
+  <text x="28" y="172" fill="#8E8EA6" font-family="monospace" font-size="10">test-results/promo-double-apply/video.webm</text>
+</svg>
