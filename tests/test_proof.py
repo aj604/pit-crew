@@ -259,6 +259,11 @@ def test_shell_heredocs_are_consumed_in_redirection_order() -> None:
     assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(2, "true -> false"), (6, "> -> <=")]
 
 
+def test_shell_heredocs_inside_command_substitution_have_their_own_queue() -> None:
+    source = "echo <<'OUTER' $(cat <<'INNER'\n(( a < b ))\nINNER\n(( x > y ))\n)\n(( a > b ))\nOUTER\n(( x < y ))\n"
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(4, "> -> <="), (8, "< -> >=")]
+
+
 def test_booleans_flip_only_where_the_language_spells_them_that_way() -> None:
     assert mutants("a.ts", "const t = True;\n") == []
     assert mutants("a.py", "x = true\n") == []

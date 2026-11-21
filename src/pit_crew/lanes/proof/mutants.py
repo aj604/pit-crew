@@ -52,6 +52,8 @@ _HEREDOC_RE = re.compile(
 )
 _DELIMITER_QUOTES_RE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*"|\\.""")
 
+type _HereDoc = tuple[str, bool, bool]
+
 
 @dataclass(frozen=True)
 class Mutant:
@@ -154,23 +156,32 @@ def _heredoc_end(source: str, start: int, delimiter: str, *, strip_tabs: bool) -
     return start
 
 
+def _heredoc_scope(pending: dict[int, list[_HereDoc]], depth: int, marker: str) -> None:
+    if marker == "$(":
+        pending[depth] = []
+    elif marker == ")":
+        pending.pop(depth + 1, None)
+
+
 def _mask_shell_heredocs(source: str) -> str:
     """Blank quoted here-documents, consuming all here-documents in redirection order."""
     out = list(source)
     context = [False]
-    pending: list[tuple[str, bool, bool]] = []
+    pending: dict[int, list[_HereDoc]] = {len(context): []}
     i = 0
     while i < len(source):
+        documents = pending[next(reversed(pending))]
         if source[i] == "\n":
             i += 1
-            for delimiter, strip_tabs, quoted in pending:
+            for delimiter, strip_tabs, quoted in documents:
                 end = _heredoc_end(source, i, delimiter, strip_tabs=strip_tabs)
                 if quoted:
                     _blank(out, i, end)
                 i = end
-            pending.clear()
+            documents.clear()
         elif paren := _SHELL_PARENS_RE.match(source, i):
             _shell_paren(context, paren.group())
+            _heredoc_scope(pending, len(context), paren.group())
             i = paren.end()
         elif source.startswith("\\\n", i):
             i += 2
@@ -179,7 +190,7 @@ def _mask_shell_heredocs(source: str) -> str:
         elif not context[-1] and (opener := _HEREDOC_RE.match(source, i)):
             word = opener["word"]
             delimiter = _DELIMITER_QUOTES_RE.sub(_unquote_delimiter, word)
-            pending.append((delimiter, bool(opener["tabs"]), delimiter != word))
+            documents.append((delimiter, bool(opener["tabs"]), delimiter != word))
             i = opener.end()
         else:
             i = _literal_end(source, i, hash_comments=True) or i + 1
