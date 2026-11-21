@@ -13,9 +13,160 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "deptry>=0.25.1",
+    "import-linter>=2.17",
+    "mypy>=2.4.1",
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.6",
+    "zizmor>=1.32.0",
 ]
 
 [tool.ruff]
+target-version = "py312"
 line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",  # conflicts with ruff format
+    "CPY001",  # repository does not require per-file copyright headers
+    "ISC001",  # conflicts with ruff format
+    "D203",    # conflicts with D211 (no blank line before class docstring)
+    "D213",    # conflicts with D212 (multi-line summary on first line)
+    "TD002",   # repo uses TODO(<lane> owner) without GitHub handles
+    "TD003",   # repo uses TODO(<lane> owner) without issue links
+    "FIX002",  # allow intentional TODO(<lane> owner) scaffolding markers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "D",        # docstrings not required in tests
+    "INP001",   # tests/ is not a package
+    "PLR2004",  # magic numbers are fine in test assertions
+    "S101",     # assert is expected in pytest
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.isort]
+known-first-party = ["pit_crew"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_equality = true
+extra_checks = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-expr",
+    "truthy-bool",
+    "possibly-undefined",
+    "explicit-override",
+]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=pit_crew",
+    "--cov-branch",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["pit_crew"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+    "\\.\\.\\.",
+]
+
+[tool.deptry.package_module_name_map]
+google-genai = "google"
+
+[tool.importlinter]
+root_package = "pit_crew"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Lanes must not import each other"
+type = "independence"
+modules = [
+    "pit_crew.lanes.analysis",
+    "pit_crew.lanes.optimizer",
+    "pit_crew.lanes.proof",
+]
+
+[[tool.importlinter.contracts]]
+name = "Contracts has no internal dependencies"
+type = "forbidden"
+source_modules = ["pit_crew.contracts"]
+forbidden_modules = [
+    "pit_crew.ledger",
+    "pit_crew.tools",
+    "pit_crew.rater",
+    "pit_crew.dispatcher",
+    "pit_crew.managed_agent",
+    "pit_crew.lanes",
+]
+
+[[tool.importlinter.contracts]]
+name = "Rater is pure and isolated"
+type = "forbidden"
+source_modules = ["pit_crew.rater"]
+forbidden_modules = [
+    "pit_crew.ledger",
+    "pit_crew.tools",
+    "pit_crew.dispatcher",
+    "pit_crew.managed_agent",
+    "pit_crew.lanes",
+    "google",
+]
+
+[[tool.importlinter.contracts]]
+name = "Lanes respect the trust boundary"
+type = "forbidden"
+source_modules = ["pit_crew.lanes"]
+forbidden_modules = [
+    "pit_crew.rater",
+    "pit_crew.dispatcher",
+    "pit_crew.managed_agent",
+    "google",
+]
+
+[[tool.importlinter.contracts]]
+name = "Only managed_agent may import google-genai"
+type = "forbidden"
+source_modules = [
+    "pit_crew.contracts",
+    "pit_crew.ledger",
+    "pit_crew.tools",
+    "pit_crew.rater",
+    "pit_crew.dispatcher",
+    "pit_crew.lanes",
+]
+forbidden_modules = ["google"]

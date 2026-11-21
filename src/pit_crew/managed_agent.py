@@ -42,14 +42,14 @@ def build_request(lane: str, task: str) -> dict[str, Any]:
     }
 
 
-def run_lane(lane: str, task: str) -> Any:
+def run_lane(lane: str, task: str) -> object:
     """Start one lane as a managed-agent interaction. Needs GEMINI_API_KEY.
 
     TODO(dispatcher owner): mount the fork as a repository source, run in the background,
     and answer `requires_action` steps with tools.call. None of this has been run against
     the live API yet.
     """
-    from google import genai
+    from google import genai  # noqa: PLC0415
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"})
     return client.interactions.create(**build_request(lane, task))

@@ -41,8 +41,13 @@ agent may call). Each has a `TODO(<lane> owner)` marking where to start.
 
 ```sh
 uv sync
-uv run pytest -q
+uv run ruff format --check
 uv run ruff check
+uv run mypy src tests
+uv run deptry src
+uv run lint-imports
+uv run zizmor .github/workflows
+uv run pytest
 ```
 
 You do not need Managed Agents access to work on a lane. Tools are ordinary Python tested

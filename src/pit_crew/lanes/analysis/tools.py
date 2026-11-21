@@ -1,13 +1,22 @@
 """Analysis lane: find where the minutes go and record hypotheses."""
 
 from collections import defaultdict
+from collections.abc import Sequence
+from typing import TypedDict
 
 from pit_crew.contracts import Hypothesis
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
 
-def slowest_jobs(job_runs: list[dict]) -> list[tuple[str, float]]:
+class JobRun(TypedDict):
+    """Timing entry for a single CI job execution."""
+
+    name: str
+    seconds: float
+
+
+def slowest_jobs(job_runs: Sequence[JobRun]) -> list[tuple[str, float]]:
     """Total seconds per job across runs, slowest first.
 
     Each item needs "name" and "seconds".
@@ -31,9 +40,7 @@ def slowest_jobs(job_runs: list[dict]) -> list[tuple[str, float]]:
         "required": ["repo", "description", "skill", "expected_savings_seconds"],
     },
 )
-def record_hypothesis(
-    ledger: Ledger, repo: str, description: str, skill: str, expected_savings_seconds: float
-) -> str:
+def record_hypothesis(ledger: Ledger, repo: str, description: str, skill: str, expected_savings_seconds: float) -> str:
     """Record one bottleneck worth fixing. Returns the hypothesis id."""
     hypothesis = Hypothesis(repo, description, skill, expected_savings_seconds)
     ledger.add(hypothesis)
