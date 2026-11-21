@@ -3,15 +3,20 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.ledger import InMemoryLedger
+from pit_crew.rater import rate
 from pit_crew.server import DEFAULT_BRAND_DIR, DEFAULT_WEB_DIR, create_app
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "src" / "pit_crew" / "web"
 APP_JS = WEB_DIR / "app.js"
+DEMO_JS = WEB_DIR / "demo_scenarios.js"
+STORE_JS = WEB_DIR / "store.js"
 NODE = shutil.which("node")
 # A `#` hex literal not preceded by a word char or `&` (so `#repo-input` ids and `&#...;` don't count as
 # id selectors), plus functional colour notations that would bypass the brand tokens.
@@ -86,6 +91,8 @@ def test_index_provides_downstream_mount_points(client: TestClient) -> None:
         ("/brand/favicon.svg", "image/svg+xml"),
         ("/web/styles.css", "text/css"),
         ("/web/app.js", "javascript"),
+        ("/web/demo_scenarios.js", "javascript"),
+        ("/web/store.js", "javascript"),
     ],
 )
 def test_static_assets_are_served(client: TestClient, path: str, media_type: str) -> None:
@@ -116,7 +123,7 @@ def test_custom_dirs_are_mounted(tmp_path: Path) -> None:
     assert client.get("/brand/tokens.css").text == ":root {}"
 
 
-@pytest.mark.parametrize("name", ["styles.css", "index.html"])
+@pytest.mark.parametrize("name", ["styles.css", "index.html", "app.js", "demo_scenarios.js", "store.js"])
 def test_shell_uses_no_ad_hoc_colors(name: str) -> None:
     source = (WEB_DIR / name).read_text()
 
@@ -209,7 +216,7 @@ def test_app_js_is_valid_module_with_header_helpers() -> None:
 
 # A minimal fake DOM: enough of `getElementById`, attributes and listeners to drive `createHeaderBar`
 # and the module's boot code under node, without jsdom.
-_NODE_DOM_SCRIPT = """
+_FAKE_DOM = """
 const fakeNode = (extra = {}) => {
   const listeners = {};
   return {
@@ -218,6 +225,7 @@ const fakeNode = (extra = {}) => {
     addEventListener(type, fn) { (listeners[type] ??= []).push(fn); },
     dispatchEvent(event) { for (const fn of listeners[event.type] ?? []) fn(event); return true; },
     replaceChildren(...kids) { this.kids = kids; },
+    append(...kids) { this.kids.push(...kids); },
     querySelectorAll(selector) { return selector === "[data-mode]" ? (this.modeButtons ?? []) : []; },
     click() { this.dispatchEvent({ type: "click" }); },
     ...extra,
@@ -230,11 +238,17 @@ const fakeDocument = (readyState) => {
     "repo-input": fakeNode(), "repo-options": fakeNode(), "base-sha-value": fakeNode(),
     "sla-median": fakeNode(), "sla-p95": fakeNode(), "sla-badge": fakeNode({ hidden: true }),
     "mode-toggle": fakeNode({ modeButtons: [live, demo] }), "run-pit-stop": fakeNode(),
+    "demo-switcher": fakeNode(),
   };
-  const doc = fakeNode({ readyState, getElementById: (id) => ids[id] ?? null, createElement: () => ({}) });
+  const doc = fakeNode({ readyState, getElementById: (id) => ids[id] ?? null, createElement: () => fakeNode() });
   return { doc, ids, live, demo };
 };
 const pressed = (d) => [d.live.attrs["aria-pressed"], d.demo.attrs["aria-pressed"]];
+"""
+
+_NODE_DOM_SCRIPT = (
+    _FAKE_DOM
+    + """
 const url = process.argv[1];
 globalThis.window = globalThis;
 
@@ -281,6 +295,7 @@ console.log(JSON.stringify({
   bootBound, met, missed, initialMode, afterLive, afterDemo, modeEvents, boundBeforeReady, boundAfterReady,
 }));
 """
+)
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -313,3 +328,322 @@ def test_header_bar_binds_dom_badge_toggle_and_run_button() -> None:
     assert out["modeEvents"] == ["live", "demo"]
     assert out["boundBeforeReady"] is False
     assert out["boundAfterReady"] is True
+
+
+def _node(script: str, *args: str) -> dict[str, Any]:
+    assert NODE is not None
+    result = subprocess.run(  # noqa: S603
+        [NODE, "--input-type=module", "-e", script, *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out: dict[str, Any] = json.loads(result.stdout)
+    return out
+
+
+_DEMO_DUMP_SCRIPT = """
+const d = await import(process.argv[1]);
+const fails = (fn) => { try { fn(); return null; } catch (error) { return error.message; } };
+console.log(JSON.stringify({
+  ids: d.DEMO_SCENARIO_IDS, stages: d.DEMO_STAGES, labels: d.DEMO_STAGE_LABELS,
+  titles: d.DEMO_SCENARIO_IDS.map((id) => d.getScenario(id).title),
+  snapshots: Object.fromEntries(d.DEMO_SCENARIO_IDS.map((id) => [id, d.DEMO_STAGES.map((_, i) =>
+    d.scenarioSnapshotAtStage(id, i))])),
+  errors: [fails(() => d.getScenario("nope")), fails(() => d.scenarioSnapshotAtStage("proven_keep", 5)),
+    fails(() => d.scenarioSnapshotAtStage("proven_keep", -1))],
+}));
+"""
+
+# scenario -> (keep, speedup, p_value, bugs_caught, median, p95, sla_met)
+DEMO_TARGETS = {
+    "unsafe_reject": (False, 1.92, 0.004, 3, 62.5, 72.4, False),
+    "noise_reject": (False, 1.03, 0.24, 4, 100.0, 114.8, False),
+    "proven_keep": (True, 1.85, 0.004, 4, 48.0, 82.0, True),
+}
+
+
+@pytest.fixture(scope="module")
+def demo_dump() -> dict[str, Any]:
+    if NODE is None:
+        pytest.skip("node is not installed")
+    return _node(_DEMO_DUMP_SCRIPT, DEMO_JS.as_uri())
+
+
+def _ledger_from_records(records: dict[str, list[dict[str, Any]]]) -> InMemoryLedger:
+    ledger = InMemoryLedger()
+    for h in records["hypotheses"]:
+        ledger.add(Hypothesis(**h))
+    for c in records["candidates"]:
+        ledger.add(Candidate(**{**c, "changed_files": tuple(c["changed_files"])}))
+    for p in records["replay_plans"]:
+        cases = tuple(BugCase(**case) for case in p["cases"])
+        ledger.add(ReplayPlan(p["candidate_id"], tuple(p["bug_shas"]), id=p["id"], cases=cases))
+    for e in records["evidence"]:
+        ledger.add(_evidence(e))
+    for v in records["verdicts"]:
+        ledger.add(Verdict(**v))
+    return ledger
+
+
+def _evidence(e: dict[str, Any]) -> Evidence:
+    tuples = ("baseline_seconds", "candidate_seconds", "run_urls", "bug_outcomes")
+    return Evidence(**{**e, **{key: tuple(e[key]) for key in tuples}})
+
+
+def test_demo_scenarios_list_stages_and_reject_unknowns(demo_dump: dict[str, Any]) -> None:
+    assert demo_dump["ids"] == ["unsafe_reject", "noise_reject", "proven_keep"]
+    assert demo_dump["stages"] == ["analysis", "optimizer", "proof", "ci", "rater"]
+    assert demo_dump["labels"] == ["Analysis", "Optimizer", "Proof", "CI", "Rater"]
+    assert demo_dump["titles"] == ["Fast but Unsafe", "Within Noise", "Proven Speedup"]
+    assert demo_dump["errors"] == [
+        "Unknown demo scenario: nope",
+        "Demo stage index out of range: 5",
+        "Demo stage index out of range: -1",
+    ]
+
+
+@pytest.mark.parametrize("scenario", list(DEMO_TARGETS))
+def test_demo_scenario_hits_targets_and_matches_rater(demo_dump: dict[str, Any], scenario: str) -> None:
+    keep, speedup, p_value, caught, median, p95, sla_met = DEMO_TARGETS[scenario]
+    records = demo_dump["snapshots"][scenario][-1]["records"]
+    verdict, evidence = records["verdicts"][0], records["evidence"][0]
+
+    assert (verdict["keep"], verdict["speedup"], verdict["p_value"]) == (keep, speedup, p_value)
+    assert (verdict["median_seconds"], verdict["p95_seconds"], verdict["sla_met"]) == (median, p95, sla_met)
+    assert (evidence["bugs_caught"], evidence["bugs_total"]) == (caught, 4)
+    assert len(evidence["baseline_seconds"]) >= 5
+    assert len(evidence["candidate_seconds"]) >= 5
+    assert [o["caught"] for o in evidence["bug_outcomes"]].count(False) == 4 - caught
+    assert {o["kind"] for o in evidence["bug_outcomes"]} == {"commit", "mutation"}
+    assert all(set(o) == {"kind", "ref", "baseline_failed", "caught", "run_url"} for o in evidence["bug_outcomes"])
+    assert all(content.startswith("name: CI") for content in records["candidates"][0]["files"].values())
+
+    rated = rate(_evidence(evidence))
+    assert (rated.median_seconds, rated.sla_met) == (median, sla_met)
+    assert rated.p95_seconds == pytest.approx(p95)
+    if caught < 4:
+        # rater short-circuits on a missed bug; the demo shows the speed it would have measured.
+        assert (rated.keep, rated.reason) == (False, f"caught {caught}/4 bugs")
+        rated = rate(_evidence({**evidence, "bugs_caught": 4}))
+    else:
+        assert (rated.keep, rated.reason) == (keep, verdict["reason"])
+    assert round(rated.speedup, 2) == speedup
+    assert rated.p_value is not None
+    assert round(rated.p_value, 3 if p_value < 0.01 else 2) == p_value
+
+
+@pytest.mark.parametrize("scenario", list(DEMO_TARGETS))
+def test_demo_snapshots_match_live_api_shapes(demo_dump: dict[str, Any], scenario: str) -> None:
+    stages = demo_dump["snapshots"][scenario]
+    base = stages[0]["status"]["base_sha"]
+
+    for index, snap in enumerate(stages):
+        client = TestClient(create_app(_ledger_from_records(snap["records"])))
+        api = "/api/repos/pit-crew-demo/checkout-api"
+
+        assert client.get(f"{api}/records").json() == snap["records"]
+        assert client.get(f"{api}/attempts").json() == snap["attempts"]
+        assert client.get(f"{api}/status").json() == {**snap["status"], "active": False}
+        assert snap["status"]["active"] is (index < 4)
+        counts = [len(snap["records"][k]) for k in ("candidates", "replay_plans", "evidence", "verdicts")]
+        assert counts == [int(index >= n) for n in range(1, 5)]
+        if index < 4:
+            assert (snap["status"]["base_sha"], snap["status"]["latest_verdict"]) == (base, None)
+
+    final = stages[-1]["status"]
+    head = stages[-1]["records"]["candidates"][0]["head_sha"]
+    assert final["base_sha"] == (head if DEMO_TARGETS[scenario][0] else base)
+
+
+_STORE_SCRIPT = """
+const s = await import(process.argv[1]);
+const timers = [];
+const timer = {
+  setInterval(fn, ms) { timers.push({ fn, ms, cleared: false }); return timers.length - 1; },
+  clearInterval(id) { timers[id].cleared = true; },
+};
+const pick = (st) => [st.mode, st.scenarioId, st.stageIndex, st.stage, st.isPlaying];
+const fails = (fn) => { try { fn(); return null; } catch (error) { return error.message; } };
+const boots = ["", "?repo=owner/name", "?repo=owner/name&mode=demo", "?mode=demo", "?repo=bad", "?mode=live"]
+  .map(s.resolveInitialBoot);
+const store = s.createPitWallStore({ timer, intervalMs: 500 });
+const seen = [];
+const unsubscribe = store.subscribe((st) => seen.push(st.stage));
+const log = { initial: pick(store.getState()), keys: Object.keys(store.getState()).sort() };
+const init = store.getState();
+log.initialData = [init.status.sla_met, init.attempts.length, init.records.verdicts.length,
+  init.selectedAttemptIndex, init.selectedAttempt.candidate_id === init.records.candidates[0].id];
+store.reset(); log.reset = pick(store.getState());
+store.step(); store.step(); log.stepped = pick(store.getState());
+store.setStage(3); store.step(); store.step(); log.capped = pick(store.getState());
+store.play(); log.play = [...pick(store.getState()), timers.length, timers[0].ms];
+store.play(); log.playTwice = timers.length;
+timers[0].fn(); timers[0].fn(); log.ticked = pick(store.getState());
+timers[0].fn(); timers[0].fn(); log.finished = [...pick(store.getState()), timers[0].cleared];
+store.play(); store.pause(); log.paused = [...pick(store.getState()), timers[1].cleared];
+store.selectScenario("unsafe_reject"); log.scenario = [...pick(store.getState()),
+  store.getState().status.latest_verdict.speedup];
+store.play(); store.selectScenario("noise_reject"); log.scenarioStops = [store.getState().isPlaying, timers[2].cleared];
+store.selectAttempt(0); log.selected = store.getState().selectedAttemptIndex;
+log.errors = [fails(() => store.selectAttempt(1)), fails(() => store.selectScenario("x")),
+  fails(() => store.setStage(5)), fails(() => store.setMode("x"))];
+store.play(); store.setMode("live"); const live = store.getState();
+log.live = [...pick(live), timers[3].cleared, live.status, live.attempts, live.selectedAttempt, live.records];
+store.step(); store.reset(); store.play();
+log.liveIgnores = [live.stageIndex === store.getState().stageIndex, timers.length];
+store.setRepo("owner/name"); store.setFetchError("boom"); log.fetchError = store.getState().fetchError;
+store.setLiveData({ status: { repo: "owner/name" }, attempts: [{ id: 1 }, { id: 2 }] });
+const fed = store.getState();
+log.fed = [fed.repo, fed.status, fed.attempts.length, fed.selectedAttemptIndex, fed.selectedAttempt, fed.fetchError,
+  fed.records.verdicts];
+store.selectAttempt(0); log.feedSelect = store.getState().selectedAttempt;
+store.setFetchError(); log.clearedError = store.getState().fetchError;
+store.setMode("demo"); log.backToDemo = [...pick(store.getState()), store.getState().attempts.length];
+store.play(); store.step(); store.reset();
+log.resetStops = [...pick(store.getState()), timers.at(-1).cleared];
+unsubscribe(); const before = seen.length; store.reset(); log.unsubscribed = seen.length === before;
+log.seenStart = seen.slice(0, 4);
+console.log(JSON.stringify({ boots, log }));
+"""
+
+
+STATE_KEYS = (
+    "mode repo scenarioId stageIndex stage isPlaying status attempts records selectedAttemptIndex selectedAttempt"
+    " fetchError"
+)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_boot_and_store_transitions() -> None:
+    out = _node(_STORE_SCRIPT, STORE_JS.as_uri())
+    demo = {"mode": "demo", "repo": "", "scenarioId": "proven_keep"}
+    live = {"mode": "live", "repo": "owner/name", "scenarioId": "proven_keep"}
+    assert out["boots"] == [demo, live, {**demo, "repo": "owner/name"}, demo, demo, demo]
+
+    log = out["log"]
+    assert log["initial"] == ["demo", "proven_keep", 4, "rater", False]
+    assert log["keys"] == sorted(STATE_KEYS.split())
+    assert log["initialData"] == [True, 1, 1, 0, True]
+    assert log["reset"] == ["demo", "proven_keep", 0, "analysis", False]
+    assert log["stepped"] == ["demo", "proven_keep", 2, "proof", False]
+    assert log["capped"] == ["demo", "proven_keep", 4, "rater", False]
+    assert log["play"] == ["demo", "proven_keep", 0, "analysis", True, 1, 500]
+    assert log["playTwice"] == 1
+    assert log["ticked"] == ["demo", "proven_keep", 2, "proof", True]
+    assert log["finished"] == ["demo", "proven_keep", 4, "rater", False, True]
+    assert log["paused"] == ["demo", "proven_keep", 0, "analysis", False, True]
+    assert log["scenario"] == ["demo", "unsafe_reject", 4, "rater", False, 1.92]
+    assert log["scenarioStops"] == [False, True]
+    assert log["selected"] == 0
+    assert log["errors"] == [
+        "Attempt index out of range: 1",
+        "Unknown demo scenario: x",
+        "Demo stage index out of range: 5",
+        "Unknown Pit Wall mode: x",
+    ]
+    empty_records: dict[str, list[Any]] = {
+        k: [] for k in ("hypotheses", "candidates", "replay_plans", "evidence", "verdicts")
+    }
+    assert log["live"] == ["live", "noise_reject", 0, "analysis", False, True, None, [], None, empty_records]
+    assert log["liveIgnores"] == [True, 4]
+    assert log["fetchError"] == "boom"
+    assert log["fed"] == ["owner/name", {"repo": "owner/name"}, 2, 1, {"id": 2}, None, []]
+    assert log["feedSelect"] == {"id": 1}
+    assert log["clearedError"] is None
+    assert log["backToDemo"] == ["demo", "noise_reject", 0, "analysis", False, 1]
+    assert log["resetStops"] == ["demo", "noise_reject", 0, "analysis", False, True]
+    assert log["unsubscribed"] is True
+    assert log["seenStart"] == ["analysis", "optimizer", "proof", "ci"]
+
+
+_SWITCHER_SCRIPT = (
+    _FAKE_DOM
+    + """
+const m = await import(process.argv[1]);
+const view = (d, pw) => ({
+  sha: d.ids["base-sha-value"].textContent, median: d.ids["sla-median"].textContent,
+  p95: d.ids["sla-p95"].textContent, badgeHidden: d.ids["sla-badge"].hidden, running: d.ids["run-pit-stop"].disabled,
+  slotHidden: d.ids["demo-switcher"].hidden, stage: pw.store.getState().stage,
+  stages: pw.switcher.stageItems.map((n) => n.dataset.state).join(","),
+  scenario: pw.switcher.scenarioButtons.filter((n) => n.attrs["aria-pressed"] === "true").map((n) => n.textContent),
+  play: pw.switcher.playButton.textContent, stepOff: pw.switcher.stepButton.disabled,
+  resetOff: pw.switcher.resetButton.disabled,
+});
+const d = fakeDocument("complete");
+const pw = m.bootPitWall(d.doc, "");
+const sw = pw.switcher;
+const out = { boot: view(d, pw), labels: sw.stageItems.map((n) => n.textContent),
+  slotKids: d.ids["demo-switcher"].kids.length, ariaCurrent: sw.stageItems[4].attrs["aria-current"] };
+sw.resetButton.click(); out.analysis = view(d, pw);
+const walk = [];
+for (let i = 0; i < 4; i += 1) { sw.stepButton.click(); walk.push(view(d, pw)); }
+out.walk = walk;
+sw.scenarioButtons[0].click(); out.unsafe = view(d, pw);
+sw.playButton.click(); out.playing = view(d, pw);
+sw.playButton.click(); out.paused = view(d, pw);
+d.ids["run-pit-stop"].click(); out.runPlays = pw.store.getState().isPlaying; pw.store.pause();
+d.live.click(); out.live = view(d, pw);
+d.demo.click(); out.demo = view(d, pw);
+const l = fakeDocument("complete");
+const lpw = m.bootPitWall(l.doc, "?repo=owner/name");
+out.liveBoot = { ...view(l, lpw), mode: lpw.store.getState().mode, repo: l.ids["repo-input"].value,
+  pressed: pressed(l) };
+l.ids["run-pit-stop"].click(); out.liveRunIgnored = lpw.store.getState().isPlaying;
+console.log(JSON.stringify(out));
+"""
+)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_demo_switcher_drives_header_through_stages() -> None:
+    out = _node(_SWITCHER_SCRIPT, APP_JS.as_uri())
+    kept = {"sha": "e9b17d3", "median": "48.0", "p95": "82.0", "badgeHidden": False, "running": False}
+    pending = {"sha": "4f1c9e2", "median": "--", "p95": "--", "badgeHidden": True, "running": True}
+    assert out["boot"] == {
+        **kept,
+        "slotHidden": False,
+        "stage": "rater",
+        "stages": "done,done,done,done,current",
+        "scenario": ["Proven Speedup"],
+        "play": "Play",
+        "stepOff": True,
+        "resetOff": False,
+    }
+    assert out["labels"] == ["Analysis", "Optimizer", "Proof", "CI", "Rater"]
+    assert out["slotKids"] == 4
+    assert out["ariaCurrent"] == "step"
+    assert out["analysis"] == {
+        **pending,
+        "slotHidden": False,
+        "stage": "analysis",
+        "stages": "current,pending,pending,pending,pending",
+        "scenario": ["Proven Speedup"],
+        "play": "Play",
+        "stepOff": False,
+        "resetOff": True,
+    }
+    assert [w["stage"] for w in out["walk"]] == ["optimizer", "proof", "ci", "rater"]
+    assert [w["stages"].count("done") for w in out["walk"]] == [1, 2, 3, 4]
+    for w in out["walk"][:3]:
+        assert {k: w[k] for k in pending} == pending
+    assert {k: out["walk"][3][k] for k in kept} == kept
+    assert out["unsafe"]["scenario"] == ["Fast but Unsafe"]
+    assert {k: out["unsafe"][k] for k in kept} == {
+        "sha": "4f1c9e2",
+        "median": "62.5",
+        "p95": "72.4",
+        "badgeHidden": True,
+        "running": False,
+    }
+    assert (out["playing"]["play"], out["playing"]["stage"], out["playing"]["running"]) == ("Pause", "analysis", True)
+    assert (out["paused"]["play"], out["paused"]["stage"]) == ("Play", "analysis")
+    assert out["runPlays"] is True
+    assert (out["live"]["slotHidden"], out["live"]["sha"], out["live"]["median"]) == (True, "-------", "--")
+    assert (out["demo"]["slotHidden"], out["demo"]["scenario"]) == (False, ["Fast but Unsafe"])
+    assert out["liveBoot"]["mode"] == "live"
+    assert out["liveBoot"]["slotHidden"] is True
+    assert out["liveBoot"]["repo"] == "owner/name"
+    assert out["liveBoot"]["pressed"] == ["true", "false"]
+    assert out["liveRunIgnored"] is False

@@ -240,7 +240,100 @@ body {
   cursor: progress;
 }
 
-/* Downstream slots (#48-#51) */
+/* Demo Scenario Switcher (#48) */
+.demo-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: calc(var(--pc-grid-unit) * 1.5) calc(var(--pc-grid-unit) * 2);
+  padding: calc(var(--pc-grid-unit) * 1.5) calc(var(--pc-grid-unit) * 2);
+  background: var(--pc-bg-carbon);
+  border: 1px solid var(--pc-border-grid);
+  border-left: 3px solid var(--pc-vegas-magenta);
+  border-radius: var(--pc-radius-md);
+}
+
+.demo-switcher__label {
+  color: var(--pc-vegas-magenta);
+  font-family: var(--pc-font-display);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.demo-switcher__scenarios,
+.demo-switcher__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pc-grid-unit);
+}
+
+.demo-switcher__scenario,
+.demo-switcher__control {
+  padding: calc(var(--pc-grid-unit) * 0.75) calc(var(--pc-grid-unit) * 1.5);
+  background: var(--pc-bg-paddock);
+  color: var(--pc-ink-secondary);
+  border: 1px solid var(--pc-border-grid);
+  border-radius: var(--pc-radius-sm);
+  font-family: var(--pc-font-display);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.demo-switcher__scenario[aria-pressed="true"],
+.demo-switcher__control[aria-pressed="true"] {
+  background: var(--pc-bg-pitwall);
+  color: var(--pc-ink-highvis);
+  border-color: var(--pc-vegas-magenta);
+}
+
+.demo-switcher__control:disabled {
+  color: var(--pc-ink-muted);
+  cursor: not-allowed;
+}
+
+.demo-switcher__scenario:focus-visible,
+.demo-switcher__control:focus-visible {
+  outline: 2px solid var(--pc-sphere-cyan);
+  outline-offset: 2px;
+}
+
+.demo-switcher__stages {
+  display: flex;
+  flex: 1 1 320px;
+  flex-wrap: wrap;
+  gap: calc(var(--pc-grid-unit) * 0.5);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.demo-switcher__stage {
+  flex: 1 1 0;
+  min-width: 64px;
+  padding: calc(var(--pc-grid-unit) * 0.5) var(--pc-grid-unit);
+  color: var(--pc-ink-muted);
+  border-bottom: 2px solid var(--pc-border-grid);
+  font-family: var(--pc-font-display);
+  font-size: 12px;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.demo-switcher__stage[data-state="done"] {
+  color: var(--pc-ink-secondary);
+  border-bottom-color: var(--pc-drs-green);
+}
+
+.demo-switcher__stage[data-state="current"] {
+  color: var(--pc-ink-highvis);
+  border-bottom-color: var(--pc-sector-purple);
+}
+
+/* Downstream slots (#49-#51) */
 .pit-wall {
   display: flex;
   flex-direction: column;
@@ -309,5 +402,14 @@ body {
 
   .pit-wall__grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .demo-switcher__stages {
+    flex-basis: 100%;
+  }
+
+  .demo-switcher__stage {
+    min-width: 0;
+    font-size: 11px;
   }
 }
