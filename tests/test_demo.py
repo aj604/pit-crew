@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from pit_crew import rater
@@ -143,7 +144,7 @@ def test_sse_stream_endpoint_formats_events() -> None:
     async def _run() -> None:
         engine = DemoEngine(ledger=InMemoryLedger())
         router = create_demo_router(engine)
-        events_route = next(r for r in router.routes if getattr(r, "path", None) == "/api/events")
+        events_route = next(r for r in router.routes if isinstance(r, APIRoute) and r.path == "/api/events")
         response = await events_route.endpoint()
 
         async def _read_one() -> str:

@@ -64,8 +64,7 @@ class DemoEngine:
                     "stage": "analysis",
                     "status": "completed",
                     "message": (
-                        f"Proposed {scenario.hypothesis.skill} "
-                        f"(~{scenario.hypothesis.expected_savings_seconds:.0f}s)"
+                        f"Proposed {scenario.hypothesis.skill} (~{scenario.hypothesis.expected_savings_seconds:.0f}s)"
                     ),
                 },
                 None,
@@ -193,8 +192,7 @@ class DemoEngine:
                         "stage": "ci",
                         "status": "completed",
                         "message": (
-                            f"Collected {len(base)}+{len(cand)} timing runs "
-                            f"and {scenario.evidence.bugs_total} replays"
+                            f"Collected {len(base)}+{len(cand)} timing runs and {scenario.evidence.bugs_total} replays"
                         ),
                     },
                     None,
