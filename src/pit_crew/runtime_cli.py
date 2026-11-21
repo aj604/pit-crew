@@ -302,6 +302,9 @@ def add_runtime_subcommands(commands: Any) -> None:  # noqa: ANN401
         "--timing-pairs", type=int, default=5, help="interleaved timing pairs per candidate (default: 5)"
     )
     cycle.add_argument("--parallel-runs", type=int, default=10, help="max concurrent CI workflow runs (default: 10)")
+    cycle.add_argument(
+        "--optimizer-fanout", type=int, default=3, help="Optimizer lanes run at once on top hypotheses (default: 3)"
+    )
     cycle.add_argument("--until-sla", action="store_true", help="compound cycles until the CI SLA is met")
     cycle.add_argument("--max-cycles", type=int, default=5, help="max compounding cycles for --until-sla (default: 5)")
     cycle.add_argument("--workflow", default="ci.yml", help="target workflow file name (default: ci.yml)")
@@ -318,6 +321,9 @@ def add_runtime_subcommands(commands: Any) -> None:  # noqa: ANN401
     serve.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
     serve.add_argument("--parallel-runs", type=int, default=10, help="max concurrent CI workflow runs (default: 10)")
+    serve.add_argument(
+        "--optimizer-fanout", type=int, default=3, help="Optimizer lanes run at once on top hypotheses (default: 3)"
+    )
 
     hook = commands.add_parser("register-webhook", help="idempotently configure the GitHub workflow_run webhook")
     hook.add_argument("--repo", required=True, help="target repository slug (owner/name)")
@@ -410,6 +416,7 @@ def _run_cycle_command(
                     auto_open_pr=not args.no_open_pr,
                     base_branch=args.base_branch,
                     max_parallel_runs=args.parallel_runs,
+                    optimizer_fanout=args.optimizer_fanout,
                 )
                 active_dispatcher = _build_live_dispatcher(
                     ledger,
@@ -472,7 +479,7 @@ def _run_serve_command(
         if dispatcher is not None:
             active_dispatcher = dispatcher
         elif github is not None or github_token:
-            config = DispatcherConfig(max_parallel_runs=args.parallel_runs)
+            config = DispatcherConfig(max_parallel_runs=args.parallel_runs, optimizer_fanout=args.optimizer_fanout)
             active_dispatcher = _build_live_dispatcher(
                 ledger,
                 tracker,
