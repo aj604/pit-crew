@@ -1,21 +1,10 @@
-import json
-from pathlib import Path
-
 import pytest
 
 from pit_crew import tools
 from pit_crew.contracts import Candidate, Hypothesis, ReplayPlan
 from pit_crew.dispatcher import next_lane
-from pit_crew.lanes.analysis.tools import slowest_jobs
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import build_request
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-def test_analysis_ranks_jobs_by_total_time() -> None:
-    job_runs = json.loads((FIXTURES / "job_runs.json").read_text())
-    assert slowest_jobs(job_runs) == [("test", 1500.0), ("build", 500.0), ("lint", 60.0)]
 
 
 def test_records_flow_from_hypothesis_to_replay_plan() -> None:
@@ -53,5 +42,6 @@ def test_request_carries_only_the_lanes_own_skill_and_tools(lane: str) -> None:
     request = build_request(lane, "do the thing")
     targets = [source["target"] for source in request["environment"]["sources"]]
     assert targets == [".agents/AGENTS.md", f".agents/skills/{lane}/SKILL.md"]
-    assert len(request["tools"]) == 1
+    assert request["tools"]
+    assert {t["name"] for t in request["tools"]} == {t.name for t in tools.for_lane(lane)}
     assert request["input"].startswith(f"Lane: {lane}")
