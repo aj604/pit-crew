@@ -8,6 +8,7 @@ with its original text. A file that does not parse fails, because it cannot be c
 """
 
 import configparser
+import fnmatch
 import json
 import re
 import tomllib
@@ -25,9 +26,11 @@ _RETRIES = re.compile(r"['\"]?\bretries\b['\"]?\s*:\s*(\{[^}]*\}|[^,\n}]+)")
 _NUMBER = re.compile(r"\d+")
 _BOOLEAN_NARROWING_KEYS = frozenset({"passWithNoTests"})
 _TRUTHY = frozenset({"true", "1", "yes", "on"})
+_JS_TRAILING_COMMENT = re.compile(r"\s*(?://.*|/\*.*?\*/)\s*$")
 _BRACES = re.compile(r"\{([^{}]*)\}")
 _MAKE_RULE = re.compile(r"^([^\s:=#][^:=#]*?)\s*::?(?!=)\s*(.*)$")
 _MAKE_CALL = re.compile(r"(?:\$\(MAKE\)|\$\{MAKE\}|^make)\s+(?:-\S+\s+)*([A-Za-z0-9_.-]+)")
+_MAKE_COMMENT = re.compile(r"(?<!\\)#.*$")
 _MAKE_UNRESOLVED = re.compile(r"^\s*(?:-?include|sinclude)\s|\$\(eval\b", re.MULTILINE)
 _RECORDING = re.compile(r"\b(video|screenshot|trace)\s*:\s*['\"]?([A-Za-z-]+)")
 # Keys that, when added, make a JS test runner collect or fail on fewer tests.
@@ -58,6 +61,7 @@ _TS_STRICT_FLAGS = (
     "noUnusedParameters",
 )
 _PYTEST_COLLECTION_KEYS = ("python_files", "python_classes", "python_functions")
+_PYTEST_DEFAULT_FILES = ("test_*.py", "*_test.py")
 _RUST_RUNTIME_CHECKS = ("debug-assertions", "overflow-checks")
 
 
@@ -175,7 +179,8 @@ def _pyproject(before: str, after: str) -> list[str]:
 def _pytest_options(where: str, old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
     old_opts, new_opts = " ".join(_words(old.get("addopts"))), " ".join(_words(new.get("addopts")))
     problems = _flags_added(f"{where} addopts", old_opts, new_opts)
-    problems += _discovery(where, _words(old.get("testpaths")), _words(new.get("testpaths")))
+    patterns = _words(new.get("python_files")) or list(_PYTEST_DEFAULT_FILES)
+    problems += _discovery(where, _words(old.get("testpaths")), _words(new.get("testpaths")), patterns)
     added = set(_words(new.get("norecursedirs"))) - set(_words(old.get("norecursedirs")))
     if added:
         problems.append(f"{where} stops collecting {sorted(added)}")
@@ -187,10 +192,19 @@ def _pytest_options(where: str, old: Mapping[str, Any], new: Mapping[str, Any]) 
     return problems
 
 
-def _discovery(where: str, before: list[str], after: list[str]) -> list[str]:
-    """Without `testpaths`, pytest discovers from where it runs: setting it can only narrow that."""
+def _discovery(where: str, before: list[str], after: list[str], patterns: list[str]) -> list[str]:
+    """Without `testpaths`, pytest discovers from where it runs: setting it can only narrow that.
+
+    Removing it is safe for directories, but a file listed explicitly is collected whatever its
+    name; once it is gone, discovery only finds files matching `python_files`.
+    """
     if not after:
-        return []
+        missed = [
+            p
+            for p in before
+            if p.endswith(".py") and not any(fnmatch.fnmatch(PurePosixPath(p).name, pat) for pat in patterns)
+        ]
+        return [f"{where} drops `testpaths` entries default discovery would skip: {missed}"] if missed else []
     if not before:
         return [f"{where} sets `testpaths = {after}`, so tests outside them are no longer discovered"]
     return _values_lost(f"{where} testpaths", before, after)
@@ -313,10 +327,13 @@ def _rules(text: str) -> dict[str, _Rule]:
     for line in text.splitlines():
         if line.startswith("\t"):
             command = " ".join(line.strip().lstrip("@").split())  # `@` only silences echoing
-            for rule in current:
-                rule.recipe.append(command)
+            if not command.startswith("#"):  # the shell ignores a commented recipe line
+                for rule in current:
+                    rule.recipe.append(command)
             continue
-        match = _MAKE_RULE.match(line)
+        if line.lstrip().startswith("#"):
+            continue  # a standalone comment keeps the current rule, as GNU Make does
+        match = _MAKE_RULE.match(_MAKE_COMMENT.sub("", line))
         if match is None:
             if line.strip() and not line.startswith(" "):
                 current = []  # a variable assignment or directive ends the previous rule
@@ -408,7 +425,7 @@ def _js_narrowing(where: str, before: str, after: str) -> list[str]:
 def _values_of(text: str, key: str) -> list[str]:
     """Each value assigned to ``key`` (arrays and objects whole), whitespace-normalized."""
     pattern = rf"['\"]?\b{key}\b['\"]?\s*:\s*(\[[^\]]*\]|\{{[^}}]*\}}|[^,\n}}]+)"
-    return [" ".join(value.split()).rstrip(",") for value in re.findall(pattern, text)]
+    return [_JS_TRAILING_COMMENT.sub("", " ".join(value.split())).rstrip(",") for value in re.findall(pattern, text)]
 
 
 def _atoms(values: Iterable[str]) -> set[str]:
@@ -428,8 +445,8 @@ def _retries_raised(before: str, after: str) -> list[str]:
     Cypress sets `runMode` and `openMode` separately, so each number is compared in place rather
     than taking a maximum; a changed expression that cannot be compared counts as a raise.
     """
-    old = [" ".join(v.split()) for v in _RETRIES.findall(before)]
-    new = [" ".join(v.split()) for v in _RETRIES.findall(after)]
+    old = [_JS_TRAILING_COMMENT.sub("", " ".join(v.split())) for v in _RETRIES.findall(before)]
+    new = [_JS_TRAILING_COMMENT.sub("", " ".join(v.split())) for v in _RETRIES.findall(after)]
     if not new or new == old:
         return []
     if len(new) == len(old) and all(_not_higher(o, n) for o, n in zip(old, new, strict=True)):

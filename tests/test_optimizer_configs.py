@@ -361,3 +361,50 @@ def test_review_findings_are_rejected(path: str, before: str, after: str, expect
 )
 def test_review_safe_counterparts_pass(path: str, before: str, after: str) -> None:
     assert _problems(path, before, after) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after", "expected"),
+    [
+        (
+            "pytest.ini",
+            "[pytest]\ntestpaths = tests tests/smoke.py\n",
+            "[pytest]\naddopts = -q\n",
+            "default discovery would skip: ['tests/smoke.py']",
+        ),
+        (
+            "vitest.config.ts",
+            "export default { test: {\n  globals: true\n} }\n",
+            "export default { test: {\n  globals: true,\n  passWithNoTests: true // empty on some jobs\n} }\n",
+            "`passWithNoTests`",
+        ),
+        (
+            "vitest.config.ts",
+            "export default { test: { passWithNoTests: false /* strict */ } }\n",
+            "export default { test: { passWithNoTests: true /* relaxed */ } }\n",
+            "`passWithNoTests`",
+        ),
+        (
+            "Makefile",
+            "check:\n# Run tests\n\tpytest\n\truff check .\n",
+            "check:\n# Run tests\n\truff check .\n",
+            "drops or rewrites `pytest`",
+        ),
+        (
+            "Makefile",
+            "check: lint # see CONTRIBUTING=docs\n\tpytest\nlint:\n\truff check .\n",
+            "check: # see CONTRIBUTING=docs\n\tpytest\nlint:\n\truff check .\n",
+            "drops or rewrites `ruff check .`",
+        ),
+    ],
+)
+def test_second_review_findings_are_rejected(path: str, before: str, after: str, expected: str) -> None:
+    problems = _problems(path, before, after)
+    assert any(expected in p for p in problems), problems
+
+
+def test_dropping_testpaths_of_default_named_files_is_fine() -> None:
+    assert (
+        _problems("pytest.ini", "[pytest]\ntestpaths = tests tests/test_smoke.py\n", "[pytest]\naddopts = -q\n") == []
+    )
+    assert _problems("Makefile", "test:\n\t# comment\n\tpytest\n", "test:\n\tpytest\n") == []
