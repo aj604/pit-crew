@@ -24,6 +24,10 @@ jobs:
 {extra}      - run: npm ci
       - run: npm test
 """
+MULTILINE_PATH_CACHE = (
+    "      - uses: actions/cache@v4\n        with:\n          path: |\n"
+    "            ~/.cache/ms-playwright\n            ~/.npm\n"
+)
 CACHED = "      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n"
 
 
@@ -103,7 +107,7 @@ def test_dep_cache_respects_setup_action_cache() -> None:
 def test_dep_cache_respects_actions_cache_and_enable_cache() -> None:
     for extra in (
         "      - uses: actions/cache@v4\n        with: {path: ~/.npm, key: k}\n",
-        "      - uses: some/setup-thing@v1\n        with: {enable-cache: 'TRUE'}\n",
+        MULTILINE_PATH_CACHE,
     ):
         wf, prof = make_profile(BASE.format(extra=extra), [NPM_JOB])
         assert detect_dep_cache(prof, wf, PATH) == []
@@ -206,5 +210,39 @@ def test_dep_cache_setup_go_cache_false_is_flagged() -> None:
 
 def test_dep_cache_inline_unquoted_enable_cache_counts() -> None:
     extra = "      - uses: astral-sh/setup-uv@v5\n        with: {enable-cache: true}\n"
+    wf, prof = make_profile(BASE.format(extra=extra).replace("npm ci", "uv sync"), [NPM_JOB])
+    assert detect_dep_cache(prof, wf, PATH) == []
+
+
+def test_dep_cache_unrelated_cache_does_not_hide_npm_ci() -> None:
+    extra = "      - uses: actions/cache@v4\n        with: {path: '~/.cache/ms-playwright', key: k}\n"
     wf, prof = make_profile(BASE.format(extra=extra), [NPM_JOB])
+    (f,) = detect_dep_cache(prof, wf, PATH)
+    assert f.step == "Run npm ci"
+
+
+def test_dep_cache_npm_path_cache_is_not_flagged() -> None:
+    extra = "      - uses: actions/cache@v4\n        with: {path: ~/.npm, key: k}\n"
+    wf, prof = make_profile(BASE.format(extra=extra), [NPM_JOB])
+    assert detect_dep_cache(prof, wf, PATH) == []
+
+
+def test_dep_cache_other_manager_setup_cache_does_not_hide_npm_ci() -> None:
+    extra = "      - uses: actions/setup-node@v4\n        with:\n          cache: pnpm\n"
+    wf, prof = make_profile(BASE.format(extra=extra), [NPM_JOB])
+    assert len(detect_dep_cache(prof, wf, PATH)) == 1
+
+
+@pytest.mark.parametrize(
+    ("extra", "install"),
+    [
+        ("      - uses: actions/setup-python@v5\n        with: {cache: poetry}\n", "poetry install"),
+        ("      - uses: ruby/setup-ruby@v1\n        with: {bundler-cache: true}\n", "bundle install"),
+        ("      - uses: Swatinem/rust-cache@v2\n", "cargo fetch"),
+        ("      - uses: actions/setup-go@v5\n        with: {cache: true}\n", "go mod download"),
+        ("      - uses: actions/cache@v4\n        with: {path: vendor/bundle, key: k}\n", "bundle install"),
+    ],
+)
+def test_dep_cache_matching_manager_caches_hide_install(extra: str, install: str) -> None:
+    wf, prof = make_profile(BASE.format(extra=extra).replace("npm ci", install), [NPM_JOB])
     assert detect_dep_cache(prof, wf, PATH) == []

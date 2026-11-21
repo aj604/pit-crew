@@ -18,18 +18,78 @@ SAVED_FRACTION = 0.7  # share of the install a warm cache typically removes
 CONFIDENT_RUNS = 20  # runs needed before the estimate is trusted
 
 
-def _caches(step: StepSpec) -> bool:
-    uses = step.uses or ""
-    if uses.startswith("actions/cache"):
-        return True
-    if not uses.split("@", 1)[0].rsplit("/", 1)[-1].startswith("setup-"):
-        return False
-    cache = step.with_.get("cache", "").strip().lower()
-    return cache not in {"", "false"} or step.with_.get("enable-cache", "").lower() == "true"
+_CACHE_INPUT_VALUES = {  # `cache:` values of setup actions whose value names the manager it caches
+    "setup-node": frozenset({"npm", "pnpm", "yarn"}),
+    "setup-python": frozenset({"pip", "poetry", "pipenv"}),
+}
+# Directories (as consecutive path components) a generic `actions/cache` must include to cover a manager.
+_CACHE_DIRS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "npm": ((".npm",), ("node_modules",)),
+    "pnpm": (("pnpm-store",), (".pnpm-store",), ("node_modules",)),
+    "yarn": ((".yarn",), ("yarn",), ("node_modules",)),
+    "bun": ((".bun",), ("node_modules",)),
+    "pip": ((".cache", "pip"), ("pip",)),
+    "uv": ((".cache", "uv"), ("uv",)),
+    "poetry": (("pypoetry",), (".cache", "pypoetry")),
+    "cargo": ((".cargo",), ("target",)),
+    "go": (("go", "pkg", "mod"), ("go-build",)),
+    "bundle": (("vendor", "bundle"),),
+}
+_GENERIC_CACHE_ACTIONS = frozenset({"actions/cache", "actions/cache/restore"})
 
 
-def _job_caches(job: JobSpec) -> bool:
-    return any(_caches(s) for s in job.steps)
+def _managers(command: str) -> set[str]:
+    """The package managers whose install commands appear in a shell command."""
+    managers = set()
+    for match in INSTALL_COMMANDS.finditer(command):
+        managers.add(match.group(1).split()[0])
+    return managers
+
+
+def _path_covers(path: str, manager: str) -> bool:
+    for line in path.splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("!"):
+            continue
+        parts = [p for p in entry.split("/") if p]
+        for hint in _CACHE_DIRS[manager]:
+            width = len(hint)
+            if any(tuple(parts[i : i + width]) == hint for i in range(len(parts) - width + 1)):
+                return True
+    return False
+
+
+def _setup_covered(name: str, with_: dict[str, str]) -> set[str]:
+    """Managers a `setup-*` action's built-in cache covers."""
+    cache = with_.get("cache", "").strip().lower()
+    managers: set[str] = set()
+    if cache in _CACHE_INPUT_VALUES.get(name, frozenset()):
+        managers.add(cache)
+    elif name == "setup-uv" and with_.get("enable-cache", "").strip().lower() == "true":
+        managers.add("uv")
+    elif name == "setup-go" and cache not in {"", "false"}:
+        managers.add("go")
+    elif name == "setup-ruby" and with_.get("bundler-cache", "").strip().lower() == "true":
+        managers.add("bundle")
+    return managers
+
+
+def _covered(step: StepSpec) -> set[str]:
+    """The package managers whose dependencies this step caches."""
+    action = (step.uses or "").split("@", 1)[0].lower()
+    if action in _GENERIC_CACHE_ACTIONS:
+        path = step.with_.get("path", "")
+        return {m for m in _CACHE_DIRS if _path_covers(path, m)}
+    if action == "swatinem/rust-cache":
+        return {"cargo"}
+    return _setup_covered(action.rsplit("/", 1)[-1], step.with_)
+
+
+def _job_covered(job: JobSpec) -> set[str]:
+    covered: set[str] = set()
+    for step in job.steps:
+        covered |= _covered(step)
+    return covered
 
 
 def detect_dep_cache(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
@@ -37,10 +97,11 @@ def detect_dep_cache(profile: CIProfile, workflow: Workflow, workflow_path: str)
     findings: list[Finding] = []
     for job in workflow.jobs.values():
         jp = job_profile(profile, job.id)
-        if jp is None or jp.max_saving_seconds <= 0 or _job_caches(job):
+        if jp is None or jp.max_saving_seconds <= 0:
             continue
+        covered = _job_covered(job)
         for step in job.steps:
-            if step.run is None or not INSTALL_COMMANDS.search(step.run):
+            if step.run is None or not _managers(step.run) - covered:
                 continue
             sp = step_profile(profile, job.id, step)
             if sp is None:
