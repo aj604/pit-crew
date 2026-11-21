@@ -125,10 +125,10 @@ def parse_workflow(text: str) -> Workflow:
         needs = (raw_needs,) if isinstance(raw_needs, str) else tuple(raw_needs)
         jobs[job_id] = JobSpec(
             id=job_id,
-            name=str(body.get("name") or job_id),
+            name=_text(body.get("name")) or str(job_id),
             needs=needs,
             has_matrix=bool((body.get("strategy") or {}).get("matrix")),
-            uses=body.get("uses"),
+            uses=_text(body.get("uses")),
             steps=_parse_steps(body.get("steps")),
             runs_on=_runs_on(body.get("runs-on")),
             matrix_keys=_matrix_keys(body),
@@ -144,12 +144,27 @@ def parse_workflow(text: str) -> Workflow:
     return Workflow(name=str(doc.get("name") or ""), jobs=jobs)
 
 
+_NON_SCALAR = "<non-scalar>"  # stands in for a `with:` value that is a list or mapping
+
+
+def _text(value: object) -> str | None:
+    """The value when it is a non-empty string, else None.
+
+    GitHub requires these fields to be strings, and stringifying a YAML container would expand every alias.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def _with_value(value: object) -> str:
+    return str(value) if isinstance(value, str | int | float | bool) or value is None else _NON_SCALAR
+
+
 def _step_name(item: dict[str, Any]) -> str:
-    if item.get("name"):
-        return str(item["name"])
-    if item.get("uses"):
-        return f"Run {item['uses']}"
-    lines = str(item.get("run") or "").strip().splitlines()
+    if name := _text(item.get("name")):
+        return name
+    if uses := _text(item.get("uses")):
+        return f"Run {uses}"
+    lines = (_text(item.get("run")) or "").strip().splitlines()
     return f"Run {lines[0].strip()}" if lines else "Run"
 
 
@@ -159,10 +174,12 @@ def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
     return tuple(
         StepSpec(
             name=_step_name(item),
-            uses=str(item["uses"]) if item.get("uses") else None,
-            run=str(item["run"]) if item.get("run") is not None else None,
-            with_={str(k): str(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()},
-            if_=str(item["if"]) if item.get("if") is not None else None,
+            uses=_text(item.get("uses")),
+            run=item["run"] if isinstance(item.get("run"), str) else None,
+            with_={
+                str(k): _with_value(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()
+            },
+            if_=item["if"] if isinstance(item.get("if"), str) else None,
         )
         for item in raw
         if isinstance(item, dict)
@@ -297,7 +314,7 @@ def _literal_length(name: str) -> int:
 def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
     """The needs a job reads. A gate (status-function `if:`, `needs.*`, `toJSON(needs)`) reads all of them."""
     if_ = body.get("if")
-    if if_ is not None and _STATUS_FUNCTION.search(str(if_)):
+    if isinstance(if_, str) and _STATUS_FUNCTION.search(if_):
         return frozenset(needs)  # the job decides on its needs' results, so every edge carries a signal
     if not _expanded_size_within(body, _MAX_BODY_BYTES):
         return frozenset(needs)  # too large to scan: assume it reads every need, so no edge is ever cut

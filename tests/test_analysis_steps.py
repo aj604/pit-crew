@@ -340,3 +340,37 @@ jobs:
 """)
     assert time.perf_counter() - start < 0.5
     assert wf.jobs["c"].needs_refs == frozenset({"a", "b"})
+
+
+def test_step_run_list_of_shared_huge_scalar_is_ignored_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 5_000)
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - run: [{refs}]
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].steps[0].run is None
+    assert wf.jobs["c"].steps[0].name == "Run"
+
+
+def test_step_with_container_value_becomes_placeholder_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 5_000)
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - uses: actions/checkout@v4
+        with: {{path: [{refs}], depth: 1}}
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].steps[0].with_ == {"path": "<non-scalar>", "depth": "1"}
