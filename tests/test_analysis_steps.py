@@ -270,3 +270,24 @@ jobs:
     assert wf.job_id_for("Test io_uring on Linux 7.3.5") == "uring"
     assert wf.job_id_for("Test io_uring on Linux 7.3.5 / build") == "uring"
     assert wf.job_id_for("zzz") is None  # a zero-literal expandable name is still never a wildcard
+
+
+@pytest.mark.parametrize("repeat", ["${{", "${{ x ", "${{ x }", "${{\n}}"])
+def test_adversarial_names_are_processed_in_linear_time(repeat: str) -> None:
+    name = repeat * (60_000 // len(repeat))
+    wf = parse_workflow(f"name: CI\njobs:\n  a:\n    name: {json.dumps(name)}\n    runs-on: x\n")
+    start = time.perf_counter()
+    assert not match_step_name(name, "a" * 100)
+    assert wf.job_id_for("zzz") is None
+    assert time.perf_counter() - start < 0.5
+
+
+def test_unclosed_expression_is_literal_text() -> None:
+    assert match_step_name("Run ${{ unclosed", "Run ${{ unclosed")
+    assert not match_step_name("Run ${{ unclosed", "Run anything")
+    assert match_step_name("a ${{ x }} ${{ b", "a z ${{ b")
+
+
+def test_expression_does_not_span_a_newline() -> None:
+    assert not match_step_name("a ${{ x\n}} b", "a z b")
+    assert match_step_name("a ${{ x\n}} b", "a ${{ x\n}} b")

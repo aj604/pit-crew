@@ -11,13 +11,43 @@ from typing import Any
 
 import yaml
 
-_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _MAX_EXPANSIONS = 1000
 _NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)", re.IGNORECASE)  # GitHub expressions are case-insensitive
 _READS_EVERY_NEED = re.compile(r"needs\.\*|needs\[|toJSON\s*\(\s*needs\s*\)", re.IGNORECASE)
 _STATUS_FUNCTION = re.compile(r"\b(success|failure|always|cancelled)\s*\(", re.IGNORECASE)
+
+
+def _tokenize(text: str) -> tuple[list[str], list[str]]:
+    """Split text into its literal pieces and its `${{ ... }}` expressions: len(literals) == len(expressions) + 1.
+
+    Linear in the text (names are repo-controlled, so a regex with `.*?` would be quadratic). An expression
+    does not span a newline, and an unclosed `${{` is literal text.
+    """
+    literals: list[str] = []
+    expressions: list[str] = []
+    start = 0  # where the current literal piece began
+    pos = text.find("${{")
+    close = -1  # first "}}" at or after the last position searched from; reused while still ahead of pos
+    while pos != -1:
+        if close < pos + 3:
+            close = text.find("}}", pos + 3)
+            if close == -1:
+                break  # nothing closes any later `${{` either
+        if text.find("\n", pos, close) == -1:
+            literals.append(text[start:pos])
+            expressions.append(text[pos : close + 2])
+            start = close + 2
+            pos = text.find("${{", start)
+        else:
+            pos = text.find("${{", pos + 1)
+    literals.append(text[start:])
+    return literals, expressions
+
+
+def _has_expression(text: str) -> bool:
+    return bool(_tokenize(text)[1])
 
 
 @dataclass(frozen=True)
@@ -59,7 +89,7 @@ class Workflow:
         jobs = list(self.jobs.values())
         wanted = _normalize(display_name)
         for job in jobs:  # a literal name, or the raw one GitHub shows for a skipped matrix job
-            if display_name == job.name or (_EXPRESSION.search(job.name) is None and wanted == _normalize(job.name)):
+            if display_name == job.name or (not _has_expression(job.name) and wanted == _normalize(job.name)):
                 return job.id
         expanded = {job.id: _expand_name(job) for job in jobs}
         for job in jobs:  # `${{ matrix.key }}` names with known values are literal names in disguise
@@ -178,7 +208,7 @@ def _normalize(name: str) -> str:
 
 def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
     """Every concrete display name of a job named only by `${{ matrix.<key> }}` expressions, or None."""
-    expressions = _EXPRESSION.findall(job.name)
+    literals, expressions = _tokenize(job.name)
     keys = [m.group(1) if (m := _MATRIX_EXPRESSION.fullmatch(e)) else None for e in expressions]
     values = dict(job.matrix_values)
     if not expressions or any(k is None or k not in values for k in keys):
@@ -189,7 +219,6 @@ def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
         combos *= len(values[k])
     if combos > _MAX_EXPANSIONS:
         return None
-    literals = _EXPRESSION.split(job.name)
     names = []
     for combo in itertools.product(*(values[k] for k in used)):
         chosen = dict(zip(used, combo, strict=True))
@@ -201,7 +230,7 @@ def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
 
 
 def _literal_length(name: str) -> int:
-    return len(_EXPRESSION.sub("", name))
+    return sum(len(piece) for piece in _tokenize(name)[0])
 
 
 def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
@@ -221,7 +250,7 @@ def match_step_name(spec_name: str, measured_name: str) -> bool:
     spec_name = SHA.sub("<sha>", spec_name)  # measured names are folded; a SHA-pinned `uses:` must be too
     if spec_name == measured_name:
         return True
-    return _wildcard_match(_EXPRESSION.split(spec_name), measured_name)
+    return _wildcard_match(_tokenize(spec_name)[0], measured_name)
 
 
 def _wildcard_match(parts: list[str], text: str) -> bool:
@@ -266,7 +295,7 @@ def topological_order(workflow: Workflow) -> list[str]:
 def _matches(job: JobSpec, display_name: str) -> bool:
     if display_name == job.name:
         return True
-    if not _EXPRESSION.search(job.name):
+    if not _has_expression(job.name):
         # GitHub appends the matrix values when the name does not use them
         return job.has_matrix and display_name.startswith(f"{job.name} (") and display_name.endswith(")")
-    return _wildcard_match(_EXPRESSION.split(job.name), display_name)
+    return _wildcard_match(_tokenize(job.name)[0], display_name)
