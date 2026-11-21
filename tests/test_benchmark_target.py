@@ -53,6 +53,21 @@ def test_template_is_excluded_from_wheel(tmp_path: Path) -> None:
     assert not [name for name in names if "status_board" in name or "target_template" in name or "benchmarks" in name]
 
 
+def test_template_workflow_passes_zizmor() -> None:
+    search_path = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
+    zizmor = shutil.which("zizmor", path=search_path)
+    if zizmor is None:
+        pytest.skip("zizmor is not on PATH")
+    result = subprocess.run(  # noqa: S603
+        [zizmor, "--offline", str(TEMPLATE / ".github" / "workflows")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_template_fast_tests_pass_offline() -> None:
     result = _run([sys.executable, "-m", "pytest", "tests/unit", "-q", "-p", "no:cacheprovider"], TEMPLATE)
     assert result.returncode == 0, result.stdout + result.stderr
