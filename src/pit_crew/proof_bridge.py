@@ -6,18 +6,21 @@ from GitHub Actions job runs, computes ``required_replays`` and ``uncovered_chec
 them into the Proof lane task prompt.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Protocol
 
-from pit_crew.contracts import Candidate, Evidence
-from pit_crew.github import ProofHistoryClient
+from pit_crew.contracts import Candidate, Evidence, Verdict
+from pit_crew.github import ProofHistoryClient, PullRequestClient
+from pit_crew.lanes.proof.card import pr_body, render_card
 from pit_crew.lanes.proof.checks import Check, FileChange, touched_checks
 from pit_crew.lanes.proof.miner import RedCommit, flaky_checks, red_commits
 from pit_crew.lanes.proof.tools import MAX_REPLAYS, pick_replays, uncovered_checks
 from pit_crew.lanes.proof.verify import AskModel, Replay, compare_failures, tally, verify_replays
 from pit_crew.ledger import Ledger
+
+PROOF_CARD_PATH = ".github/pit-crew/proof-card.svg"
 
 
 class ProofBridgeError(ValueError):
@@ -37,6 +40,11 @@ class ProofBridgeError(ValueError):
     def missing_verifier(cls) -> "ProofBridgeError":
         """Build error when ``verify_replay_runs()`` is called without a multimodal ``ask`` callable."""
         return cls("ProofBridge.verify_replay_runs() requires an ask callable (e.g. managed_agent.ask_multimodal)")
+
+    @classmethod
+    def missing_pr_client(cls) -> "ProofBridgeError":
+        """Build error when ``open_kept_pr()`` is called without a ``PullRequestClient``."""
+        return cls("ProofBridge.open_kept_pr() requires a PullRequestClient (github or pr_client)")
 
 
 class LaneRunner(Protocol):
@@ -86,6 +94,27 @@ class ReplayVerification:
             run_urls=run_urls,
             bug_outcomes=self.bug_outcomes,
         )
+
+
+@dataclass(frozen=True)
+class ProofPRConfig:
+    """Configuration for Proof Card attachment and PR creation on kept candidates."""
+
+    auto_open_pr: bool = False
+    base_branch: str = "main"
+    repo: str = ""
+
+
+@dataclass(frozen=True)
+class OpenedPullRequest:
+    """Metadata for a pull request opened with a committed SVG Proof Card."""
+
+    url: str
+    card_path: str
+    card_sha: str
+    card_url: str
+    title: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -260,6 +289,51 @@ class ProofBridge:
             bug_outcomes=tuple(replay.as_outcome() for replay in verified),
         )
 
+    def open_kept_pr(
+        self,
+        candidate: Candidate,
+        evidence: Evidence,
+        verdict: Verdict,
+        replays: Sequence[Replay],
+        *,
+        config: ProofPRConfig | None = None,
+    ) -> OpenedPullRequest | None:
+        """Render and commit the SVG Proof Card and open a PR when ``verdict.keep`` and ``config.auto_open_pr``."""
+        effective = config or ProofPRConfig()
+        if not verdict.keep or not effective.auto_open_pr:
+            return None
+        target_repo = effective.repo or candidate.repo
+        if not target_repo:
+            raise ProofBridgeError.missing_repo(candidate.id)
+        if not isinstance(self._github, PullRequestClient):
+            raise ProofBridgeError.missing_pr_client()
+
+        svg = render_card(candidate.branch, evidence, verdict, replays)
+        card_sha = self._github.commit_files(
+            target_repo,
+            candidate.branch,
+            {PROOF_CARD_PATH: svg},
+            f"pit-crew: add proof card for {candidate.id}",
+        )
+        card_url = f"https://raw.githubusercontent.com/{target_repo}/{card_sha}/{PROOF_CARD_PATH}"
+        body = pr_body(candidate.branch, evidence, verdict, replays, card_url=card_url)
+        title = _pr_title(candidate)
+        url = self._github.open_pull_request(
+            target_repo,
+            head=candidate.branch,
+            base=effective.base_branch,
+            title=title,
+            body=body,
+        )
+        return OpenedPullRequest(
+            url=url,
+            card_path=PROOF_CARD_PATH,
+            card_sha=card_sha,
+            card_url=card_url,
+            title=title,
+            body=body,
+        )
+
     def _compute_touched_checks(
         self,
         candidate: Candidate,
@@ -273,6 +347,11 @@ class ProofBridge:
             before = self._github.get_file_content(repo, base_sha, path) if base_sha else None
             changes.append(FileChange(path=path, before=before, after=after))
         return touched_checks(changes)
+
+
+def _pr_title(candidate: Candidate) -> str:
+    subject = candidate.summary.strip().splitlines()[0] if candidate.summary.strip() else candidate.branch
+    return f"pit-crew: {subject}"
 
 
 def _format_check(check: Check) -> str:

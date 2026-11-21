@@ -6,10 +6,18 @@ from functools import partial
 import pytest
 
 from pit_crew import managed_agent, rater
-from pit_crew.contracts import Candidate
+from pit_crew.contracts import Candidate, Evidence, Verdict, is_allowed_candidate_path
+from pit_crew.lanes.proof.card import pr_body, render_card
 from pit_crew.lanes.proof.miner import JobRun
+from pit_crew.lanes.proof.verify import Replay
 from pit_crew.ledger import InMemoryLedger, Ledger
-from pit_crew.proof_bridge import ProofBridge, ProofBridgeError, ReplayRunPair
+from pit_crew.proof_bridge import (
+    PROOF_CARD_PATH,
+    ProofBridge,
+    ProofBridgeError,
+    ProofPRConfig,
+    ReplayRunPair,
+)
 
 BASE_CI = """\
 name: CI
@@ -508,3 +516,178 @@ def test_verify_replay_runs_skips_verifier_when_not_both_failed() -> None:
     assert verification.bugs_caught == 0
     assert github.failure_output_requests == []
     assert fake_client.models.calls == []
+
+
+class FakePRGitHub(FakeProofGitHub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.committed: list[tuple[str, str, dict[str, str], str]] = []
+        self.opened_prs: list[dict[str, str]] = []
+
+    def commit_files(self, repo: str, branch: str, files: dict[str, str], message: str) -> str:
+        self.committed.append((repo, branch, dict(files), message))
+        return "cardsha1234"
+
+    def open_pull_request(self, repo: str, *, head: str, base: str, title: str, body: str) -> str:
+        self.opened_prs.append({"repo": repo, "head": head, "base": base, "title": title, "body": body})
+        return f"https://github.com/{repo}/pull/7"
+
+
+def _kept_fixture() -> tuple[Candidate, Evidence, Verdict, tuple[Replay, ...]]:
+    repo = "acme/demo"
+    github = FakeProofGitHub(
+        run_outputs={
+            (repo, "run-base-1"): b"baseline-mp4-bytes",
+            (repo, "run-cand-1"): b"candidate-mp4-bytes",
+        }
+    )
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError in test_auth.py::test_token_expiry",
+                "candidate_failure": "AssertionError in test_auth.py::test_token_expiry",
+                "reason": "Both runs fail on the same assertion in test_token_expiry.",
+            }
+        )
+    )
+    bridge = ProofBridge(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    verification = bridge.verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Unit Tests",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="run-base-1",
+                candidate_run_id="run-cand-1",
+            )
+        ],
+    )
+    candidate = Candidate(
+        id="cand-99",
+        hypothesis_id="hyp-99",
+        branch="pit-crew/cand-99",
+        summary="Parallelize unit tests",
+        repo=repo,
+    )
+    evidence = verification.to_evidence(
+        candidate_id=candidate.id,
+        baseline_seconds=(120.0, 121.0, 119.0, 122.0, 118.0),
+        candidate_seconds=(50.0, 51.0, 49.0, 52.0, 48.0),
+    )
+    verdict = rater.rate(evidence)
+    return candidate, evidence, verdict, verification.replays
+
+
+def test_open_kept_pr_commits_svg_card_and_formats_pr_body() -> None:
+    assert is_allowed_candidate_path(PROOF_CARD_PATH) is True
+
+    candidate, evidence, verdict, replays = _kept_fixture()
+    assert verdict.keep is True
+
+    github = FakePRGitHub()
+    bridge = ProofBridge(github)
+    opened = bridge.open_kept_pr(
+        candidate,
+        evidence,
+        verdict,
+        replays,
+        config=ProofPRConfig(auto_open_pr=True, base_branch="main"),
+    )
+
+    assert opened is not None
+    assert opened.url == "https://github.com/acme/demo/pull/7"
+    assert opened.card_path == ".github/pit-crew/proof-card.svg"
+    assert opened.card_sha == "cardsha1234"
+    expected_card_url = "https://raw.githubusercontent.com/acme/demo/cardsha1234/.github/pit-crew/proof-card.svg"
+    assert opened.card_url == expected_card_url
+
+    expected_svg = render_card(candidate.branch, evidence, verdict, replays)
+    assert github.committed == [
+        (
+            "acme/demo",
+            "pit-crew/cand-99",
+            {".github/pit-crew/proof-card.svg": expected_svg},
+            "pit-crew: add proof card for cand-99",
+        )
+    ]
+
+    expected_body = pr_body(candidate.branch, evidence, verdict, replays, card_url=expected_card_url)
+    assert opened.body == expected_body
+    assert github.opened_prs == [
+        {
+            "repo": "acme/demo",
+            "head": "pit-crew/cand-99",
+            "base": "main",
+            "title": "pit-crew: Parallelize unit tests",
+            "body": expected_body,
+        }
+    ]
+
+
+def test_open_kept_pr_skips_when_auto_open_pr_disabled() -> None:
+    candidate, evidence, verdict, replays = _kept_fixture()
+    assert verdict.keep is True
+
+    github = FakePRGitHub()
+    bridge = ProofBridge(github)
+
+    assert bridge.open_kept_pr(candidate, evidence, verdict, replays) is None
+    assert bridge.open_kept_pr(candidate, evidence, verdict, replays, config=ProofPRConfig(auto_open_pr=False)) is None
+    assert github.committed == []
+    assert github.opened_prs == []
+
+
+def test_open_kept_pr_skips_when_verdict_rejected() -> None:
+    candidate, evidence, _, replays = _kept_fixture()
+    rejected = Verdict(
+        candidate_id=candidate.id,
+        keep=False,
+        speedup=1.0,
+        p_value=None,
+        reason="caught 0/1 bugs",
+    )
+
+    github = FakePRGitHub()
+    bridge = ProofBridge(github)
+    result = bridge.open_kept_pr(
+        candidate,
+        evidence,
+        rejected,
+        replays,
+        config=ProofPRConfig(auto_open_pr=True),
+    )
+
+    assert result is None
+    assert github.committed == []
+    assert github.opened_prs == []
+
+
+def test_open_kept_pr_errors_on_missing_repo_or_pr_client() -> None:
+    candidate, evidence, verdict, replays = _kept_fixture()
+    no_repo_candidate = Candidate(
+        id="cand-no-repo",
+        hypothesis_id="hyp-1",
+        branch="pit-crew/no-repo",
+        summary="",
+    )
+
+    with pytest.raises(ProofBridgeError, match="no repo"):
+        ProofBridge(FakePRGitHub()).open_kept_pr(
+            no_repo_candidate,
+            evidence,
+            verdict,
+            replays,
+            config=ProofPRConfig(auto_open_pr=True),
+        )
+
+    with pytest.raises(ProofBridgeError, match="PullRequestClient"):
+        ProofBridge(FakeProofGitHub()).open_kept_pr(
+            candidate,
+            evidence,
+            verdict,
+            replays,
+            config=ProofPRConfig(auto_open_pr=True),
+        )
