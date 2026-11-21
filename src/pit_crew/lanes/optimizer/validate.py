@@ -58,6 +58,15 @@ _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _SHELL_OPERATOR = re.compile(r"\s*(&&|\|\||;)\s*")
 _MASKING_TAIL = re.compile(r"\s*\|\|\s*(?:true|:|exit\s+0)\s*$")
 _EXTENSION_OPERATOR = re.compile(r"[;&|]")
+# Arguments a check may gain: they split, parallelize or report on the same tests; none runs fewer.
+_SAFE_VALUED_OPTION = re.compile(
+    r"--?(?:shard|splits|group|partition|n|numprocesses|dist|maxWorkers|max-workers|workers|j|jobs|"
+    r"test-threads|reporter|reporters|junitxml|cov|cov-report|durations|maxfail|color|profile)(?:=\S+)?"
+)
+_SAFE_FLAG = re.compile(
+    r"--?(?:ci|q|quiet|v|verbose|silent|no-cache|frozen|locked|offline|bail|x|exitfirst|no-fail-fast|"
+    r"nocapture|show-output|runInBand|forceExit|detectOpenHandles|logHeapUsage)"
+)
 _ALWAYS = re.compile(r"^\s*(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?\s*$")
 _JQ_GATE = re.compile(r'toJSON\(needs\).*\|\s*jq\s+-e\b.*\ball\(.*\.result\s*==\s*"success"')
 _GATE_ACTION = "re-actors/alls-green"
@@ -266,14 +275,28 @@ def _step_checks(step: Workflow) -> list[str]:
 
 
 def covered(check: str, candidates: Iterable[str]) -> bool:
-    """True when a candidate runs ``check`` exactly, or with plain arguments added (as sharding does).
+    """True when a candidate runs ``check`` exactly, or with safe arguments added (as sharding does).
 
-    Added text may not chain another command: `npm test || npm run coverage` does not cover `npm test`.
+    Added text may not chain another command (`npm test || npm run coverage`), and every added
+    argument must be one that splits, parallelizes or reports on the same tests: `--shard=1/2`,
+    `-n auto` or `--ci` keep `pytest` covered; a path, `-m slow` or `--project chromium` do not.
     """
-    return any(
-        c == check or (c.startswith(check + " ") and not _EXTENSION_OPERATOR.search(c[len(check) :]))
-        for c in candidates
-    )
+    return any(c == check or (c.startswith(check + " ") and safe_extension(c[len(check) :])) for c in candidates)
+
+
+def safe_extension(extra: str) -> bool:
+    """True when every argument added to a command is a known-safe option or its value."""
+    if _EXTENSION_OPERATOR.search(extra):
+        return False
+    expects_value = False
+    for arg in extra.split():
+        if _SAFE_VALUED_OPTION.fullmatch(arg):
+            expects_value = "=" not in arg
+        elif arg == "--" or _SAFE_FLAG.fullmatch(arg) or (expects_value and not arg.startswith("-")):
+            expects_value = False  # `--` separates a wrapper's options from the test runner's
+        else:
+            return False
+    return True
 
 
 def _actions(workflow: Workflow) -> list[str]:

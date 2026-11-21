@@ -146,7 +146,7 @@ def test_safe_config_changes_pass(path: str, before: str, after: str) -> None:
         ("Makefile", "check:\n\truff check\n\tpytest\n", "check:\n\tpytest\n", "drops or rewrites `ruff check`"),
         ("Cargo.toml", '[[test]]\nname = "e2e"\n', '[package]\nname = "x"\n', "[[test]] targets drops ['e2e']"),
         ("Cargo.toml", "", "[profile.test]\noverflow-checks = false\n", "turns off `overflow-checks`"),
-        ("playwright.config.ts", PLAYWRIGHT, PLAYWRIGHT.replace("? 1 : 0", "? 3 : 0"), "raises test retries"),
+        ("playwright.config.ts", PLAYWRIGHT, PLAYWRIGHT.replace("? 1 : 0", "? 3 : 0"), "test retries"),
         (
             "playwright.config.ts",
             PLAYWRIGHT,
@@ -238,3 +238,126 @@ def test_report_candidate_runs_the_config_guard() -> None:
     assert ledger.all(Candidate) == []
     result = tools.call("check_workflow_change", ledger, {"path": "package.json", "before": before, "after": after})
     assert result["ok"] is False
+
+
+# --- Devin review on #88/#116 -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after", "expected"),
+    [
+        # a positional selector narrows the run, like any unknown argument
+        ("package.json", _package({"test": "jest"}), _package({"test": "jest tests/unit"}), "drops or rewrites `jest`"),
+        # Makefile: dropping a prerequisite, moving a check to an uncalled target, .IGNORE, .ONESHELL
+        (
+            "Makefile",
+            "test: integration\n\tpytest\nintegration:\n\tpytest tests/it\n",
+            "test:\n\tpytest\nintegration:\n\tpytest tests/it\n",
+            "`make test` drops or rewrites `pytest tests/it`",
+        ),
+        (
+            "Makefile",
+            "check:\n\tpytest\n\truff check .\nlint:\n\tmypy\n",
+            "check:\n\tpytest\nlint:\n\tmypy\n\truff check .\n",
+            "`make check` drops or rewrites `ruff check .`",
+        ),
+        ("Makefile", "test:\n\tpytest\n", "test:\n\tpytest\n.IGNORE: test\n", "adds `.IGNORE`"),
+        ("Makefile", "test:\n\tpytest\n\tmypy\n", ".ONESHELL:\ntest:\n\tpytest\n\tmypy\n", "adds `.ONESHELL`"),
+        ("Makefile", "test:\n\tpytest\n", "include extra.mk\ntest:\n\tpytest\n", "cannot follow"),
+        # tox: ignore_outcome (base and named), default envlist (with factors)
+        (
+            "tox.ini",
+            "[testenv]\ncommands = pytest\n",
+            "[testenv]\ncommands = pytest\nignore_outcome = true\n",
+            "[testenv] sets `ignore_outcome`",
+        ),
+        (
+            "tox.ini",
+            "[tox]\nenvlist = py,lint\n[testenv:lint]\ncommands = ruff check\n",
+            "[tox]\nenvlist = py,lint\n[testenv:lint]\ncommands = ruff check\nignore_outcome = True\n",
+            "[testenv:lint] sets `ignore_outcome`",
+        ),
+        (
+            "tox.ini",
+            "[tox]\nenvlist = py,lint\n[testenv:lint]\ncommands = ruff check\n",
+            "[tox]\nenvlist = py\n[testenv:lint]\ncommands = ruff check\n",
+            "default envlist drops ['lint']",
+        ),
+        (
+            "tox.ini",
+            "[tox]\nenv_list = py{311,312}-django\n",
+            "[tox]\nenv_list = py312-django\n",
+            "drops ['py311-django']",
+        ),
+        # pytest: explicit testpaths where discovery used to start at the root
+        (
+            "pyproject.toml",
+            '[tool.pytest.ini_options]\naddopts = "-q"\n',
+            '[tool.pytest.ini_options]\naddopts = "-q"\ntestpaths = ["tests/unit"]\n',
+            "sets `testpaths",
+        ),
+        # JS: widening an existing filter's value
+        (
+            "playwright.config.ts",
+            "export default { testIgnore: ['**/exp/**'] }\n",
+            "export default { testIgnore: ['**/exp/**', '**/integration/**'] }\n",
+            "changes `testIgnore`",
+        ),
+        (
+            "package.json",
+            _package({"test": "jest"}, jest={"passWithNoTests": False}),
+            _package({"test": "jest"}, jest={"passWithNoTests": True}),
+            "changes `passWithNoTests`",
+        ),
+        # Cypress: per-mode retries, inline and multi-line
+        (
+            "cypress.config.ts",
+            "export default { retries: { runMode: 0, openMode: 2 } }\n",
+            "export default { retries: { runMode: 1, openMode: 2 } }\n",
+            "test retries",
+        ),
+        (
+            "cypress.config.ts",
+            "export default {\n  retries: {\n    runMode: 0,\n    openMode: 2,\n  },\n}\n",
+            "export default {\n  retries: {\n    runMode: 2,\n    openMode: 2,\n  },\n}\n",
+            "test retries",
+        ),
+        ("cypress.config.ts", "export default {}\n", "export default { retries: { runMode: 2 } }\n", "test retries"),
+    ],
+)
+def test_review_findings_are_rejected(path: str, before: str, after: str, expected: str) -> None:
+    problems = _problems(path, before, after)
+    assert any(expected in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        (
+            "Makefile",
+            "check:\n\tpytest\n\truff check .\nlint:\n\tmypy\n",
+            "check: lint\n\tpytest\nlint:\n\tmypy\n\truff check .\n",
+        ),
+        ("Makefile", "check:\n\tpytest\n\truff check .\n", "check:\n\tpytest\n\t$(MAKE) lint\nlint:\n\truff check .\n"),
+        ("Makefile", "CC = gcc\ntest:\n\t@pytest\n", "CC := gcc\ntest:\n\tpytest -n auto\n"),
+        (
+            "pyproject.toml",
+            '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+            '[tool.pytest.ini_options]\naddopts = "-q"\n',
+        ),
+        ("tox.ini", "[tox]\nenvlist = py\n", "[tox]\nenvlist = py,lint\n"),
+        (
+            "playwright.config.ts",
+            "export default { testIgnore: ['**/exp/**', '**/old/**'] }\n",
+            "export default { testIgnore: ['**/exp/**'] }\n",
+        ),
+        (
+            "cypress.config.ts",
+            "export default { retries: { runMode: 2, openMode: 2 } }\n",
+            "export default { retries: { runMode: 1, openMode: 2 } }\n",
+        ),
+        ("cypress.config.ts", "export default { retries: 2 }\n", "export default {}\n"),
+    ],
+)
+def test_review_safe_counterparts_pass(path: str, before: str, after: str) -> None:
+    assert _problems(path, before, after) == []

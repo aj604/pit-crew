@@ -12,6 +12,7 @@ import json
 import re
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -20,8 +21,14 @@ from pit_crew.lanes.optimizer.validate import WEAKENING_FLAGS, GuardReport, chec
 Checker = Callable[[str, str], list[str]]
 
 _JS_TEST_CONFIG = re.compile(r"^(?:playwright|vitest|jest|cypress)\.config\.")
-_RETRIES = re.compile(r"retries\b[^\n]{0,60}")
+_RETRIES = re.compile(r"['\"]?\bretries\b['\"]?\s*:\s*(\{[^}]*\}|[^,\n}]+)")
 _NUMBER = re.compile(r"\d+")
+_BOOLEAN_NARROWING_KEYS = frozenset({"passWithNoTests"})
+_TRUTHY = frozenset({"true", "1", "yes", "on"})
+_BRACES = re.compile(r"\{([^{}]*)\}")
+_MAKE_RULE = re.compile(r"^([^\s:=#][^:=#]*?)\s*::?(?!=)\s*(.*)$")
+_MAKE_CALL = re.compile(r"(?:\$\(MAKE\)|\$\{MAKE\}|^make)\s+(?:-\S+\s+)*([A-Za-z0-9_.-]+)")
+_MAKE_UNRESOLVED = re.compile(r"^\s*(?:-?include|sinclude)\s|\$\(eval\b", re.MULTILINE)
 _RECORDING = re.compile(r"\b(video|screenshot|trace)\s*:\s*['\"]?([A-Za-z-]+)")
 # Keys that, when added, make a JS test runner collect or fail on fewer tests.
 _JS_NARROWING_KEYS = (
@@ -136,7 +143,7 @@ def _package_json(before: str, after: str) -> list[str]:
             where = f'script "{name}"'
             problems += _commands_kept(where, [str(command)], [str(new_scripts[name])])
             problems += _flags_added(where, str(command), str(new_scripts[name]))
-    problems += _js_narrowing("jest config", json.dumps(old.get("jest", "")), json.dumps(new.get("jest", "")))
+    problems += _js_narrowing("jest config", json.dumps(old.get("jest", {})), json.dumps(new.get("jest", {})))
     return problems
 
 
@@ -168,7 +175,7 @@ def _pyproject(before: str, after: str) -> list[str]:
 def _pytest_options(where: str, old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
     old_opts, new_opts = " ".join(_words(old.get("addopts"))), " ".join(_words(new.get("addopts")))
     problems = _flags_added(f"{where} addopts", old_opts, new_opts)
-    problems += _values_lost(f"{where} testpaths", _words(old.get("testpaths")), _words(new.get("testpaths")))
+    problems += _discovery(where, _words(old.get("testpaths")), _words(new.get("testpaths")))
     added = set(_words(new.get("norecursedirs"))) - set(_words(old.get("norecursedirs")))
     if added:
         problems.append(f"{where} stops collecting {sorted(added)}")
@@ -178,6 +185,15 @@ def _pytest_options(where: str, old: Mapping[str, Any], new: Mapping[str, Any]) 
         if _words(old.get(key)) != _words(new.get(key))
     ]
     return problems
+
+
+def _discovery(where: str, before: list[str], after: list[str]) -> list[str]:
+    """Without `testpaths`, pytest discovers from where it runs: setting it can only narrow that."""
+    if not after:
+        return []
+    if not before:
+        return [f"{where} sets `testpaths = {after}`, so tests outside them are no longer discovered"]
+    return _values_lost(f"{where} testpaths", before, after)
 
 
 def _ini(text: str) -> configparser.ConfigParser:
@@ -203,6 +219,7 @@ def _tox_ini(before: str, after: str) -> list[str]:
     problems = _pytest_options(
         "pytest", _ini_section(old, "pytest", "tool:pytest"), _ini_section(new, "pytest", "tool:pytest")
     )
+    problems += _values_lost("tox's default envlist", _envlist(old), _envlist(new))
     for section in old.sections():
         if not section.startswith("testenv"):
             continue
@@ -210,7 +227,50 @@ def _tox_ini(before: str, after: str) -> list[str]:
         after_commands = run_lines(new.get(section, "commands", fallback="")) if new.has_section(section) else []
         problems += _commands_kept(f"[{section}] commands", before_commands, after_commands)
         problems += _flags_added(f"[{section}] commands", "\n".join(before_commands), "\n".join(after_commands))
+    envs = {
+        "testenv",
+        *(s for s in old.sections() if s.startswith("testenv:")),
+        *(f"testenv:{e}" for e in _envlist(old)),
+    }
+    problems += [
+        f"[{section}] sets `ignore_outcome`, so its failures no longer fail tox"
+        for section in sorted(envs)
+        if _ignores_outcome(new, section) and not _ignores_outcome(old, section)
+    ]
     return problems
+
+
+def _envlist(parser: configparser.ConfigParser) -> list[str]:
+    """The environments a bare `tox` runs, with factors like `py{311,312}-lint` expanded."""
+    raw: str = parser.get("tox", "envlist", fallback="") or parser.get("tox", "env_list", fallback="")
+    return [env for token in _split_top_level(raw) for env in _expand_braces(token)]
+
+
+def _split_top_level(text: str) -> list[str]:
+    tokens, depth, current = [], 0, ""
+    for char in text:
+        depth += (char == "{") - (char == "}")
+        if depth == 0 and (char == "," or char.isspace()):
+            tokens.append(current)
+            current = ""
+        else:
+            current += char
+    return [t for t in (*tokens, current) if t]
+
+
+def _expand_braces(token: str) -> list[str]:
+    match = _BRACES.search(token)
+    if match is None:
+        return [token]
+    head, tail = token[: match.start()], token[match.end() :]
+    return [env for part in match.group(1).split(",") for env in _expand_braces(head + part.strip() + tail)]
+
+
+def _ignores_outcome(parser: configparser.ConfigParser, section: str) -> bool:
+    """`ignore_outcome` for an environment, inherited from [testenv] when the section does not set it."""
+    base = parser.get("testenv", "ignore_outcome", fallback="false")
+    value = parser.get(section, "ignore_outcome", fallback=base) if parser.has_section(section) else base
+    return value.strip().lower() in _TRUTHY
 
 
 def _noxfile(before: str, after: str) -> list[str]:
@@ -223,18 +283,77 @@ def _noxfile(before: str, after: str) -> list[str]:
 # --- Makefile ------------------------------------------------------------------------------
 
 
+@dataclass
+class _Rule:
+    prerequisites: list[str] = field(default_factory=list)
+    recipe: list[str] = field(default_factory=list)
+
+
 def _makefile(before: str, after: str) -> list[str]:
-    old, new = _recipes(before), _recipes(after)
-    problems = _commands_kept("recipe", old, new)
-    problems += _flags_added("recipe", "\n".join(old), "\n".join(new))
-    if sum(line.startswith("-") for line in new) > sum(line.startswith("-") for line in old):
+    """Each target must still run its checks, itself or through prerequisites and `$(MAKE) x` calls."""
+    old, new = _rules(before), _rules(after)
+    problems: list[str] = []
+    for target in old:
+        if not target.startswith("."):
+            problems += _commands_kept(f"`make {target}`", _reachable(old, target), _reachable(new, target))
+    old_lines = [line for rule in old.values() for line in rule.recipe]
+    new_lines = [line for rule in new.values() for line in rule.recipe]
+    problems += _flags_added("recipe", "\n".join(old_lines), "\n".join(new_lines))
+    if sum(line.startswith("-") for line in new_lines) > sum(line.startswith("-") for line in old_lines):
         problems.append("adds a recipe line starting with `-`, which ignores its failure")
+    problems += _make_specials(old, new)
+    if len(_MAKE_UNRESOLVED.findall(after)) > len(_MAKE_UNRESOLVED.findall(before)):
+        problems.append("adds `include` or `$(eval ...)`, which the guard cannot follow")
+    return list(dict.fromkeys(problems))
+
+
+def _rules(text: str) -> dict[str, _Rule]:
+    rules: dict[str, _Rule] = {}
+    current: list[_Rule] = []
+    for line in text.splitlines():
+        if line.startswith("\t"):
+            command = " ".join(line.strip().lstrip("@").split())  # `@` only silences echoing
+            for rule in current:
+                rule.recipe.append(command)
+            continue
+        match = _MAKE_RULE.match(line)
+        if match is None:
+            if line.strip() and not line.startswith(" "):
+                current = []  # a variable assignment or directive ends the previous rule
+            continue
+        prerequisites = [] if "=" in match.group(2) else match.group(2).split(";", 1)[0].split()
+        current = [rules.setdefault(target, _Rule()) for target in match.group(1).split()]
+        for rule in current:
+            rule.prerequisites += prerequisites
+    return rules
+
+
+def _reachable(rules: Mapping[str, _Rule], target: str) -> list[str]:
+    """Recipe lines `make target` runs: its own, its prerequisites', and targets it calls with $(MAKE)."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    stack = [target]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in rules:
+            continue
+        seen.add(name)
+        lines += rules[name].recipe
+        stack += rules[name].prerequisites
+        stack += [call.group(1) for line in rules[name].recipe if (call := _MAKE_CALL.search(line))]
+    return lines
+
+
+def _make_specials(old: Mapping[str, _Rule], new: Mapping[str, _Rule]) -> list[str]:
+    problems = []
+    if ".IGNORE" in new:
+        before = set(old[".IGNORE"].prerequisites) if ".IGNORE" in old else None
+        after = set(new[".IGNORE"].prerequisites)
+        if before is None or (before and (not after or after - before)):
+            problems.append("adds `.IGNORE`, which makes recipe failures nonfatal")
+    if ".ONESHELL" in new and ".ONESHELL" not in old:
+        problems.append("adds `.ONESHELL`, so only the last line of a recipe decides whether it fails")
     return problems
-
-
-def _recipes(text: str) -> list[str]:
-    """Recipe command lines with make's `@` (silent) prefix removed; a `-` prefix is kept."""
-    return [" ".join(line.strip().lstrip("@").split()) for line in text.splitlines() if line.startswith("\t")]
 
 
 # --- Cargo.toml ----------------------------------------------------------------------------
@@ -263,8 +382,7 @@ def _target_names(data: Mapping[str, Any], kind: str) -> list[str]:
 
 def _js_test_config(before: str, after: str) -> list[str]:
     problems = _js_narrowing("test config", before, after)
-    if _max_retries(after) > _max_retries(before):
-        problems.append("raises test retries; a test that needs a retry has a bug")
+    problems += _retries_raised(before, after)
     if sorted(_JS_COLLECTION_KEY.findall(before)) != sorted(_JS_COLLECTION_KEY.findall(after)):
         problems.append("changes which test files are collected")
     if _recordings_on(after) < _recordings_on(before):
@@ -273,20 +391,56 @@ def _js_test_config(before: str, after: str) -> list[str]:
 
 
 def _js_narrowing(where: str, before: str, after: str) -> list[str]:
-    problems = [
-        f"{where} adds `{key}`, which runs or fails on fewer tests"
-        for key in _JS_NARROWING_KEYS
-        if _key_count(after, key) > _key_count(before, key)
-    ]
+    """Filter keys that are added, or whose values change: any new value may select fewer tests."""
+    problems = []
+    for key in _JS_NARROWING_KEYS:
+        old, new = _values_of(before, key), _values_of(after, key)
+        if key in _BOOLEAN_NARROWING_KEYS:
+            changed = new.count("true") > old.count("true")
+        else:  # compare array entries one by one, so removing an ignore pattern is fine
+            changed = bool(_atoms(new) - _atoms(old))
+        if changed:
+            verb = "adds" if len(new) > len(old) else "changes"
+            problems.append(f"{where} {verb} `{key}`, which can run or fail on fewer tests")
     return problems + _flags_added(where, before, after)
 
 
-def _key_count(text: str, key: str) -> int:
-    return len(re.findall(rf"['\"]?\b{key}\b['\"]?\s*:", text))
+def _values_of(text: str, key: str) -> list[str]:
+    """Each value assigned to ``key`` (arrays and objects whole), whitespace-normalized."""
+    pattern = rf"['\"]?\b{key}\b['\"]?\s*:\s*(\[[^\]]*\]|\{{[^}}]*\}}|[^,\n}}]+)"
+    return [" ".join(value.split()).rstrip(",") for value in re.findall(pattern, text)]
 
 
-def _max_retries(text: str) -> int:
-    return max((int(n) for m in _RETRIES.findall(text) for n in _NUMBER.findall(m)), default=0)
+def _atoms(values: Iterable[str]) -> set[str]:
+    """Array values split into entries; other values whole."""
+    atoms: set[str] = set()
+    for value in values:
+        if value.startswith("[") and value.endswith("]"):
+            atoms.update(entry.strip().strip("'\"") for entry in value[1:-1].split(",") if entry.strip())
+        else:
+            atoms.add(value)
+    return atoms
+
+
+def _retries_raised(before: str, after: str) -> list[str]:
+    """Retry settings may stay, go away, or come down number for number; anything else is a raise.
+
+    Cypress sets `runMode` and `openMode` separately, so each number is compared in place rather
+    than taking a maximum; a changed expression that cannot be compared counts as a raise.
+    """
+    old = [" ".join(v.split()) for v in _RETRIES.findall(before)]
+    new = [" ".join(v.split()) for v in _RETRIES.findall(after)]
+    if not new or new == old:
+        return []
+    if len(new) == len(old) and all(_not_higher(o, n) for o, n in zip(old, new, strict=True)):
+        return []
+    return ["raises or changes test retries; a test that needs a retry has a bug"]
+
+
+def _not_higher(before: str, after: str) -> bool:
+    same_shape = _NUMBER.sub("#", before) == _NUMBER.sub("#", after)
+    pairs = zip(_NUMBER.findall(before), _NUMBER.findall(after), strict=False)
+    return same_shape and all(int(n) <= int(o) for o, n in pairs)
 
 
 def _recordings_on(text: str) -> int:
