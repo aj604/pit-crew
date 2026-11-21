@@ -31,10 +31,10 @@ ${steps}
 `;
 
 const bugCases = (prefix) => [
-  { kind: "commit", reason: "historical red commit: cart total rounding", commit_sha: `${prefix}1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4`, mutated_files: {}, artifact_ref: null },
-  { kind: "commit", reason: "historical red commit: coupon double-apply", commit_sha: `${prefix}9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c5`, mutated_files: {}, artifact_ref: null },
-  { kind: "mutation", reason: "flip tax rate boundary", commit_sha: null, mutated_files: { "app/tax.py": "RATE = 0.0\n" }, artifact_ref: "proof/tax-mutation.log" },
-  { kind: "mutation", reason: "drop inventory check", commit_sha: null, mutated_files: { "app/stock.py": "def in_stock(sku):\n    return True\n" }, artifact_ref: "proof/stock-mutation.log" },
+  { kind: "commit", reason: "historical red commit: cart total rounding", commit_sha: `${prefix}1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4`, mutated_files: {}, artifact_ref: null, expected_checks: [] },
+  { kind: "commit", reason: "historical red commit: coupon double-apply", commit_sha: `${prefix}9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c5`, mutated_files: {}, artifact_ref: null, expected_checks: [] },
+  { kind: "mutation", reason: "flip tax rate boundary", commit_sha: null, mutated_files: { "app/tax.py": "RATE = 0.0\n" }, artifact_ref: "proof/tax-mutation.log", expected_checks: [] },
+  { kind: "mutation", reason: "drop inventory check", commit_sha: null, mutated_files: { "app/stock.py": "def in_stock(sku):\n    return True\n" }, artifact_ref: "proof/stock-mutation.log", expected_checks: [] },
 ];
 
 function buildScenario(spec) {
