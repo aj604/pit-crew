@@ -19,6 +19,8 @@ def rate(evidence: Evidence) -> Verdict:
     def verdict(keep: bool, reason: str, speedup: float = 0.0, p: float | None = None) -> Verdict:
         return Verdict(evidence.candidate_id, keep, speedup, p, reason)
 
+    if evidence.bugs_total == 0:
+        return verdict(False, "no bugs replayed, so safety is unproven")
     if evidence.bugs_caught < evidence.bugs_total:
         return verdict(False, f"caught {evidence.bugs_caught}/{evidence.bugs_total} bugs")
     if min(len(base), len(cand)) < MIN_RUNS:

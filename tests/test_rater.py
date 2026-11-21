@@ -32,3 +32,7 @@ def test_rejects_a_slower_candidate():
 
 def test_rejects_too_few_runs():
     assert not rate(evidence(baseline=SLOW[:3], candidate=FAST[:3])).keep
+
+
+def test_rejects_a_candidate_with_no_bugs_replayed():
+    assert not rate(evidence(bugs_total=0, bugs_caught=0)).keep
