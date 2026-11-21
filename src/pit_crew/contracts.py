@@ -70,7 +70,7 @@ class InvalidHypothesisError(ValueError):
 
 
 class InvalidBugCaseError(ValueError):
-    """Raised when a BugCase is missing required commit or mutation fields."""
+    """Raised when a BugCase is missing required commit or mutation fields or has invalid expected_checks."""
 
     @classmethod
     def unknown_kind(cls, kind: str) -> "InvalidBugCaseError":
@@ -86,6 +86,29 @@ class InvalidBugCaseError(ValueError):
     def missing_mutations(cls) -> "InvalidBugCaseError":
         """Build error when a mutation BugCase omits mutated_files."""
         return cls("mutation BugCase requires non-empty mutated_files")
+
+    @classmethod
+    def invalid_expected_checks(cls, checks: object) -> "InvalidBugCaseError":
+        """Build error when expected_checks is not a tuple of strings."""
+        return cls(f"BugCase.expected_checks must be a tuple of non-empty strings, got {checks!r}")
+
+    @classmethod
+    def invalid_expected_check(cls, check: object) -> "InvalidBugCaseError":
+        """Build error when an expected_checks entry is empty or not a string."""
+        return cls(f"BugCase.expected_checks entries must be non-empty strings, got {check!r}")
+
+
+def _validate_expected_checks(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, tuple):
+        raise InvalidBugCaseError.invalid_expected_checks(raw)
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise InvalidBugCaseError.invalid_expected_check(item)
+        stripped = item.strip()
+        if stripped not in cleaned:
+            cleaned.append(stripped)
+    return tuple(cleaned)
 
 
 def _id() -> str:
@@ -171,13 +194,19 @@ class Candidate:
 
 @dataclass(frozen=True)
 class BugCase:
-    """One historical red commit or synthetic file mutation to replay against a candidate."""
+    """One historical red commit or synthetic file mutation to replay against a candidate.
+
+    `expected_checks` holds the CI check keys (for example a job's id and display-name aliases
+    such as `("CI/test", "CI/Unit tests")`, or every check a multi-check red commit failed on)
+    expected to fail when this case is replayed. Empty when unspecified.
+    """
 
     kind: str  # "commit" or "mutation"
     reason: str = ""
     commit_sha: str | None = None
     mutated_files: dict[str, str] = field(default_factory=dict)
     artifact_ref: str | None = None  # screenshot / Playwright trace / build artifact inspected by Proof
+    expected_checks: tuple[str, ...] = ()  # check keys expected to fail on replay; empty if unspecified
 
     def __post_init__(self) -> None:
         """Validate required fields for commit vs. mutation replay cases."""
@@ -187,6 +216,9 @@ class BugCase:
             raise InvalidBugCaseError.missing_commit_sha()
         if self.kind == "mutation" and not self.mutated_files:
             raise InvalidBugCaseError.missing_mutations()
+        cleaned = _validate_expected_checks(self.expected_checks)
+        if cleaned != self.expected_checks:
+            object.__setattr__(self, "expected_checks", cleaned)
 
 
 @dataclass(frozen=True)

@@ -102,7 +102,7 @@ All cross-lane state is represented by five frozen dataclasses:
 |---|---|---|---|
 | `Hypothesis` | Analysis | Dispatcher, Optimizer | `repo`, `description`, `skill` (one of `PLAYBOOK_SKILLS`), `expected_savings_seconds`, `id`, `base_sha`, `workflow_path`, `job`, `step`, `bucket` (`waiting`/`setup`/`running`), `evidence`, `confidence`, `risk` |
 | `Candidate` | Optimizer | Dispatcher, Proof | `hypothesis_id`, `branch`, `summary`, `id` |
-| `ReplayPlan` | Proof | Dispatcher | `candidate_id`, `bug_shas`, `id` |
+| `ReplayPlan` | Proof | Dispatcher | `candidate_id`, `bug_shas`, `cases` (`BugCase`: `kind`, `commit_sha`, `mutated_files`, `expected_checks`, `artifact_ref`, `reason`), `id` |
 | `Evidence` | Dispatcher (code) | Rater | `candidate_id`, `baseline_seconds`, `candidate_seconds`, `bugs_total`, `bugs_caught`, `id` |
 | `Verdict` | Rater (code) | Dispatcher, Optimizer (history) | `candidate_id`, `keep`, `speedup`, `p_value`, `reason`, `id` |
 
@@ -120,5 +120,5 @@ All cross-lane state is represented by five frozen dataclasses:
    - `proof`: **`gemini-4-carbon`** (adversarial & multimodal failure artifact inspection via base64-mounted screenshots/traces under `/workspace/.pit-crew/artifacts/`).
 2. **Zero-Secret Sandbox & Candidate Coordinates:** All untrusted repo/log/image inspection runs inside Google's remote sandbox. `GITHUB_TOKEN` stays on the Dispatcher host. `Candidate` carries `repo`, `base_sha`, `head_sha`, `files`, and `changed_files`, validated by `contracts.is_allowed_candidate_path()` (`.github/**` and runner configs only).
 3. **Compounding Pit Stops Toward 60s / 120s SLA (`rater.py`):** Target repo CI goal is **`median <= 60s` and `p95 <= 120s`**. Any candidate achieving `speedup >= 1.05x` (`MIN_SPEEDUP`), `p <= 0.05` (exact permutation up to 10 runs/side, deterministic Monte Carlo above 10, including cold Run #1 across 5 staggered pairs), and `100%` bugs caught is kept (`keep=True`) and promoted as the new `base_sha` until `Verdict.sla_met` is `True`.
-4. **Dual Replay Plan (`BugCase` in `ReplayPlan`):** Supports both historical red SHAs (`kind="commit"`) via 3-way overlay of Candidate files onto `bug_sha` and synthetic mutations (`kind="mutation"`, `mutated_files`) verified to fail Baseline so dud mutations cannot game Rater.
+4. **Dual Replay Plan (`BugCase` in `ReplayPlan`):** Supports both historical red SHAs (`kind="commit"`) via 3-way overlay of Candidate files onto `bug_sha` and synthetic mutations (`kind="mutation"`, `mutated_files`) verified to fail Baseline so dud mutations cannot game Rater; each `BugCase` can carry `expected_checks` so replays verify the expected CI check(s) failed.
 5. **Runtime, Storage & UI:** Single FastAPI service (`workflow_run` webhooks + live Pit Wall UI + PR SVG/PNG charts) backed by WAL-mode `SqliteLedger` (`ledger.prior_attempts(repo)`, `ledger.latest_kept_candidate(repo)`) and in-process `@tool` gates via the Interactions API `requires_action` loop.

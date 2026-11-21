@@ -250,10 +250,18 @@ def _deserialize[R: Record](kind: type[R], data: dict[str, Any]) -> R:
         data["changed_files"] = tuple(data.get("changed_files", ()))
     elif kind is ReplayPlan:
         data["bug_shas"] = tuple(data.get("bug_shas", ()))
-        data["cases"] = tuple(BugCase(**case) for case in data.get("cases", ()))
+        data["cases"] = tuple(_deserialize_bug_case(case) for case in data.get("cases", ()))
     elif kind is Evidence:
         data["baseline_seconds"] = tuple(data["baseline_seconds"])
         data["candidate_seconds"] = tuple(data["candidate_seconds"])
         data["run_urls"] = tuple(data.get("run_urls", ()))
         data["bug_outcomes"] = tuple(data.get("bug_outcomes", ()))
     return kind(**data)
+
+
+def _deserialize_bug_case(data: dict[str, Any]) -> BugCase:
+    case = dict(data)
+    raw_checks = case.get("expected_checks")
+    if isinstance(raw_checks, list):
+        case["expected_checks"] = tuple(raw_checks)
+    return BugCase(**case)
