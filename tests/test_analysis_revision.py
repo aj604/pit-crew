@@ -1,0 +1,198 @@
+"""Only runs of the exact workflow file in the checkout are profiled."""
+
+import io
+import json
+import urllib.error
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from pit_crew import tools
+from pit_crew.lanes.analysis import history
+from pit_crew.ledger import InMemoryLedger
+from pit_crew.managed_agent import build_request
+
+REPO = "acme/app"
+T0 = datetime(2026, 11, 1, tzinfo=UTC)
+
+CHECKOUT = """name: CI
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run checks
+        run: pytest
+"""
+OTHER = CHECKOUT.replace("run: pytest", "run: python -m build")
+
+MATCH_NEW, MATCH_OLD, OTHER_NEWEST, GONE = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+
+
+def at(seconds: float) -> str:
+    return (T0 + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def make_run(run_id: int, head_sha: str, day: int, checks_seconds: float) -> dict[str, Any]:
+    start = day * 86400
+    steps = [("Run checks", checks_seconds)]
+    return {
+        "id": run_id,
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "head_branch": "main",
+        "head_sha": head_sha,
+        "conclusion": "success",
+        "run_attempt": 1,
+        "run_started_at": at(start),
+        "jobs": [
+            {
+                "id": run_id,
+                "name": "test",
+                "run_attempt": 1,
+                "conclusion": "success",
+                "created_at": at(start),
+                "started_at": at(start),
+                "completed_at": at(start + checks_seconds),
+                "labels": [],
+                "steps": [
+                    {
+                        "number": i,
+                        "name": n,
+                        "conclusion": "success",
+                        "started_at": at(start),
+                        "completed_at": at(start + s),
+                    }
+                    for i, (n, s) in enumerate(steps, 1)
+                ],
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_text(CHECKOUT)
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
+    build_request("analysis", "")
+
+
+def patch_history(monkeypatch: pytest.MonkeyPatch, raw: list[dict[str, Any]], blobs: dict[str, str | None]) -> None:
+    monkeypatch.setattr(history, "fetch_history", lambda *_a, **_k: raw)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: {r: blobs[r] for r in refs})
+
+
+def mixed_history() -> list[dict[str, Any]]:
+    """The newest run is of another revision, whose "Run checks" builds for 200 s."""
+    return [
+        make_run(4, OTHER_NEWEST, 4, 200),
+        make_run(3, MATCH_NEW, 3, 100),
+        make_run(2, MATCH_OLD, 2, 110),
+        make_run(1, OTHER_NEWEST, 1, 200),
+    ]
+
+
+@pytest.mark.usefixtures("checkout")
+def test_only_runs_of_the_checkouts_workflow_file_are_profiled(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    blobs: dict[str, str | None] = {MATCH_NEW: local, MATCH_OLD: local, OTHER_NEWEST: history.workflow_blob_sha(OTHER)}
+    patch_history(monkeypatch, mixed_history(), blobs)
+    ledger = InMemoryLedger()
+
+    ci = tools.call("profile_ci", ledger, {"repo": REPO, "workflow": "ci.yml"})
+    found = tools.call("find_bottlenecks", ledger, {"repo": REPO, "workflow": "ci.yml"})
+
+    json.dumps(found)
+    assert ci["runs_analyzed"] == 2
+    assert ci["runs_excluded_revision"] == 2
+    assert ci["steps"][0]["median_seconds"] == pytest.approx(105)  # not pulled towards the 200 s build
+    assert found["profile_summary"]["runs_analyzed"] == 2
+    assert found["profile_summary"]["runs_excluded_revision"] == 2
+    assert found["profile_summary"]["base_sha"] == MATCH_NEW  # the newest matching run, not the newest run
+
+
+@pytest.mark.usefixtures("checkout")
+def test_no_matching_run_gives_no_findings_and_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    other = history.workflow_blob_sha(OTHER)
+    patch_history(monkeypatch, mixed_history()[:1] + mixed_history()[3:], {OTHER_NEWEST: other})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["findings"] == []
+    assert result["profile_summary"]["runs_analyzed"] == 0
+    assert result["profile_summary"]["runs_excluded_revision"] == 2
+    assert result["profile_summary"]["base_sha"] == ""
+    assert len(result["uncovered"]) == 1
+    assert "exact workflow file" in result["uncovered"][0]
+    assert "branch" in result["uncovered"][0]
+
+
+def test_workflow_blob_sha_matches_git_hash_object() -> None:
+    # printf 'name: CI\njobs: {}\n' | git hash-object --stdin
+    assert history.workflow_blob_sha("name: CI\njobs: {}\n") == "9c176ad8516f3333a7419f15c073bc624b91fcb5"
+    assert history.workflow_blob_sha("") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"  # the empty blob
+
+
+def http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.github.com/x", code, "err", None, io.BytesIO(b""))  # type: ignore[arg-type]
+
+
+def test_fetch_workflow_blob_shas_reads_the_contents_api_once_per_distinct_sha() -> None:
+    urls: list[str] = []
+
+    def get(url: str) -> tuple[Any, str | None]:
+        urls.append(url)
+        return {"sha": "f" * 40, "type": "file"}, None
+
+    found = history.fetch_workflow_blob_shas(
+        REPO, ".github/workflows/ci.yml", [MATCH_NEW, MATCH_NEW, MATCH_OLD, "main", "../x", ""], get=get
+    )
+
+    assert found == {MATCH_NEW: "f" * 40, MATCH_OLD: "f" * 40}  # non-SHA refs are skipped
+    assert sorted(urls) == [
+        f"https://api.github.com/repos/{REPO}/contents/.github/workflows/ci.yml?ref={sha}"
+        for sha in (MATCH_NEW, MATCH_OLD)
+    ]
+
+
+@pytest.mark.parametrize(
+    "path", [".github/workflows/../../etc/passwd", "ci.yml", ".github/workflows/.x.yml", "x/ci.yml"]
+)
+def test_fetch_workflow_blob_shas_rejects_paths_other_than_a_workflow_file(path: str) -> None:
+    with pytest.raises(ValueError, match="path must be"):
+        history.fetch_workflow_blob_shas(REPO, path, [MATCH_NEW], get=lambda _u: pytest.fail("must not fetch"))
+
+
+def test_a_404_for_one_ref_is_a_missing_file_not_a_failure() -> None:
+    def get(url: str) -> tuple[Any, str | None]:
+        if GONE in url:
+            raise http_error(404)
+        return {"sha": "f" * 40}, None
+
+    found = history.fetch_workflow_blob_shas(REPO, ".github/workflows/ci.yml", [MATCH_NEW, GONE], get=get)
+
+    assert found == {MATCH_NEW: "f" * 40, GONE: None}
+
+
+def test_other_http_errors_still_fail_loudly() -> None:
+    def get(_url: str) -> tuple[Any, str | None]:
+        raise http_error(403)
+
+    with pytest.raises(urllib.error.HTTPError):
+        history.fetch_workflow_blob_shas(REPO, ".github/workflows/ci.yml", [MATCH_NEW], get=get)
+
+
+@pytest.mark.usefixtures("checkout")
+def test_a_run_whose_file_is_missing_at_its_commit_is_excluded(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [make_run(2, MATCH_NEW, 2, 100), make_run(1, GONE, 1, 100)]
+    patch_history(monkeypatch, raw, {MATCH_NEW: local, GONE: None})
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["runs_analyzed"] == 1
+    assert result["runs_excluded_revision"] == 1

@@ -12,7 +12,9 @@ Input: a repository. Output: hypotheses, most valuable first.
    out bottlenecks already in the ledger, and returns `findings` ranked by
    `expected_savings_seconds`, biggest first, plus `uncovered` notes. Use `profile_ci` when you
    need the full per-job and per-step numbers behind a finding. When profiling without a local
-   checkout, pass `workflow_content` (and `ref` for a specific base commit) to `profile_ci`.
+   checkout, pass `workflow_content` (and `ref` for a specific base commit) to `profile_ci`. Only
+   runs of the exact workflow file in the checkout are analysed (`runs_excluded_revision` counts
+   the rest), and `base_sha` is the commit of the newest such run.
 2. Read each finding against the workflow file before recording it. Drop any finding that
    would remove or weaken a check: Pit Crew never checks less and never hides failures.
 3. Record the top 5 at most, highest `expected_savings_seconds` first, with `record_hypothesis`,

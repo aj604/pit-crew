@@ -442,6 +442,8 @@ def test_profile_ci_tool_reads_the_workspace_workflow(monkeypatch: pytest.Monkey
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
     raw = fastapi_raw()
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    blob = history.workflow_blob_sha((FIXTURES / "fastapi" / "test.yml").read_text())
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
 
     build_request("analysis", "")
     result = tools.call("profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml"})

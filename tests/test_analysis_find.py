@@ -72,6 +72,12 @@ def run(run_id: int) -> Raw:
     }
 
 
+def same_revision(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    """Make every run in the patched history count as having run the checkout's workflow file."""
+    blob = history.workflow_blob_sha(text)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
+
+
 @pytest.fixture
 def synthetic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
@@ -79,6 +85,7 @@ def synthetic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
     raw = [run(i) for i in range(1, 6)]
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    same_revision(monkeypatch, WORKFLOW)
     build_request("analysis", "")
 
 
@@ -106,6 +113,7 @@ def test_find_bottlenecks_ranks_findings() -> None:
         "critical_path_buckets",
         "biggest_bucket",
         "biggest_bucket_p95",
+        "runs_excluded_revision",
     }
 
 
@@ -125,6 +133,7 @@ def test_find_bottlenecks_reports_waiting_as_uncovered(monkeypatch: pytest.Monke
     with gzip.open(FIXTURES / "fastapi" / "runs.json.gz") as f:
         raw = json.load(f)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    same_revision(monkeypatch, (FIXTURES / "fastapi" / "test.yml").read_text())
 
     build_request("analysis", "")
     result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml"})

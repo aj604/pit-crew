@@ -6,7 +6,7 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 
 import math
 import re
-import urllib.error
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,34 +68,31 @@ def workflow_path(workflow: str) -> Path:
     return path
 
 
-def _load_workflow_and_history(  # noqa: PLR0913  mirrors profile_ci parameters
+def _load_workflow_text(  # noqa: PLR0913  mirrors profile_ci parameters
     repo: str,
     workflow: str,
-    *,
-    runs: int,
     branch: str | None,
+    raw: list[dict[str, Any]],
+    *,
     workflow_content: str | None,
     ref: str | None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Load workflow YAML and run history, falling back to a run's commit SHA if ``branch`` was deleted."""
-    if workflow_content is not None:
-        _validate_workflow_name(workflow)
-        return workflow_content, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+) -> str:
+    """The workflow file's text: the caller's, else the checkout's, else GitHub's at ``ref``/``branch``.
 
+    If ``branch`` was deleted (404) the file is read at the commit of a run in ``raw``. The text keeps the
+    file's exact bytes (line endings included) so its blob SHA matches GitHub's.
+    """
+    if workflow_content is not None:
+        return workflow_content
     path = workflow_path(workflow)
     if path.is_file():
-        return path.read_text(), history.fetch_history(repo, workflow, runs=runs, branch=branch)
-
-    fetch_ref = ref or branch
+        return path.read_bytes().decode()
     try:
-        yaml_text = history.fetch_workflow(repo, workflow, ref=fetch_ref)
+        return history.fetch_workflow(repo, workflow, ref=ref or branch)
     except urllib.error.HTTPError as exc:
         if ref is not None or branch is None or exc.code != _HTTP_NOT_FOUND:
             raise
-        raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
-        return _fetch_workflow_from_runs(repo, workflow, branch, raw), raw
-
-    return yaml_text, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+        return _fetch_workflow_from_runs(repo, workflow, branch, raw)
 
 
 def _fetch_workflow_from_runs(
@@ -155,7 +152,16 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
     wall-clock time any change to that job can save. Jobs with max_saving_seconds of 0 are off
     the critical path; speeding them up saves nothing. Also returns the slowest steps.
     """
-    return _profile_workflow(repo, workflow, runs, branch, workflow_content=workflow_content, ref=ref)[0].to_dict()
+    profiled = _profile_workflow(repo, workflow, runs, branch, workflow_content=workflow_content, ref=ref)
+    return {**profiled.ci.to_dict(), "runs_excluded_revision": profiled.excluded}
+
+
+@dataclass(frozen=True)
+class _Profiled:
+    ci: CIProfile
+    spec: Workflow
+    excluded: int  # runs dropped because their workflow file differs from the checkout's
+    matched: int  # runs whose workflow file is byte-identical to the checkout's
 
 
 def _profile_workflow(
@@ -166,21 +172,31 @@ def _profile_workflow(
     *,
     workflow_content: str | None = None,
     ref: str | None = None,
-) -> tuple[CIProfile, Workflow]:
-    """Validate the arguments, read the workflow file and its run history, and profile it."""
+) -> _Profiled:
+    """Validate the arguments, read the workflow file and its run history, and profile it.
+
+    Only runs whose workflow file is byte-identical to the checkout's are profiled: a run of another
+    revision may have a same-named step that runs a different command.
+    """
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    yaml_text, raw = _load_workflow_and_history(
-        repo,
-        workflow,
-        runs=runs,
-        branch=branch,
-        workflow_content=workflow_content,
-        ref=ref,
+    _validate_workflow_name(workflow)
+    raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
+    text = _load_workflow_text(repo, workflow, branch, raw, workflow_content=workflow_content, ref=ref)
+    spec = parse_workflow(text)
+    local = history.workflow_blob_sha(text)
+    remote = history.fetch_workflow_blob_shas(
+        repo, f".github/workflows/{workflow}", {str(r.get("head_sha", "")) for r in raw}
     )
-    spec = parse_workflow(yaml_text)
-    return profile(spec, history.parse_runs(raw)), spec
+    same = [r for r in raw if remote.get(str(r.get("head_sha", ""))) == local]
+    return _Profiled(profile(spec, history.parse_runs(same)), spec, len(raw) - len(same), len(same))
+
+
+_NO_MATCHING_REVISION = (
+    "No run in the history used this exact workflow file, so nothing can be measured against the checkout. "
+    "Analyse the branch the history comes from: check that branch out and pass it as `branch`."
+)
 
 
 def _uncovered(ci: CIProfile) -> list[str]:
@@ -225,10 +241,16 @@ def find_bottlenecks(
     already in the ledger are left out) and uncovered (time no playbook skill can shrink, such as
     runner queueing: report these).
     """
-    ci, spec = _profile_workflow(repo, workflow, runs, branch)
+    profiled = _profile_workflow(repo, workflow, runs, branch)
+    ci, spec = profiled.ci, profiled.spec
     path = f".github/workflows/{workflow}"
     seen = recorded_keys(ledger, repo)
-    found = keep_worthwhile(f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen)
+    no_match = profiled.matched == 0 and profiled.excluded > 0
+    found = (
+        []
+        if no_match
+        else keep_worthwhile(f for detect in DETECTORS for f in detect(ci, spec, path) if f.key not in seen)
+    )
     summary = ci.to_dict()
     return {
         "profile_summary": {
@@ -245,9 +267,10 @@ def find_bottlenecks(
                     "biggest_bucket_p95",
                 )
             },
+            "runs_excluded_revision": profiled.excluded,
         },
         "findings": [f.to_dict() for f in found],
-        "uncovered": _uncovered(ci),
+        "uncovered": [_NO_MATCHING_REVISION] if no_match else _uncovered(ci),
     }
 
 

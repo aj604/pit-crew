@@ -6,18 +6,19 @@
     GITHUB_TOKEN=... uv run python -m pit_crew.lanes.analysis.history fastapi/fastapi test.yml > runs.json
 """
 
-import base64
+import hashlib
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 API = "https://api.github.com"
 DEFAULT_RUNS = 150  # the architect's audit window
@@ -33,6 +34,11 @@ _JOB_FIELDS = (
     "created_at", "started_at", "completed_at", "labels", "runner_name",
 )  # fmt: skip
 _STEP_FIELDS = ("number", "name", "status", "conclusion", "started_at", "completed_at")
+
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+_HTTP_NOT_FOUND = 404
 
 # (url) -> (decoded JSON body, url of the next page or None)
 Getter = Callable[[str], tuple[Any, str | None]]
@@ -133,30 +139,47 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
 
 
-def fetch_workflow(
+def workflow_blob_sha(text: str) -> str:
+    """The git blob SHA-1 of `text` as UTF-8: what `git hash-object` prints and the contents API returns."""
+    data = text.encode()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+
+
+def fetch_workflow_blob_shas(
     repo: str,
-    workflow: str,
+    path: str,
+    refs: Iterable[str],
     *,
-    ref: str | None = None,
     token: str | None = None,
     get: Getter | None = None,
-) -> str:
-    """Fetch a workflow YAML file under ``.github/workflows/`` from GitHub's Contents API."""
-    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
-    url = f"{API}/repos/{repo}/contents/.github/workflows/{workflow}"
-    if ref:
-        url = f"{url}?{urlencode({'ref': ref})}"
-    body, _ = get(url)
-    content = body.get("content") if isinstance(body, dict) else None
-    if (
-        not isinstance(body, dict)
-        or body.get("type") != "file"
-        or body.get("encoding") != "base64"
-        or not isinstance(content, str)
-    ):
-        msg = f"unexpected GitHub contents response for {repo}/.github/workflows/{workflow}"
+) -> dict[str, str | None]:
+    """The git blob SHA of the workflow file at `path` for each distinct commit in `refs`.
+
+    A commit where the file does not exist (HTTP 404) maps to None. `path` must be a
+    `.github/workflows/<name>.yml` file and each ref a full 40-hex commit SHA; refs that are not
+    are skipped, so they are absent from the result. Other HTTP errors propagate.
+    """
+    if not _REPO.fullmatch(repo) or ".." in repo:
+        msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    return base64.b64decode(content).decode("utf-8")
+    if not _WORKFLOW_PATH.fullmatch(path) or path.startswith(".github/workflows/."):
+        msg = f"path must be .github/workflows/<name>.yml, got {path!r}"
+        raise ValueError(msg)
+    wanted = sorted({r for r in refs if _COMMIT_SHA.fullmatch(r)})
+    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
+
+    def blob(ref: str) -> str | None:
+        try:
+            body, _ = get(f"{API}/repos/{repo}/contents/{quote(path)}?ref={ref}")
+        except urllib.error.HTTPError as error:
+            if error.code == _HTTP_NOT_FOUND:
+                return None
+            raise
+        sha = body.get("sha") if isinstance(body, dict) else None  # a list means the path is a directory
+        return sha if isinstance(sha, str) else None
+
+    with ThreadPoolExecutor(max_workers=_JOB_FETCHERS) as pool:
+        return dict(zip(wanted, pool.map(blob, wanted), strict=True))
 
 
 def parse_runs(raw: list[dict[str, Any]]) -> list[WorkflowRun]:
