@@ -132,6 +132,7 @@ forbidden_modules = [
     "pit_crew.tools",
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
     "pit_crew.lanes",
 ]
@@ -144,6 +145,7 @@ forbidden_modules = [
     "pit_crew.ledger",
     "pit_crew.tools",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
     "pit_crew.lanes",
     "google",
@@ -156,7 +158,19 @@ source_modules = ["pit_crew.lanes"]
 forbidden_modules = [
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.managed_agent",
+    "google",
+]
+
+[[tool.importlinter.contracts]]
+name = "GitHub client boundary does not import lanes or agent layers"
+type = "forbidden"
+source_modules = ["pit_crew.github"]
+forbidden_modules = [
+    "pit_crew.dispatcher",
+    "pit_crew.managed_agent",
+    "pit_crew.lanes",
     "google",
 ]
 
@@ -169,6 +183,7 @@ source_modules = [
     "pit_crew.tools",
     "pit_crew.rater",
     "pit_crew.dispatcher",
+    "pit_crew.github",
     "pit_crew.lanes",
 ]
 forbidden_modules = ["google"]
