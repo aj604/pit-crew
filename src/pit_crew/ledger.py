@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol, override
@@ -36,6 +38,15 @@ class Ledger(Protocol):
         """Return the most recent kept ``Candidate`` for ``repo``, if any."""
         ...
 
+    def records_for_repo(self, repo: str) -> dict[str, list[dict[str, Any]]]:
+        """Return all ledger records scoped to ``repo`` grouped by record type."""
+        ...
+
+
+def _normalize_repo(repo: str) -> str:
+    """Normalize a repository identifier for case-insensitive matching."""
+    return repo.strip().lower()
+
 
 class _QueryMixin:
     """Shared read queries built on ``all()`` so every Ledger backend behaves identically."""
@@ -45,10 +56,12 @@ class _QueryMixin:
 
     def hypotheses_for_repo(self, repo: str) -> list[Hypothesis]:
         """Return every ``Hypothesis`` recorded for ``repo``."""
-        return [h for h in self.all(Hypothesis) if h.repo == repo]
+        repo_key = _normalize_repo(repo)
+        return [h for h in self.all(Hypothesis) if _normalize_repo(h.repo) == repo_key]
 
     def prior_attempts(self, repo: str) -> list[dict[str, Any]]:
         """History of hypotheses, candidates and verdicts for ``repo`` (oldest first)."""
+        repo_key = _normalize_repo(repo)
         hypotheses = {h.id: h for h in self.hypotheses_for_repo(repo)}
         verdicts_by_candidate = {v.candidate_id: v for v in self.all(Verdict)}
 
@@ -56,7 +69,7 @@ class _QueryMixin:
         seen_hypotheses: set[str] = set()
         for cand in self.all(Candidate):
             hyp = hypotheses.get(cand.hypothesis_id)
-            if hyp is None and cand.repo != repo:
+            if hyp is None and _normalize_repo(cand.repo) != repo_key:
                 continue
             seen_hypotheses.add(cand.hypothesis_id)
             verdict = verdicts_by_candidate.get(cand.id)
@@ -69,13 +82,34 @@ class _QueryMixin:
 
     def latest_kept_candidate(self, repo: str) -> Candidate | None:
         """Most recent kept Candidate for ``repo``, used to advance ``base_sha`` when compounding."""
+        repo_key = _normalize_repo(repo)
         hypotheses = {h.id for h in self.hypotheses_for_repo(repo)}
         kept_ids = {v.candidate_id for v in self.all(Verdict) if v.keep}
         latest: Candidate | None = None
         for cand in self.all(Candidate):
-            if cand.id in kept_ids and (cand.hypothesis_id in hypotheses or cand.repo == repo):
+            if cand.id in kept_ids and (cand.hypothesis_id in hypotheses or _normalize_repo(cand.repo) == repo_key):
                 latest = cand
         return latest
+
+    def records_for_repo(self, repo: str) -> dict[str, list[dict[str, Any]]]:
+        """Return all ledger records scoped to ``repo`` grouped by record type."""
+        repo_key = _normalize_repo(repo)
+        hypotheses = self.hypotheses_for_repo(repo)
+        hypothesis_ids = {h.id for h in hypotheses}
+        candidates = [
+            c for c in self.all(Candidate) if c.hypothesis_id in hypothesis_ids or _normalize_repo(c.repo) == repo_key
+        ]
+        candidate_ids = {c.id for c in candidates}
+        replay_plans = [p for p in self.all(ReplayPlan) if p.candidate_id in candidate_ids]
+        evidence = [e for e in self.all(Evidence) if e.candidate_id in candidate_ids]
+        verdicts = [v for v in self.all(Verdict) if v.candidate_id in candidate_ids]
+        return {
+            "hypotheses": [asdict(h) for h in hypotheses],
+            "candidates": [asdict(c) for c in candidates],
+            "replay_plans": [asdict(p) for p in replay_plans],
+            "evidence": [asdict(e) for e in evidence],
+            "verdicts": [asdict(v) for v in verdicts],
+        }
 
 
 def _attempt_dict(hyp: Hypothesis | None, cand: Candidate, verdict: Verdict | None) -> dict[str, Any]:
@@ -164,10 +198,16 @@ class SqliteLedger(_QueryMixin):
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection inside a transaction, then close it (``with conn`` alone never closes)."""
         conn = sqlite3.connect(self.path, timeout=5.0)
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def add(self, record: Record) -> None:
         """Persist or update ``record`` as JSON in SQLite."""
