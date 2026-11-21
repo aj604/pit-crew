@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, status
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.webhooks import create_github_webhook_router
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,8 @@ def create_app(
         ledger_kind = "sqlite" if isinstance(ledger, SqliteLedger) else "memory"
         return {"status": "ok", "ledger": ledger_kind}
 
+    app.include_router(create_github_webhook_router(webhook_secret=webhook_secret))
+
     @app.post("/triggers/cycle", status_code=status.HTTP_202_ACCEPTED)
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
         """Enqueue a background optimization cycle guarded by a per-repo lock."""
@@ -147,6 +150,11 @@ def create_app(
     def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
         """Return prior optimization attempts for a repository."""
         return ledger.prior_attempts(f"{owner}/{name}")
+
+    @app.get("/api/repos/{owner}/{name}/records")
+    def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
+        """Return structured ledger records for a repository."""
+        return ledger.records_for_repo(f"{owner}/{name}")
 
     @app.get("/api/repos/{owner}/{name}/status")
     def repo_status(owner: str, name: str) -> dict[str, Any]:
