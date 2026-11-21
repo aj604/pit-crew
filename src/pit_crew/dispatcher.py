@@ -34,6 +34,7 @@ from pit_crew.proof_bridge import (
     ReplayRunPair,
     ReplayVerification,
     build_replay_overlay,
+    resolve_workflow_check_aliases,
 )
 from pit_crew.rater import rate
 
@@ -769,21 +770,23 @@ class Dispatcher:
         ref_sha: str,
         files: dict[str, str],
         expected_checks: tuple[str, ...],
-    ) -> dict[str, str]:
-        if not self._record_replays:
-            return files
+    ) -> tuple[dict[str, str], tuple[str, ...]]:
         workflow_path = f".github/workflows/{target.workflow}"
         workflow_yaml = (
             files[workflow_path]
             if workflow_path in files
             else self.github.get_file_content(target.repo, workflow_path, ref_sha)
         )
-        return build_replay_overlay(
+        aliases = resolve_workflow_check_aliases(workflow_yaml, workflow_path, expected_checks)
+        if not self._record_replays:
+            return files, aliases
+        instrumented = build_replay_overlay(
             workflow_path,
             workflow_yaml,
             files,
             target_checks=expected_checks,
         )
+        return instrumented, aliases
 
     def _replay_bug_case(
         self,
@@ -899,7 +902,7 @@ class Dispatcher:
         idx: int,
     ) -> _BugReplayResult:
         check_name = _primary_check_name(bug_case, target.workflow)
-        base_files = self._instrument_replay_files(target, commit_sha, {}, bug_case.expected_checks)
+        base_files, base_aliases = self._instrument_replay_files(target, commit_sha, {}, bug_case.expected_checks)
         baseline_run = self._run_ephemeral_branch(
             target,
             _BranchReplaySpec(
@@ -918,6 +921,9 @@ class Dispatcher:
                 candidate_conclusion="skipped",
                 baseline_run_id=str(baseline_run.run_id),
                 candidate_run_id="",
+                baseline_run_url=baseline_run.html_url,
+                expected_checks=bug_case.expected_checks,
+                check_aliases=base_aliases,
             )
             meta = _ReplayPairMeta(
                 kind="commit",
@@ -941,7 +947,9 @@ class Dispatcher:
                 pair_meta=meta,
             )
 
-        cand_files = self._instrument_replay_files(target, commit_sha, overlay_files, bug_case.expected_checks)
+        cand_files, cand_aliases = self._instrument_replay_files(
+            target, commit_sha, overlay_files, bug_case.expected_checks
+        )
         candidate_run = self._run_ephemeral_branch(
             target,
             _BranchReplaySpec(
@@ -961,6 +969,10 @@ class Dispatcher:
             candidate_conclusion=candidate_run.conclusion or "",
             baseline_run_id=str(baseline_run.run_id),
             candidate_run_id=str(candidate_run.run_id),
+            baseline_run_url=baseline_run.html_url,
+            candidate_run_url=candidate_run.html_url,
+            expected_checks=bug_case.expected_checks,
+            check_aliases=tuple(dict.fromkeys((*base_aliases, *cand_aliases))),
         )
         meta = _ReplayPairMeta(
             kind="commit",
@@ -1002,7 +1014,7 @@ class Dispatcher:
         ref = bug_case.reason or ",".join(sorted(bug_case.mutated_files))
         check_name = _primary_check_name(bug_case, target.workflow)
         mutation_sha = f"mutation-{idx}"
-        base_files = self._instrument_replay_files(
+        base_files, base_aliases = self._instrument_replay_files(
             target,
             target.base_sha,
             dict(bug_case.mutated_files),
@@ -1027,6 +1039,9 @@ class Dispatcher:
                 candidate_conclusion="skipped",
                 baseline_run_id=str(baseline_run.run_id),
                 candidate_run_id="",
+                baseline_run_url=baseline_run.html_url,
+                expected_checks=bug_case.expected_checks,
+                check_aliases=base_aliases,
             )
             meta = _ReplayPairMeta(
                 kind="mutation",
@@ -1060,7 +1075,9 @@ class Dispatcher:
                 run_urls=tuple(run_urls),
             )
 
-        cand_files = self._instrument_replay_files(target, target.base_sha, overlay_files, bug_case.expected_checks)
+        cand_files, cand_aliases = self._instrument_replay_files(
+            target, target.base_sha, overlay_files, bug_case.expected_checks
+        )
         candidate_run = self._run_ephemeral_branch(
             target,
             _BranchReplaySpec(
@@ -1080,6 +1097,10 @@ class Dispatcher:
             candidate_conclusion=candidate_run.conclusion or "",
             baseline_run_id=str(baseline_run.run_id),
             candidate_run_id=str(candidate_run.run_id),
+            baseline_run_url=baseline_run.html_url,
+            candidate_run_url=candidate_run.html_url,
+            expected_checks=bug_case.expected_checks,
+            check_aliases=tuple(dict.fromkeys((*base_aliases, *cand_aliases))),
         )
         meta = _ReplayPairMeta(
             kind="mutation",

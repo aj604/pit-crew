@@ -1,22 +1,26 @@
 """Host-side GitHub boundary contract and ``httpx`` REST implementation.
 
-Defines ``WorkflowRunResult``, the ``GitHubClient``, ``CandidatePublisherClient``,
-and ``PullRequestClient`` protocols, and the concrete ``HttpxGitHubClient`` backed
-by GitHub's REST and Git Data APIs. Keeping the client and its bearer token
-strictly on the host allows the Dispatcher's orchestration, replay overlays,
-evidence collection, and compounding loop to be developed and tested completely
-offline without network calls or secrets.
+Defines ``WorkflowRunResult``, ``RunArtifact``, ``RunJob``, the ``GitHubClient``,
+``RunArtifactsClient``, ``CandidatePublisherClient``, and ``PullRequestClient`` protocols,
+and the concrete ``HttpxGitHubClient`` backed by GitHub's REST and Git Data APIs. Keeping
+the client and its bearer token strictly on the host allows the Dispatcher's orchestration,
+replay overlays, evidence collection, and compounding loop to be developed and tested
+completely offline without network calls or secrets.
 """
 
 import base64
+import io
+import json
 import os
+import re
 import time
-from collections.abc import Callable, Mapping
+import zipfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -24,14 +28,23 @@ DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_DISPATCH_POLL_ATTEMPTS = 10
 DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS = 1.0
+MAX_ARTIFACT_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB ZIP archive download cap
+DEFAULT_FAILED_LOG_MAX_BYTES = 262_144  # 256 KiB cap for failed job log excerpts
 API_VERSION = "2022-11-28"
 USER_AGENT = "pit-crew"
 _DISPATCH_RUN_LOOKUP_LIMIT = 5
 _HTTP_NO_CONTENT = 204
 _HTTP_NOT_FOUND = 404
-_HTTP_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECT_HOPS = 3
+_ARTIFACTS_PER_PAGE = "100"
 _REPLAY_ARTIFACT_PREFIX = "pit-crew-replay-"
 _FALLBACK_RECORDING_PREFIX = "failure-recordings-"
+_REPLAY_META_FILENAME = "replay-meta.json"
+_MAX_META_BYTES = 64 * 1024
+_MATRIX_SUFFIX = re.compile(r"\s*\(.*\)$")
+_SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_TRAILING_INDEX_RE = re.compile(r"-\d+$")
 
 
 def _utc_now() -> datetime:
@@ -68,6 +81,52 @@ class WorkflowRunResult:
     html_url: str
     head_sha: str
     head_branch: str
+
+
+@dataclass(frozen=True)
+class RunArtifact:
+    """Metadata for one GitHub Actions workflow run artifact."""
+
+    id: int
+    name: str
+    size_in_bytes: int
+    archive_download_url: str
+    expired: bool
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class RunJob:
+    """Outcome metadata for one job inside a GitHub Actions workflow run."""
+
+    id: int
+    name: str
+    conclusion: str | None
+    workflow_name: str = ""
+
+
+@runtime_checkable
+class RunArtifactsClient(Protocol):
+    """Reads GitHub Actions run artifacts and failed job logs for multimodal Proof verification."""
+
+    def list_run_artifacts(self, repo: str, run_id: int | str) -> list[RunArtifact]:
+        """List artifacts uploaded by workflow run ``run_id`` in ``repo``."""
+        ...
+
+    def download_artifact(self, repo: str, artifact_id: int) -> bytes:
+        """Download artifact ZIP archive bytes for ``artifact_id``, stripping auth on redirects."""
+        ...
+
+    def get_failed_job_logs(
+        self,
+        repo: str,
+        run_id: int | str,
+        *,
+        check: str | None = None,
+        max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
+    ) -> bytes:
+        """Download logs for failed jobs in workflow run ``run_id``, capped at ``max_bytes``."""
+        ...
 
 
 @runtime_checkable
@@ -254,19 +313,16 @@ class HttpxGitHubClient:
         repo: str,
         branch: str,
         base_sha: str,
-        files: dict[str, str],
+        files: Mapping[str, str | bytes],
         message: str,
     ) -> str:
-        """Create a commit on ``branch`` atop ``base_sha`` with ``files``; returns new ``head_sha``."""
+        """Create a commit on ``branch`` atop ``base_sha`` with text or binary ``files``; returns new ``head_sha``."""
         repo_path = _repo_path(repo)
         base_commit = self._request_json("GET", f"/repos/{repo_path}/git/commits/{quote(base_sha, safe='')}")
         base_tree_sha = _require_str(_require_dict(base_commit, "tree"), "sha")
 
         if files:
-            tree_entries = [
-                {"path": path, "mode": "100644", "type": "blob", "content": content}
-                for path, content in sorted(files.items())
-            ]
+            tree_entries = [self._build_tree_entry(repo_path, path, content) for path, content in sorted(files.items())]
             created_tree = self._request_json(
                 "POST",
                 f"/repos/{repo_path}/git/trees",
@@ -289,6 +345,21 @@ class HttpxGitHubClient:
             json_body={"sha": new_commit_sha},
         )
         return new_commit_sha
+
+    def _build_tree_entry(self, repo_path: str, path: str, content: str | bytes) -> dict[str, str]:
+        if isinstance(content, bytes):
+            created_blob = self._request_json(
+                "POST",
+                f"/repos/{repo_path}/git/blobs",
+                json_body={"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"},
+            )
+            return {
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": _require_str(created_blob, "sha"),
+            }
+        return {"path": path, "mode": "100644", "type": "blob", "content": content}
 
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
         """Trigger ``workflow_dispatch`` for ``workflow`` on ``ref`` and return the ``run_id``."""
@@ -403,44 +474,234 @@ class HttpxGitHubClient:
         )
         return _require_str(pr_data, "html_url")
 
-    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+    def list_run_artifacts(self, repo: str, run_id: int | str) -> list[RunArtifact]:
+        """List GitHub Actions artifacts uploaded by workflow run ``run_id`` in ``repo``."""
+        repo_path = _repo_path(repo)
+        run_segment = quote(str(run_id), safe="")
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{run_segment}/artifacts",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        raw_artifacts = data.get("artifacts")
+        if not isinstance(raw_artifacts, list):
+            return []
+        artifacts: list[RunArtifact] = []
+        for item in raw_artifacts:
+            if not isinstance(item, dict):
+                continue
+            artifacts.append(
+                RunArtifact(
+                    id=_require_int(item, "id"),
+                    name=_require_str(item, "name"),
+                    size_in_bytes=_require_int(item, "size_in_bytes"),
+                    archive_download_url=_optional_str(item, "archive_download_url") or "",
+                    expired=bool(item.get("expired", False)),
+                    created_at=_optional_str(item, "created_at") or "",
+                )
+            )
+        return artifacts
+
+    def download_artifact(
+        self,
+        repo: str,
+        artifact_id: int,
+        *,
+        max_bytes: int = MAX_ARTIFACT_DOWNLOAD_BYTES,
+    ) -> bytes:
+        """Download artifact ZIP bytes for ``artifact_id``, stripping ``Authorization`` on 302 redirects."""
+        repo_path = _repo_path(repo)
+        url = f"{self._base_url}/repos/{repo_path}/actions/artifacts/{artifact_id}/zip"
+        return self._download_with_stripped_redirect(url, max_bytes=max_bytes)
+
+    def list_run_jobs(self, repo: str, run_id: int | str) -> list[RunJob]:
+        """Return every job belonging to workflow run ``run_id`` in ``repo``."""
+        repo_path = _repo_path(repo)
+        run_segment = quote(str(run_id).strip(), safe="")
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{run_segment}/jobs",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        raw_jobs = data.get("jobs")
+        if not isinstance(raw_jobs, list):
+            return []
+        jobs: list[RunJob] = []
+        for job in raw_jobs:
+            if not isinstance(job, dict):
+                continue
+            jobs.append(
+                RunJob(
+                    id=_require_int(job, "id"),
+                    name=_require_str(job, "name"),
+                    conclusion=_optional_str(job, "conclusion"),
+                    workflow_name=_optional_str(job, "workflow_name") or "",
+                )
+            )
+        return jobs
+
+    def get_run_failure_output(
+        self,
+        repo: str,
+        run_id: str,
+        *,
+        check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
+    ) -> bytes:
         """Download the replay recording artifact ZIP for workflow run ``run_id`` in ``repo``.
 
-        Selects the newest non-expired ``pit-crew-replay-*`` artifact (falling back to
-        ``failure-recordings-*``) and strips the ``Authorization`` header when following
-        GitHub's 302 redirect to external blob storage. Raises ``FileNotFoundError`` when
-        no non-expired recording artifact exists so replay verification fails closed.
+        When ``check`` or ``expected_checks`` is provided, resolves the expected check against
+        the completed run's jobs (including matrix display names and ``check_aliases``), requires
+        a matching job to have failed, and selects only an unambiguous recording artifact for that
+        job (verifying ``replay-meta.json`` when present). Missing, non-matching, or ambiguous
+        recordings raise ``FileNotFoundError`` so verification fails closed.
         """
         repo_path = _repo_path(repo)
         normalized_run_id = quote(run_id.strip(), safe="")
         if not normalized_run_id:
             msg = "Workflow run_id must not be empty."
             raise ValueError(msg)
-        artifacts_data = self._request_json("GET", f"/repos/{repo_path}/actions/runs/{normalized_run_id}/artifacts")
-        artifact_id = _select_replay_artifact_id(artifacts_data)
-        if artifact_id is None:
+
+        targets = _normalize_target_checks(check, expected_checks)
+        artifacts_data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{normalized_run_id}/artifacts",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        candidates = _collect_replay_artifacts(artifacts_data)
+        if not candidates:
             msg = f"No replay recording artifact found for {repo} run {run_id}."
             raise FileNotFoundError(msg)
-        return self._download_artifact_zip(repo_path, artifact_id)
 
-    def _download_artifact_zip(self, repo_path: str, artifact_id: int) -> bytes:
-        response = self._client.request(
-            "GET",
-            f"{self._base_url}/repos/{repo_path}/actions/artifacts/{artifact_id}/zip",
-            headers=self._headers,
-            follow_redirects=False,
+        if not targets:
+            artifact_id = _select_unambiguous_artifact_id(candidates, repo=repo, run_id=run_id)
+            return self.download_artifact(repo, artifact_id)
+
+        jobs = self.list_run_jobs(repo, normalized_run_id)
+        failed_resolved = _resolve_failed_jobs_for_checks(jobs, targets, check_aliases)
+        if not failed_resolved:
+            msg = f"Expected check(s) {', '.join(targets)!r} did not fail in {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+
+        return self._download_matching_replay_artifact(
+            repo=repo,
+            run_id=run_id,
+            candidates=candidates,
+            resolved_jobs=failed_resolved,
+            targets=targets,
+            check_aliases=check_aliases,
         )
-        if response.status_code in _HTTP_REDIRECT_CODES:
-            location = response.headers.get("location") or response.headers.get("Location")
-            if not location:
-                msg = f"GitHub artifact {artifact_id} redirect is missing Location header."
+
+    def _download_matching_replay_artifact(  # noqa: PLR0913
+        self,
+        *,
+        repo: str,
+        run_id: str,
+        candidates: list[tuple[int, str]],
+        resolved_jobs: list[RunJob],
+        targets: list[str],
+        check_aliases: Sequence[str],
+    ) -> bytes:
+        matched = _filter_artifacts_for_jobs(candidates, resolved_jobs, targets, check_aliases)
+        if not matched:
+            msg = f"No replay recording artifact matching {', '.join(targets)!r} found for {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+
+        # Deduplicate repeated uploads of the exact same artifact name by keeping the newest ID.
+        by_name = {name: artifact_id for artifact_id, name in matched}
+        if len(by_name) == 1:
+            payload = self.download_artifact(repo, next(iter(by_name.values())))
+            if not _zip_metadata_matches_jobs(payload, resolved_jobs, targets, check_aliases):
+                msg = f"Replay recording artifact metadata did not match {', '.join(targets)!r} in {repo} run {run_id}."
+                raise FileNotFoundError(msg)
+            return payload
+
+        # Multiple distinct artifact names matched (e.g. legacy matrix slugs without display names):
+        # disambiguate strictly via replay-meta.json, or fail closed as ambiguous.
+        verified_payloads: list[bytes] = []
+        for artifact_id in by_name.values():
+            payload = self.download_artifact(repo, artifact_id)
+            meta = _read_zip_replay_meta(payload)
+            if meta is not None and _meta_matches_resolved_jobs(meta, resolved_jobs):
+                verified_payloads.append(payload)
+        if len(verified_payloads) == 1:
+            return verified_payloads[0]
+        msg = (
+            f"Ambiguous replay recording artifacts ({', '.join(sorted(by_name))}) "
+            f"for {', '.join(targets)!r} in {repo} run {run_id}."
+        )
+        raise FileNotFoundError(msg)
+
+    def get_failed_job_logs(
+        self,
+        repo: str,
+        run_id: int | str,
+        *,
+        check: str | None = None,
+        max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
+    ) -> bytes:
+        """Download logs for failed jobs in ``run_id`` (auth-stripped redirects), capped at ``max_bytes``."""
+        failed_jobs = self._list_failed_jobs(repo, run_id)
+        if not failed_jobs:
+            return b""
+        selected = _filter_jobs_for_check(failed_jobs, check)
+        repo_path = _repo_path(repo)
+        sections: list[bytes] = []
+        for job_id, job_name in selected:
+            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job_id}/logs"
+            raw_log = self._download_with_stripped_redirect(url, max_bytes=max_bytes, allow_not_found=True)
+            if raw_log:
+                sections.append(f"=== {job_name} ===\n".encode() + raw_log)
+        combined = b"\n".join(sections)
+        if len(combined) > max_bytes:
+            return combined[-max_bytes:]
+        return combined
+
+    def list_failed_job_names(self, repo: str, run_id: int | str) -> list[str]:
+        """Return display names of jobs whose conclusion is ``failure`` in ``run_id``."""
+        return [job_name for _, job_name in self._list_failed_jobs(repo, run_id)]
+
+    def _list_failed_jobs(self, repo: str, run_id: int | str) -> list[tuple[int, str]]:
+        return [(job.id, job.name) for job in self.list_run_jobs(repo, run_id) if job.conclusion == "failure"]
+
+    def _download_with_stripped_redirect(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        allow_not_found: bool = False,
+    ) -> bytes:
+        current_url = url
+        headers: dict[str, str] = dict(self._headers)
+        for _ in range(_MAX_REDIRECT_HOPS + 1):
+            response = self._client.request(
+                "GET",
+                current_url,
+                headers=headers,
+                follow_redirects=False,
+            )
+            if allow_not_found and response.status_code == _HTTP_NOT_FOUND:
+                return b""
+            if response.status_code in _REDIRECT_STATUSES:
+                location = response.headers.get("location", "").strip()
+                if not location:
+                    msg = f"Redirect response from {current_url!r} is missing Location header."
+                    raise ValueError(msg)
+                next_url = urljoin(current_url, location)
+                _require_http_url(next_url)
+                current_url = next_url
+                # Never forward GitHub bearer credentials to external blob storage redirects.
+                headers = {"User-Agent": USER_AGENT}
+                continue
+            response.raise_for_status()
+            body = response.content
+            if len(body) > max_bytes:
+                msg = f"Download from {current_url!r} exceeded {max_bytes}-byte limit ({len(body)} bytes)."
                 raise ValueError(msg)
-            blob_headers = {k: v for k, v in self._headers.items() if k.lower() != "authorization"}
-            blob_response = self._client.request("GET", location, headers=blob_headers, follow_redirects=True)
-            blob_response.raise_for_status()
-            return blob_response.content
-        response.raise_for_status()
-        return response.content
+            return body
+        msg = f"Too many redirects while downloading {url!r}."
+        raise ValueError(msg)
 
     def _request(
         self,
@@ -572,13 +833,22 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
-def _select_replay_artifact_id(artifacts_data: Mapping[str, object]) -> int | None:
-    """Return the preferred non-expired replay recording artifact ID, or ``None``."""
+def _normalize_target_checks(check: str | None, expected_checks: Sequence[str]) -> list[str]:
+    targets = [item.strip() for item in expected_checks if item.strip()]
+    if targets:
+        return list(dict.fromkeys(targets))
+    if check and check.strip():
+        return [check.strip()]
+    return []
+
+
+def _collect_replay_artifacts(artifacts_data: Mapping[str, object]) -> list[tuple[int, str]]:
+    """Return non-expired primary ``pit-crew-replay-*`` (or fallback ``failure-recordings-*``) artifacts."""
     raw_artifacts = artifacts_data.get("artifacts")
     if not isinstance(raw_artifacts, list):
-        return None
-    primary: list[int] = []
-    fallback: list[int] = []
+        return []
+    primary: list[tuple[int, str]] = []
+    fallback: list[tuple[int, str]] = []
     for item in raw_artifacts:
         if not isinstance(item, dict) or item.get("expired") is True:
             continue
@@ -587,12 +857,185 @@ def _select_replay_artifact_id(artifacts_data: Mapping[str, object]) -> int | No
         if not isinstance(artifact_id, int) or isinstance(artifact_id, bool):
             continue
         if name.startswith(_REPLAY_ARTIFACT_PREFIX):
-            primary.append(artifact_id)
+            primary.append((artifact_id, name))
         elif name.startswith(_FALLBACK_RECORDING_PREFIX):
-            fallback.append(artifact_id)
-    if primary:
-        return primary[-1]
-    return fallback[-1] if fallback else None
+            fallback.append((artifact_id, name))
+    return primary or fallback
+
+
+def _select_unambiguous_artifact_id(candidates: list[tuple[int, str]], *, repo: str, run_id: str) -> int:
+    by_name = {name: artifact_id for artifact_id, name in candidates}
+    if len(by_name) > 1:
+        msg = (
+            f"Ambiguous replay recording artifacts ({', '.join(sorted(by_name))}) "
+            f"for {repo} run {run_id}; specify an expected check."
+        )
+        raise FileNotFoundError(msg)
+    return next(iter(by_name.values()))
+
+
+def _resolve_failed_jobs_for_checks(
+    jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> list[RunJob]:
+    """Resolve ``targets`` (and ``check_aliases``) against ``jobs`` and return matching failed jobs.
+
+    Exact matches take precedence over folded matrix-parent matches so a specific matrix leg
+    that passed is never masked by another failing leg.
+    """
+    all_targets = [item.strip() for item in (*targets, *check_aliases) if item.strip()]
+    exact = [job for job in jobs if any(_job_matches_target(job, target, allow_fold=False) for target in all_targets)]
+    if exact:
+        return [job for job in exact if job.conclusion == "failure"]
+    folded = [job for job in jobs if any(_job_matches_target(job, target, allow_fold=True) for target in all_targets)]
+    return [job for job in folded if job.conclusion == "failure"]
+
+
+def _job_matches_target(job: RunJob, target: str, *, allow_fold: bool) -> bool:
+    target_low = target.strip().lower()
+    job_low = job.name.strip().lower()
+    wf_low = job.workflow_name.strip().lower()
+    if _exact_job_match(target_low, job_low, wf_low):
+        return True
+    if not allow_fold or _MATRIX_SUFFIX.search(target_low):
+        return False
+    return _exact_job_match(target_low, _fold_job_name(job_low), wf_low)
+
+
+def _exact_job_match(target_low: str, job_low: str, wf_low: str) -> bool:
+    if target_low == job_low:
+        return True
+    if wf_low and target_low == f"{wf_low}/{job_low}":
+        return True
+    if "/" in target_low:
+        prefix, _, suffix = target_low.partition("/")
+        if suffix.strip() == job_low and (not wf_low or prefix.strip() == wf_low):
+            return True
+    return False
+
+
+def _filter_artifacts_for_jobs(
+    candidates: list[tuple[int, str]],
+    resolved_jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> list[tuple[int, str]]:
+    display_slugs = {_slugify(job.name) for job in resolved_jobs if _slugify(job.name)}
+    exact_matches = [item for item in candidates if _artifact_matches_slugs(item[1], display_slugs, exact_display=True)]
+    if exact_matches:
+        return exact_matches
+
+    alias_slugs = set(display_slugs)
+    for raw in (*targets, *check_aliases):
+        bare = raw.rsplit("/", maxsplit=1)[-1].strip()
+        slug = _slugify(bare)
+        if slug:
+            alias_slugs.add(slug)
+        if not _MATRIX_SUFFIX.search(bare):
+            folded_slug = _slugify(_fold_job_name(bare))
+            if folded_slug:
+                alias_slugs.add(folded_slug)
+    for job in resolved_jobs:
+        folded = _slugify(_fold_job_name(job.name))
+        if folded:
+            alias_slugs.add(folded)
+    return [item for item in candidates if _artifact_matches_slugs(item[1], alias_slugs, exact_display=False)]
+
+
+def _artifact_matches_slugs(artifact_name: str, slugs: set[str], *, exact_display: bool) -> bool:
+    body = _strip_artifact_envelope(artifact_name)
+    if not body:
+        return False
+    if body in slugs:
+        return True
+    if exact_display:
+        return any(body.endswith(f"-{slug}") for slug in slugs)
+    return any(body.startswith(f"{slug}-") or body.endswith(f"-{slug}") for slug in slugs)
+
+
+def _strip_artifact_envelope(artifact_name: str) -> str:
+    lower = artifact_name.lower()
+    if lower.startswith(_REPLAY_ARTIFACT_PREFIX):
+        stem = lower.removeprefix(_REPLAY_ARTIFACT_PREFIX)
+    elif lower.startswith(_FALLBACK_RECORDING_PREFIX):
+        stem = lower.removeprefix(_FALLBACK_RECORDING_PREFIX)
+    else:
+        return ""
+    return _TRAILING_INDEX_RE.sub("", stem).strip("-")
+
+
+def _slugify(value: str) -> str:
+    return _SAFE_SLUG_RE.sub("-", value.strip().lower()).strip("-")[:80].strip("-")
+
+
+def _read_zip_replay_meta(payload: bytes) -> dict[str, str] | None:
+    if not payload.startswith(b"PK\x03\x04"):
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.rsplit("/", maxsplit=1)[-1].lower() != _REPLAY_META_FILENAME:
+                    continue
+                if info.file_size > _MAX_META_BYTES:
+                    return None
+                parsed = json.loads(archive.read(info.filename).decode("utf-8"))
+                if isinstance(parsed, dict):
+                    return {str(k): str(v) for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
+    except (zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return None
+    return None
+
+
+def _meta_matches_resolved_jobs(meta: Mapping[str, str], resolved_jobs: Sequence[RunJob]) -> bool:
+    meta_name = meta.get("job_name", "").strip().lower()
+    meta_wf = meta.get("workflow", "").strip().lower()
+    if not meta_name:
+        return False
+    for job in resolved_jobs:
+        if job.name.strip().lower() == meta_name and (
+            not meta_wf or not job.workflow_name or job.workflow_name.strip().lower() == meta_wf
+        ):
+            return True
+    return False
+
+
+def _zip_metadata_matches_jobs(
+    payload: bytes,
+    resolved_jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> bool:
+    meta = _read_zip_replay_meta(payload)
+    if meta is None:
+        return True
+    if _meta_matches_resolved_jobs(meta, resolved_jobs):
+        return True
+    meta_name = meta.get("job_name", "").strip()
+    meta_wf = meta.get("workflow", "").strip()
+    if not meta_name:
+        return True
+    probe = RunJob(id=0, name=meta_name, conclusion="failure", workflow_name=meta_wf)
+    return bool(_resolve_failed_jobs_for_checks([probe], targets, check_aliases))
+
+
+def _require_http_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        msg = f"Refusing redirect to non-HTTP(S) URL: {url!r}."
+        raise ValueError(msg)
+
+
+def _filter_jobs_for_check(failed_jobs: list[tuple[int, str]], check: str | None) -> list[tuple[int, str]]:
+    if not check or not check.strip():
+        return failed_jobs
+    run_jobs = [RunJob(id=job_id, name=name, conclusion="failure") for job_id, name in failed_jobs]
+    matched = _resolve_failed_jobs_for_checks(run_jobs, (check,), ())
+    return [(job.id, job.name) for job in matched]
+
+
+def _fold_job_name(name: str) -> str:
+    return _MATRIX_SUFFIX.sub("", name.strip()).strip().lower()
 
 
 def _compute_duration_seconds(data: Mapping[str, object], status: str) -> float:

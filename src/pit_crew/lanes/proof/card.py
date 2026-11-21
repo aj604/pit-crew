@@ -13,8 +13,9 @@ from xml.sax.saxutils import escape
 from pit_crew.contracts import Evidence, Verdict
 from pit_crew.lanes.proof.verify import MODEL, Replay
 
-WIDTH = 760
+WIDTH = 860
 ROW = 30
+MAX_PR_VISUAL_PAIRS = 3
 _TOP = 116  # y of the table header
 _BRANCH_CHARS = 56  # fits the 18px title left of a right-aligned REJECT
 _STYLE = """
@@ -28,11 +29,24 @@ text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .warn { fill: #d29922; font-weight: bold; }
 .muted { fill: #8b949e; }
 .red { fill: #f85149; }
+.badge-text { font-size: 11px; font-weight: bold; }
+.badge-video { fill: #58a6ff; }
+.badge-visual { fill: #3fb950; }
+.badge-trace { fill: #d29922; }
+.badge-term { fill: #a371f7; }
+.badge-log { fill: #8b949e; }
 """
 # Markdown that could turn quoted CI output into links, images, HTML or formatting.
 _MARKDOWN = re.compile(r"([\\`*_\[\]<>|~!])")
 _STATUS = {"caught": "good", "missed": "bad", "different failure": "bad", "unverified": "warn", "not a bug": "muted"}
-_COLUMNS = ((28, "bug"), (120, "check"), (340, "baseline"), (450, "candidate"), (570, "result"))
+_COLUMNS = ((28, "bug"), (116, "check"), (320, "modality"), (440, "baseline"), (550, "candidate"), (670, "result"))
+_MODALITY_BADGES: dict[str, tuple[str, str]] = {
+    "browser_video": ("VIDEO", "badge-video"),
+    "screenshot": ("SCREENSHOT", "badge-visual"),
+    "trace_frame": ("TRACE", "badge-trace"),
+    "terminal_video": ("TERMINAL", "badge-term"),
+    "log": ("LOG", "badge-log"),
+}
 
 
 def render_card(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequence[Replay]) -> str:
@@ -68,36 +82,48 @@ def render_card(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequ
     compared = [r.match for r in replays if r.match is not None]
     matched = sum(m.same for m in compared)
     out += [
-        _text(24, y + 30, _clip(verdict.reason, 80), ""),
+        _text(24, y + 30, _clip(verdict.reason, 88), ""),
         _text(24, y + 52, f"{MODEL} watched {len(compared)} pairs of failure recordings: {matched} matched", "head"),
         "</svg>",
     ]
     return "\n".join(out)
 
 
-def pr_body(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequence[Replay], card_url: str) -> str:
-    """Return the markdown PR body: the card, the verdict, and every replay with links to its recordings."""
+def pr_body(  # noqa: PLR0913  optional preview_base_url preserves legacy 5-arg positional callers
+    branch: str,
+    evidence: Evidence,
+    verdict: Verdict,
+    replays: Sequence[Replay],
+    card_url: str,
+    *,
+    preview_base_url: str = "",
+) -> str:
+    """Return the markdown PR body: the card, replay table, visual comparisons, and trust rule."""
     rows = [
-        f"| Bug | Check | Baseline | Candidate | Result | Recordings | What {MODEL} saw |",
-        "|---|---|---|---|---|---|---|",
+        f"| Bug | Check | Modality | Baseline | Candidate | Result | Recordings | What {MODEL} saw |",
+        "|---|---|---|---|---|---|---|---|",
+        *(
+            f"| `{r.sha[:7]}` | {_cell(r.check)} | {_modality_md(r.modality)} "
+            f"| {_outcome(failed=r.baseline_failed)} | {_outcome(failed=r.candidate_failed)} "
+            f"| **{r.status}** | {_recordings(r)} | {_cell(_seen_summary(r))} |"
+            for r in replays
+        ),
     ]
-    for r in replays:
-        seen = r.match.candidate_failure if r.match and r.match.same else (r.match.reason if r.match else r.note)
-        rows.append(
-            f"| `{r.sha[:7]}` | {_cell(r.check)} | {_outcome(failed=r.baseline_failed)} "
-            f"| {_outcome(failed=r.candidate_failed)} | **{r.status}** "
-            f"| {_recordings(r)} | {_cell(seen)} |"
-        )
     before, after = _median(evidence.baseline_seconds), _median(evidence.candidate_seconds)
-    return "\n".join(
+    sections = [
+        f"## Pit Crew: `{branch}`",
+        "",
+        f"![Proof card for {branch}]({card_url})",
+        "",
+        f"**{verdict.reason}.** Median CI time {before} -> {after}; {_timing(evidence, verdict)}.",
+        "",
+        *rows,
+    ]
+    visual_section = _visual_comparison_section(replays, preview_base_url=preview_base_url)
+    if visual_section:
+        sections.extend(["", *visual_section])
+    sections.extend(
         [
-            f"## Pit Crew: `{branch}`",
-            "",
-            f"![Proof card for {branch}]({card_url})",
-            "",
-            f"**{verdict.reason}.** Median CI time {before} -> {after}; {_timing(evidence, verdict)}.",
-            "",
-            *rows,
             "",
             (
                 f"Exit codes decide whether a run failed. {MODEL} only confirms that the baseline and candidate "
@@ -105,17 +131,85 @@ def pr_body(branch: str, evidence: Evidence, verdict: Verdict, replays: Sequence
             ),
         ]
     )
+    return "\n".join(sections)
 
 
 def _row(replay: Replay, y: int) -> list[str]:
     return [
         _text(28, y - 10, replay.sha[:7], ""),
-        _text(120, y - 10, _clip(replay.check, 25), ""),
-        _run(340, y - 10, failed=replay.baseline_failed),
-        _run(450, y - 10, failed=replay.candidate_failed),
-        _text(570, y - 10, replay.status, _STATUS[replay.status]),
+        _text(116, y - 10, _clip(replay.check, 22), ""),
+        *_modality_badge(320, y - 10, replay.modality),
+        _run(440, y - 10, failed=replay.baseline_failed),
+        _run(550, y - 10, failed=replay.candidate_failed),
+        _text(670, y - 10, replay.status, _STATUS[replay.status]),
         f'<line x1="16" y1="{y}" x2="{WIDTH - 16}" y2="{y}" stroke="#30363d"/>',
     ]
+
+
+def _modality_badge(x: int, y: int, modality: str) -> list[str]:
+    badge = _MODALITY_BADGES.get(modality)
+    if badge is None:
+        return [_text(x, y, "-", "muted")]
+    label, css = badge
+    pill_w = max(48, len(label) * 8 + 14)
+    return [
+        f'<rect x="{x}" y="{y - 14}" width="{pill_w}" height="18" rx="4" fill="#161b22" stroke="#30363d"/>',
+        _text(x + 7, y - 1, label, f"badge-text {css}"),
+    ]
+
+
+def _modality_md(modality: str) -> str:
+    badge = _MODALITY_BADGES.get(modality)
+    return f"`{badge[0]}`" if badge is not None else "-"
+
+
+def _seen_summary(replay: Replay) -> str:
+    if replay.match is None:
+        return replay.note
+    if replay.match.same:
+        if replay.match.visual_summary:
+            return f"{replay.match.candidate_failure} — {replay.match.visual_summary}"
+        return replay.match.candidate_failure
+    if replay.match.visual_summary:
+        return f"{replay.match.reason} ({replay.match.visual_summary})"
+    return replay.match.reason
+
+
+def _visual_comparison_section(replays: Sequence[Replay], *, preview_base_url: str) -> list[str]:
+    paired = [r for r in replays if r.baseline_preview_path and r.candidate_preview_path][:MAX_PR_VISUAL_PAIRS]
+    if not paired:
+        return []
+    lines = ["### Visual Failure Evidence (Baseline vs. Candidate)"]
+    for r in paired:
+        base_url = _resolve_preview_url(r.baseline_preview_path, preview_base_url)
+        cand_url = _resolve_preview_url(r.candidate_preview_path, preview_base_url)
+        label = _MODALITY_BADGES.get(r.modality, ("VISUAL", ""))[0]
+        base_alt = escape(f"Baseline failure for {r.sha[:7]} ({r.check})", {'"': "&quot;"})
+        cand_alt = escape(f"Candidate failure for {r.sha[:7]} ({r.check})", {'"': "&quot;"})
+        lines.extend(
+            [
+                "",
+                f"#### `{r.sha[:7]}` — {_cell(r.check)} (`{label}`)",
+                "",
+                "| Baseline | Candidate |",
+                "|---|---|",
+                (
+                    f'| <img src="{escape(base_url, {'"': "&quot;"})}" alt="{base_alt}" width="360" /> '
+                    f'| <img src="{escape(cand_url, {'"': "&quot;"})}" alt="{cand_alt}" width="360" /> |'
+                ),
+            ]
+        )
+        if r.match and r.match.visual_summary:
+            lines.append(f"\n> **{MODEL} visual check:** {r.match.visual_summary}")
+    return lines
+
+
+def _resolve_preview_url(path: str, preview_base_url: str) -> str:
+    if path.startswith(("https://", "http://")):
+        return path
+    if preview_base_url:
+        return f"{preview_base_url.rstrip('/')}/{path.lstrip('/')}"
+    return path
 
 
 def _speedup(verdict: Verdict) -> str:
@@ -148,8 +242,10 @@ def _median(seconds: Sequence[float]) -> str:
 
 
 def _recordings(replay: Replay) -> str:
-    # A replay without agg or ffmpeg has no video; say so rather than link to nothing.
-    videos = (("baseline", replay.baseline_video), ("candidate", replay.candidate_video))
+    # Prefer concrete artifact/run URLs when captured; fall back to raw baseline_video / candidate_video.
+    base_url = replay.baseline_artifact_urls[0] if replay.baseline_artifact_urls else replay.baseline_video
+    cand_url = replay.candidate_artifact_urls[0] if replay.candidate_artifact_urls else replay.candidate_video
+    videos = (("baseline", base_url), ("candidate", cand_url))
     return " / ".join(f"[{side}]({url})" for side, url in videos if url) or "none"
 
 

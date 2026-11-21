@@ -769,3 +769,132 @@ def test_multimodal_replay_verifier_extracts_mp4_from_artifact_zip_and_fails_clo
     assert unverified.bugs_caught == 0
     assert unverified.replays[0].status == "unverified"
     assert "ReplayArtifactError" in str(unverified.bug_outcomes[0]["seen"])
+
+
+def test_multimodal_replay_verifier_rejects_unrelated_job_failures_and_metadata_mismatch() -> None:
+    repo = "acme/vite"
+    node26_meta = json.dumps(
+        {"workflow": "CI", "job_id": "test", "job_name": "Build&Test: node-26, ubuntu-latest"}
+    ).encode()
+    lint_meta = json.dumps({"workflow": "CI", "job_id": "lint", "job_name": "Lint: node-26, ubuntu-latest"}).encode()
+    node26_zip = _zip_bytes({"replay-meta.json": node26_meta, "step-1.mp4": b"node26-video"})
+    lint_zip = _zip_bytes({"replay-meta.json": lint_meta, "step-1.mp4": b"lint-video"})
+
+    class _JobAwareGitHub(FakeProofGitHub):
+        def __init__(
+            self,
+            failed_by_run: dict[str, list[str]],
+            run_outputs: dict[tuple[str, str], bytes | Exception],
+        ) -> None:
+            super().__init__(run_outputs=run_outputs)
+            self._failed_by_run = failed_by_run
+
+        def list_failed_job_names(self, _repo: str, run_id: str) -> list[str]:
+            return list(self._failed_by_run.get(run_id, []))
+
+    fake_client = _FakeModelsClient(
+        json.dumps({"same": True, "baseline_failure": "err", "candidate_failure": "err", "reason": "same"})
+    )
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+
+    # 1. Baseline failed on Node 26, but candidate passed Node 26 and failed on unrelated Lint -> different failure.
+    gh_cand_wrong = _JobAwareGitHub(
+        failed_by_run={
+            "base-1": ["Build&Test: node-26, ubuntu-latest"],
+            "cand-1": ["Lint: node-26, ubuntu-latest"],
+        },
+        run_outputs={(repo, "base-1"): node26_zip, (repo, "cand-1"): lint_zip},
+    )
+    res1 = MultimodalReplayVerifier(gh_cand_wrong, ask=ask).verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Build&Test: node-26, ubuntu-latest",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="base-1",
+                candidate_run_id="cand-1",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+        ],
+    )
+    assert res1.bugs_total == 1
+    assert res1.bugs_caught == 0
+    assert res1.replays[0].status == "different failure"
+    assert fake_client.models.calls == []
+
+    # 2. Baseline itself only failed on unrelated Lint (Node 26 passed) -> unverified, model never called.
+    gh_base_wrong = _JobAwareGitHub(
+        failed_by_run={
+            "base-2": ["Lint: node-26, ubuntu-latest"],
+            "cand-2": ["Lint: node-26, ubuntu-latest"],
+        },
+        run_outputs={(repo, "base-2"): lint_zip, (repo, "cand-2"): lint_zip},
+    )
+    res2 = MultimodalReplayVerifier(gh_base_wrong, ask=ask).verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Build&Test: node-26, ubuntu-latest",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="base-2",
+                candidate_run_id="cand-2",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+        ],
+    )
+    assert res2.bugs_total == 1
+    assert res2.bugs_caught == 0
+    assert res2.replays[0].status == "unverified"
+    assert "did not fail on baseline" in str(res2.bug_outcomes[0]["seen"])
+    assert fake_client.models.calls == []
+
+    # 3. Both runs failed on Node 26, but candidate ZIP metadata proves it came from Lint -> unverified.
+    gh_meta_mismatch = _JobAwareGitHub(
+        failed_by_run={
+            "base-3": ["Build&Test: node-26, ubuntu-latest"],
+            "cand-3": ["Build&Test: node-26, ubuntu-latest", "Lint: node-26, ubuntu-latest"],
+        },
+        run_outputs={(repo, "base-3"): node26_zip, (repo, "cand-3"): lint_zip},
+    )
+    res3 = MultimodalReplayVerifier(gh_meta_mismatch, ask=ask).verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Build&Test: node-26, ubuntu-latest",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="base-3",
+                candidate_run_id="cand-3",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+        ],
+    )
+    assert res3.bugs_total == 1
+    assert res3.bugs_caught == 0
+    assert res3.replays[0].status == "unverified"
+    assert "ReplayArtifactError" in str(res3.bug_outcomes[0]["seen"])
+    assert fake_client.models.calls == []
+
+    # 4. ProofBridge.verify_replay_runs also fails closed when baseline failed on an unexpected check.
+    bridge_res = ProofBridge(gh_base_wrong, ask=ask).verify_replay_runs(
+        repo,
+        [
+            ReplayRunPair(
+                sha="deadbeef",
+                check="CI/Build&Test: node-26, ubuntu-latest",
+                baseline_conclusion="failure",
+                candidate_conclusion="failure",
+                baseline_run_id="base-2",
+                candidate_run_id="cand-2",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+        ],
+    )
+    assert bridge_res.bugs_caught == 0
+    assert bridge_res.replays[0].status == "unverified"
+    assert fake_client.models.calls == []

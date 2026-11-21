@@ -3338,6 +3338,13 @@ def test_dispatcher_records_replays_and_wires_multimodal_verification_into_evide
         "candidate_video": "12",
         "same_failure": True,
         "seen": "Identical assertion in test_auth.",
+        "modality": "",
+        "visual_evidence_seen": False,
+        "visual_summary": "",
+        "baseline_artifact_urls": [],
+        "candidate_artifact_urls": [],
+        "baseline_preview_path": "",
+        "candidate_preview_path": "",
         "kind": "commit",
         "ref": "deadbeef01",
         "caught": True,
@@ -3597,7 +3604,7 @@ def test_build_multimodal_verifier_lazily_resolves_managed_agent_ask_multimodal(
     )
     assert ev.bugs_total == 1
     assert ev.bugs_caught == 1
-    assert calls == [("gemini-4-carbon", 5)]
+    assert calls == [("gemini-4-carbon", 7)]
 
 
 def test_format_pr_body_renders_replay_as_outcome_statuses() -> None:
@@ -3631,3 +3638,79 @@ def test_format_pr_body_renders_replay_as_outcome_statuses() -> None:
     assert "| commit | `bbb2222` | Yes | No (different failure) | - |" in body
     assert "| mutation | `mut-1` | Yes | No (unverified) | - |" in body
     assert "| commit | `ccc3333` | No | Excluded (dud) | - |" in body
+
+
+def test_dispatcher_propagates_expected_checks_and_aliases_and_rejects_unrelated_job_failure() -> None:
+    class _JobScopedGitHub(_RecordingProofGitHub):
+        def __init__(self) -> None:
+            super().__init__(
+                {"org/repo": "base-sha"},
+                run_scripts={
+                    1: [_make_run(1, conclusion="failure", duration_seconds=6.0)],
+                    2: [_make_run(2, conclusion="failure", duration_seconds=6.0)],
+                },
+                file_contents={
+                    ("org/repo", "base-sha", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+                    ("org/repo", "bug1234", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+                },
+                run_outputs={
+                    ("org/repo", "1"): _replay_zip({"step-1.mp4": b"unit-base"}),
+                    ("org/repo", "2"): _replay_zip({"step-1.mp4": b"lint-cand"}),
+                },
+            )
+            self.received_calls: list[dict[str, object]] = []
+
+        def list_failed_job_names(self, _repo: str, run_id: str) -> list[str]:
+            return ["Unit Tests"] if run_id == "1" else ["Lint"]
+
+        @override
+        def get_run_failure_output(
+            self,
+            repo: str,
+            run_id: str,
+            *,
+            check: str | None = None,
+            expected_checks: tuple[str, ...] = (),
+            check_aliases: tuple[str, ...] = (),
+        ) -> bytes:
+            self.received_calls.append(
+                {
+                    "repo": repo,
+                    "run_id": run_id,
+                    "check": check,
+                    "expected_checks": expected_checks,
+                    "check_aliases": check_aliases,
+                }
+            )
+            return super().get_run_failure_output(repo, run_id)
+
+    github = _JobScopedGitHub()
+    fake_client = _QueuedModelsClient(
+        [json.dumps({"same": True, "baseline_failure": "x", "candidate_failure": "x", "reason": "unused"})]
+    )
+    verifier = build_multimodal_verifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+        replay_verifier=verifier,
+    )
+    cand = Candidate(
+        id="cand-scoped",
+        hypothesis_id="h1",
+        branch="pc/scoped",
+        summary="scoped",
+        repo="org/repo",
+        base_sha="base-sha",
+        files={".github/workflows/ci.yml": _CAND_CI_YAML},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bug1234", expected_checks=("CI/Unit Tests",)),),
+    )
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+    assert (evidence.bugs_total, evidence.bugs_caught) == (1, 0)
+    assert evidence.bug_outcomes[0]["status"] == "different failure"
+    assert fake_client.calls == []
+    assert rate(evidence).keep is False

@@ -37,19 +37,64 @@ const bugCases = (prefix) => [
   { kind: "mutation", reason: "drop inventory check", commit_sha: null, mutated_files: { "app/stock.py": "def in_stock(sku):\n    return True\n" }, artifact_ref: "proof/stock-mutation.log", expected_checks: [] },
 ];
 
+const VISUAL_METADATA = [
+  {
+    modality: "screenshot",
+    visual_evidence_seen: true,
+    visual_summary: "Checkout summary renders $42.01 instead of expected $42.00 on both baseline and candidate.",
+    baseline_preview_path: "/web/previews/cart-total-baseline.svg",
+    candidate_preview_path: "/web/previews/cart-total-candidate.svg",
+  },
+  {
+    modality: "browser_video",
+    visual_evidence_seen: true,
+    visual_summary: "Playwright video shows duplicate SAVE20 promo chip rendered on checkout in both runs.",
+    baseline_preview_path: "/web/previews/coupon-baseline.svg",
+    candidate_preview_path: "/web/previews/coupon-candidate.svg",
+  },
+  {
+    modality: "log",
+    visual_evidence_seen: false,
+    visual_summary: "AssertionError in test_tax_boundary matches across baseline and candidate logs.",
+    missed_summary: "Candidate skipped test_tax_boundary and passed without reproducing the failure.",
+    baseline_preview_path: "",
+    candidate_preview_path: "",
+  },
+  {
+    modality: "trace_frame",
+    visual_evidence_seen: true,
+    visual_summary: "Playwright trace keyframe shows disabled out-of-stock button left active on both sides.",
+    baseline_preview_path: "",
+    candidate_preview_path: "",
+  },
+];
+
 function buildScenario(spec) {
   const { id, n, title, hypothesis, candidate, timings, caught, verdict } = spec;
   const hypothesisId = `hyp-${n}000000000`.slice(0, 12);
   const candidateId = `cand-${n}0000000`.slice(0, 12);
   const cases = bugCases(String(n));
   const runUrl = (offset) => `${RUNS}/${9100 + n * 100 + offset}`;
-  const bugOutcomes = cases.map((bug, i) => ({
-    kind: bug.kind,
-    ref: bug.kind === "commit" ? bug.commit_sha : Object.keys(bug.mutated_files)[0],
-    baseline_failed: true,
-    caught: caught[i],
-    run_url: runUrl(20 + i),
-  }));
+  const bugOutcomes = cases.map((bug, i) => {
+    const meta = VISUAL_METADATA[i];
+    const isCaught = caught[i];
+    const baseRunUrl = runUrl(10 + i);
+    const candRunUrl = runUrl(20 + i);
+    return {
+      kind: bug.kind,
+      ref: bug.kind === "commit" ? bug.commit_sha : Object.keys(bug.mutated_files)[0],
+      baseline_failed: true,
+      caught: isCaught,
+      run_url: candRunUrl,
+      modality: meta.modality,
+      visual_evidence_seen: isCaught ? meta.visual_evidence_seen : false,
+      visual_summary: isCaught ? meta.visual_summary : (meta.missed_summary ?? meta.visual_summary),
+      baseline_artifact_urls: [baseRunUrl],
+      candidate_artifact_urls: isCaught ? [candRunUrl] : [],
+      baseline_preview_path: meta.baseline_preview_path,
+      candidate_preview_path: isCaught ? meta.candidate_preview_path : "",
+    };
+  });
   const files = { [WORKFLOW]: candidate.workflow };
   return Object.freeze({
     id,
