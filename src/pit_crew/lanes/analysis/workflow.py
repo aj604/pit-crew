@@ -103,7 +103,7 @@ def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
             name=_step_name(item),
             uses=str(item["uses"]) if item.get("uses") else None,
             run=str(item["run"]) if item.get("run") is not None else None,
-            with_={str(k): str(v) for k, v in (item.get("with") or {}).items()},
+            with_={str(k): str(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()},
             if_=str(item["if"]) if item.get("if") is not None else None,
         )
         for item in raw
@@ -135,10 +135,27 @@ def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
 
 def match_step_name(spec_name: str, measured_name: str) -> bool:
     """Whether a YAML step's display name is the measured step `measured_name` (SHAs already folded to <sha>)."""
+    spec_name = SHA.sub("<sha>", spec_name)  # measured names are folded; a SHA-pinned `uses:` must be too
     if spec_name == measured_name:
         return True
-    pattern = ".+?".join(re.escape(part) for part in _EXPRESSION.split(spec_name))
-    return re.fullmatch(pattern, measured_name) is not None
+    return _wildcard_match(_EXPRESSION.split(spec_name), measured_name)
+
+
+def _wildcard_match(parts: list[str], text: str) -> bool:
+    """Whether text is `parts` joined by one-or-more-character wildcards. Linear: no regex backtracking."""
+    if len(parts) == 1:
+        return text == parts[0]
+    first, last = parts[0], parts[-1]
+    if not (text.startswith(first) and text.endswith(last)):
+        return False
+    end = len(text) - len(last)
+    pos = len(first)
+    for literal in parts[1:-1]:
+        found = text.find(literal, pos + 1, end)  # the wildcard before it eats at least one character
+        if found == -1:
+            return False
+        pos = found + len(literal)
+    return end - pos >= 1
 
 
 def topological_order(workflow: Workflow) -> list[str]:
@@ -166,7 +183,7 @@ def topological_order(workflow: Workflow) -> list[str]:
 def _matches(job: JobSpec, display_name: str) -> bool:
     if display_name == job.name:
         return True
-    pattern = ".+?".join(re.escape(part) for part in _EXPRESSION.split(job.name))
-    if job.has_matrix and not _EXPRESSION.search(job.name):
-        pattern += r"( \(.*\))?"  # GitHub appends the matrix values when the name does not use them
-    return re.fullmatch(pattern, display_name) is not None
+    if not _EXPRESSION.search(job.name):
+        # GitHub appends the matrix values when the name does not use them
+        return job.has_matrix and display_name.startswith(f"{job.name} (") and display_name.endswith(")")
+    return _wildcard_match(_EXPRESSION.split(job.name), display_name)

@@ -1,5 +1,6 @@
 import gzip
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -141,3 +142,28 @@ def test_step_profile_maps_yaml_step_to_measured_step() -> None:
     assert job_profile(p, "test") is not None
     assert job_profile(p, "nope") is None
     assert step_profile(p, "nope", step) is None
+
+
+def test_sha_pinned_action_matches_folded_measured_name() -> None:
+    sha = "a" * 40
+    assert match_step_name(f"Run actions/cache@{sha}", "Run actions/cache@<sha>")
+
+
+def test_wildcard_matching_is_linear() -> None:
+    name = "a".join(["${{ x }}"] * 30) + "b"
+    start = time.perf_counter()
+    assert not match_step_name(name, "a" * 5000)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_wildcards_need_at_least_one_character() -> None:
+    assert match_step_name("a ${{ x }} b", "a z b")
+    assert not match_step_name("a${{ x }}b", "ab")
+    assert not match_step_name("${{ x }}-${{ y }}", "-")
+
+
+def test_non_mapping_with_is_ignored() -> None:
+    wf = parse_workflow(
+        "jobs:\n  t:\n    steps:\n      - {uses: a/b@v1, with: oops}\n      - {uses: a/c@v1, with: [x]}\n"
+    )
+    assert [s.with_ for s in wf.jobs["t"].steps] == [{}, {}]
