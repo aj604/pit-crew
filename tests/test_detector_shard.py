@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
-from pit_crew.lanes.analysis.detectors.shard import _is_static_check, detect_shard_by_timing
+from pit_crew.lanes.analysis.detectors.shard import CONFIDENT_RUNS, _is_static_check, detect_shard_by_timing
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -82,8 +82,17 @@ def test_shard_flags_a_long_test_step() -> None:
     assert finding.expected_savings_seconds == 210.0
     assert finding.evidence["step_p50_seconds"] == 240.0
     assert finding.evidence["runs_sampled"] == 3.0
-    assert (finding.bucket, finding.risk, finding.confidence) == ("running", "low", 0.6)
+    assert (finding.bucket, finding.risk, finding.confidence) == ("running", "low", 0.4)
     assert "every test file" in finding.description
+
+
+@pytest.mark.parametrize(("runs", "confidence"), [(CONFIDENT_RUNS - 1, 0.4), (CONFIDENT_RUNS, 0.6)])
+def test_shard_confidence_scales_with_runs_analysed(runs: int, confidence: float) -> None:
+    wf = parse_workflow(workflow_yaml(["Run npm test"]))
+    prof = profile(wf, parse_runs([raw_run(i, [("Run npm test", 240.0)]) for i in range(1, runs + 1)]))
+    assert prof.runs_analyzed == runs
+    (finding,) = detect_shard_by_timing(prof, wf, PATH)
+    assert finding.confidence == confidence
 
 
 def test_shard_respects_existing_shard_matrix() -> None:
