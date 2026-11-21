@@ -6,7 +6,6 @@ export const CHART_VIEWBOX = Object.freeze({ width: 600, height: 280 });
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const EM_DASH = "\u2014";
-const SAFE_URL = /^https?:\/\/\S+$/i;
 const PLOT = Object.freeze({ x: 48, y: 24, width: 460, height: 208 });
 const MIN_LABEL_GAP = 14;
 
@@ -39,8 +38,16 @@ export function computeP95(values) {
   return s[lo] + (pos - lo) * (s[Math.min(lo + 1, s.length - 1)] - s[lo]);
 }
 
-/** Pure: allow only explicit http(s) URLs for clickable external links. */
-export const isSafeExternalUrl = (url) => typeof url === "string" && SAFE_URL.test(url.trim());
+/** Pure: allow only valid http(s) URLs for clickable external links. */
+export function isSafeExternalUrl(url) {
+  if (typeof url !== "string" || !url.trim()) return false;
+  try {
+    const { protocol } = new URL(url.trim());
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 export const formatMetricSeconds = (s) => (isNum(s) ? `${s.toFixed(1)}s` : EM_DASH);
 export const formatSpeedup = (x) => (isNum(x) ? `${x.toFixed(2)}x` : EM_DASH);
 export function formatPValue(p) {
@@ -49,15 +56,18 @@ export function formatPValue(p) {
   return p < 0.01 ? p.toFixed(3) : p.toFixed(2);
 }
 
-/** Pure: resolve selected attempt's Evidence and Verdict by candidate_id (falling back to latest). */
+/** Pure: resolve selected attempt's Evidence and Verdict by candidate_id (falling back to latest only when no attempt is selected). */
 export function resolveAttemptTelemetry(state) {
   const rec = state?.records ?? {};
-  const cid = state?.selectedAttempt?.candidate_id ?? null;
-  const pick = (list) => {
-    const arr = Array.isArray(list) ? list : [];
-    return cid ? findLast(arr, (r) => r?.candidate_id === cid) : (arr.at(-1) ?? null);
-  };
-  return { candidateId: cid, evidence: pick(rec.evidence), verdict: pick(rec.verdicts) };
+  const selected = state?.selectedAttempt ?? null;
+  if (selected !== null) {
+    const cid = typeof selected.candidate_id === "string" && selected.candidate_id.trim() ? selected.candidate_id : null;
+    if (!cid) return { candidateId: null, evidence: null, verdict: null };
+    const byCid = (list) => (Array.isArray(list) ? findLast(list, (r) => r?.candidate_id === cid) : null);
+    return { candidateId: cid, evidence: byCid(rec.evidence), verdict: byCid(rec.verdicts) };
+  }
+  const latest = (list) => (Array.isArray(list) ? (list.at(-1) ?? null) : null);
+  return { candidateId: null, evidence: latest(rec.evidence), verdict: latest(rec.verdicts) };
 }
 
 /** Pure: normalize one `Evidence.bug_outcomes` entry across Demo and Proof-lane shapes. */
@@ -127,8 +137,8 @@ export function buildTimingChartModel(evidence, verdict) {
   for (let t = 0; t <= yMax; t += step) yTicks.push({ value: t, label: `${t}s`, y: yFor(t) });
 
   const slotW = PLOT.width / runCount;
-  const barW = round2(Math.min(24, Math.max(8, slotW * 0.28)));
-  const gap = round2(Math.min(8, Math.max(3, slotW * 0.08)));
+  const barW = round2(Math.min(24, slotW * 0.28));
+  const gap = round2(Math.min(8, slotW * 0.08));
   const pt = (val, x) => (val === null ? null : { seconds: val, x, y: yFor(val), width: barW, height: hFor(val), dotX: round2(x + barW / 2), dotY: yFor(val) });
   const runs = Array.from({ length: runCount }, (_, i) => {
     const slotX = PLOT.x + i * slotW;
