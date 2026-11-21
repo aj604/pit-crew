@@ -132,12 +132,14 @@ def _event(cast: TextIO, start: float, text: str) -> None:
 
 
 def _chunks(master: int, proc: "subprocess.Popen[bytes]") -> Iterator[bytes]:
-    """Yield the check's output until the terminal closes, or until _DRAIN_SECONDS after the check exits."""
+    """Yield the check's output until the terminal closes, or for at most _DRAIN_SECONDS after the check exits."""
     deadline = None
     while True:
         if deadline is None and proc.poll() is not None:
             deadline = time.monotonic() + _DRAIN_SECONDS
-        timeout = _POLL_SECONDS if deadline is None else max(0.0, deadline - time.monotonic())
+        timeout = _POLL_SECONDS if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            return  # the check has exited and the drain time is up, however much is still coming
         ready, _, _ = select.select([master], [], [], timeout)
         if not ready:
             if deadline is None:

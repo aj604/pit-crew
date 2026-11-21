@@ -253,6 +253,23 @@ def test_shell_here_documents_are_text_not_code() -> None:
     assert ops == [(9, "&& -> ||"), (9, "< -> >=")]
 
 
+@pytest.mark.parametrize("shift", ["(( mask = 1 << bit ))", "echo $((1<<n))"])
+def test_a_shell_shift_is_not_a_here_document(shift: str) -> None:
+    assert [(m.line, m.operator) for m in mutants("a.sh", f"{shift}\n(( n > 2 ))\n")] == [(2, "> -> <=")]
+
+
+@pytest.mark.parametrize("opener", ["cat <<END-OF-FILE", "cat <<'END-OF-FILE' > out.txt"])
+def test_a_here_document_ends_at_its_whole_delimiter(opener: str) -> None:
+    source = f"{opener}\n(( a < b ))\nEND-OF-FILE\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
+@pytest.mark.parametrize("source", ['cat <<E"O"F\n(( n > 2 ))\nEOF\n', "cat <<EOF\n(( n > 2 ))\n"])
+def test_a_here_document_it_cannot_close_masks_nothing(source: str) -> None:
+    # Better a mutant in text than none for the rest of the file.
+    assert (2, "> -> <=") in [(m.line, m.operator) for m in mutants("a.sh", source)]
+
+
 def test_shell_arithmetic_in_double_quotes_is_still_code() -> None:
     source = "printf '%s\\n' \"n=$(( a < b ))\"\necho \"\\$(( c > d ))\" '$(( e > f ))'\n"
     assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(1, "< -> >=")]

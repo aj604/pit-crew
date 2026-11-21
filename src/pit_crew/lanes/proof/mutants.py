@@ -46,8 +46,9 @@ _WORDS = {"true": "false", "false": "true", "True": "False", "False": "True"}
 _FLIPS = _BINARY | _WORDS
 _BINARY_RE = re.compile(r"(?<=\s)(" + "|".join(re.escape(op) for op in _BINARY) + r")(?=\s)")
 _WORD_RE = re.compile(r"\b(" + "|".join(_WORDS) + r")\b")
-# A shell here-document: <<EOF, <<-EOF, << 'EOF', <<"EOF", <<\EOF, but not the here-string <<<.
-_HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*\\?(['\"]?)([A-Za-z_]\w*)\2")
+# A shell here-document: <<EOF, <<-EOF, << 'EOF', <<"END-OF-FILE", <<\EOF, but not the here-string <<<.
+# The delimiter is the whole word; one this can't read whole (<<E"O"F) is not taken as a here-document.
+_HEREDOC = re.compile(r"""(?<!<)<<(?!<)(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([^\s;|&<>()'"`]+))(?=[\s;|&<>()]|$)""")
 _SHELL_WORD_START = " \t\n;|&()"  # where a shell # starts a comment; elsewhere ($#, ${#x}) it is code
 
 
@@ -145,11 +146,15 @@ def _mask(source: str, *, hash_comments: bool, shell: bool = False) -> str:
     while i < len(source):
         if source[i] == "\n" and heredocs:
             body_end = _heredoc_end(source, i + 1, heredocs)
-            _blank(out, i + 1, body_end)
             heredocs = []
-            i = body_end
-        elif shell and (heredoc := _HEREDOC.match(source, i)):
-            heredocs.append((heredoc.group(3), heredoc.group(1) == "-"))
+            if body_end is None:  # no delimiter line: most likely not a here-document, so mask nothing
+                i += 1
+            else:
+                _blank(out, i + 1, body_end)
+                i = body_end
+        elif shell and (heredoc := _HEREDOC.match(source, i)) and not _in_arithmetic(out, i):
+            delimiter = next(word for word in heredoc.group(2, 3, 4) if word is not None)
+            heredocs.append((delimiter, heredoc.group(1) == "-"))
             i = heredoc.end()
         elif (end := _literal_end(source, i, hash_comments=hash_comments, shell=shell)) is not None:
             _blank(out, i, end)
@@ -180,11 +185,21 @@ def _keep_arithmetic(out: list[str], source: str, start: int, end: int) -> None:
         i = source.find("$((", j, end)
 
 
-def _heredoc_end(source: str, start: int, heredocs: list[tuple[str, bool]]) -> int:
-    """Return where the here-documents whose bodies start at `start` end: after the last one's delimiter line."""
+def _in_arithmetic(out: list[str], i: int) -> bool:
+    """Whether position `i`, with the source masked up to there, is in shell arithmetic, where << is a shift."""
+    start = i
+    while start > 0 and out[start - 1] != "\n":
+        start -= 1
+    return _arithmetic("".join(out[start:i]) + "<")[-1]
+
+
+def _heredoc_end(source: str, start: int, heredocs: list[tuple[str, bool]]) -> int | None:
+    """Return where the here-documents whose bodies start at `start` end, or None if a delimiter line is missing."""
     pos = start
     for delimiter, tabs in heredocs:
-        while pos < len(source):
+        while True:
+            if pos >= len(source):
+                return None
             line_end = source.find("\n", pos)
             line_end = len(source) if line_end == -1 else line_end
             line, pos = source[pos:line_end], line_end + 1
