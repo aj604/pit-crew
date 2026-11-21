@@ -5,7 +5,14 @@ import re
 
 from pit_crew.lanes.analysis.buckets import is_setup_step
 from pit_crew.lanes.analysis.critical_path import CIProfile
-from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
+from pit_crew.lanes.analysis.detectors.base import (
+    Finding,
+    job_profile,
+    keep_worthwhile,
+    step_label,
+    step_occurrences,
+    step_profile,
+)
 from pit_crew.lanes.analysis.workflow import StepSpec, Workflow
 
 SHARD_MIN_SECONDS = 60.0  # shorter steps are not worth the sharding overhead
@@ -56,25 +63,26 @@ def detect_shard_by_timing(profile: CIProfile, workflow: Workflow, workflow_path
             continue
         if any(ALREADY_SHARDED.search(key) for key in spec.matrix_keys):
             continue
-        for step in spec.steps:
+        for step, occurrence in zip(spec.steps, step_occurrences(spec.steps), strict=True):
             if is_setup_step(step.name):
                 continue
             if not _runs_tests(step):
                 continue
-            timing = step_profile(profile, job_id, step)
+            timing = step_profile(profile, job_id, step, occurrence)
             if timing is None or timing.median_seconds < SHARD_MIN_SECONDS:
                 continue
             shards = min(math.ceil(timing.median_seconds / TARGET_SHARD_SECONDS), MAX_SHARDS)
             expected = min(timing.median_seconds * (1 - 1 / shards), measured.max_saving_seconds)
+            label = step_label(step.name, occurrence)
             findings.append(
                 Finding(
                     skill="shard-by-timing",
                     workflow_path=workflow_path,
                     job=job_id,
-                    step=step.name,
+                    step=label,
                     bucket="running",
                     description=(
-                        f"Step '{step.name}' takes a median {timing.median_seconds:.0f}s on the critical path. "
+                        f"Step '{label}' takes a median {timing.median_seconds:.0f}s on the critical path. "
                         f"Split it into {shards} parallel shards balanced by recorded test timings. "
                         "The shards together must run every test file: prove it by comparing the union of "
                         "the shards' test files with the unsharded run's before merging."

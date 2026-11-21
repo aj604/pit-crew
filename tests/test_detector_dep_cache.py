@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
+from pit_crew.lanes.analysis.detectors.base import step_label, step_occurrences
 from pit_crew.lanes.analysis.detectors.dep_cache import INSTALL_COMMANDS, detect_dep_cache
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
@@ -246,3 +247,30 @@ def test_dep_cache_other_manager_setup_cache_does_not_hide_npm_ci() -> None:
 def test_dep_cache_matching_manager_caches_hide_install(extra: str, install: str) -> None:
     wf, prof = make_profile(BASE.format(extra=extra).replace("npm ci", install), [NPM_JOB])
     assert detect_dep_cache(prof, wf, PATH) == []
+
+
+def test_dep_cache_same_named_steps_get_separate_findings() -> None:
+    yaml_text = """
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: cd frontend && npm ci
+      - name: Install dependencies
+        run: cd dashboard && npm ci
+"""
+    jobs = [job("test", 300, (("Install dependencies", 120), ("Install dependencies", 60)))]
+    wf, prof = make_profile(yaml_text, jobs)
+    first, second = sorted(detect_dep_cache(prof, wf, PATH), key=lambda f: f.step)
+    assert (first.step, second.step) == ("Install dependencies", "Install dependencies [2]")
+    assert first.key != second.key
+    assert first.evidence["step_p50_seconds"] == 120.0
+    assert second.evidence["step_p50_seconds"] == 60.0
+
+
+def test_step_label_and_occurrences() -> None:
+    assert step_label("Build", 1) == "Build"
+    assert step_label("Build", 3) == "Build [3]"
+    wf = parse_workflow("jobs:\n  t:\n    steps:\n      - run: a\n      - run: b\n      - run: a\n")
+    assert step_occurrences(wf.jobs["t"].steps) == [1, 1, 2]

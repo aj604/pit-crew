@@ -1,6 +1,7 @@
 """The Finding record every detector returns, and helpers for tying YAML steps to measured timings."""
 
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -69,10 +70,32 @@ def job_profile(profile: CIProfile, job_id: str) -> JobProfile | None:
     return next((j for j in profile.jobs if j.job_id == job_id), None)
 
 
-def step_profile(profile: CIProfile, job_id: str, step: StepSpec) -> StepProfile | None:
-    """The measured step a YAML step corresponds to, or None when it was never measured."""
+def step_occurrences(steps: Sequence[StepSpec]) -> list[int]:
+    """For each step, how many steps up to and including it share its name: 1 for the first, 2 for the next."""
+    seen: Counter[str] = Counter()
+    occurrences = []
+    for step in steps:
+        seen[step.name] += 1
+        occurrences.append(seen[step.name])
+    return occurrences
+
+
+def step_label(name: str, occurrence: int) -> str:
+    """The name a finding carries for a step: the plain name for the first of its name, `name [n]` after that."""
+    return name if occurrence == 1 else f"{name} [{occurrence}]"
+
+
+def step_profile(profile: CIProfile, job_id: str, step: StepSpec, occurrence: int = 1) -> StepProfile | None:
+    """The measured step a YAML step corresponds to, or None when it was never measured.
+
+    `occurrence` picks among steps of the same name in the job (1 is the first).
+    """
     return next(
-        (s for s in profile.steps if s.job_id == job_id and match_step_name(step.name, s.name)),
+        (
+            s
+            for s in profile.steps
+            if s.job_id == job_id and s.occurrence == occurrence and match_step_name(step.name, s.name)
+        ),
         None,
     )
 

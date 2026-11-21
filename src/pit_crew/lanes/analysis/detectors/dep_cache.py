@@ -3,7 +3,14 @@
 import re
 
 from pit_crew.lanes.analysis.critical_path import CIProfile
-from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
+from pit_crew.lanes.analysis.detectors.base import (
+    Finding,
+    job_profile,
+    keep_worthwhile,
+    step_label,
+    step_occurrences,
+    step_profile,
+)
 from pit_crew.lanes.analysis.workflow import JobSpec, StepSpec, Workflow
 
 INSTALL_COMMANDS = re.compile(
@@ -100,20 +107,21 @@ def detect_dep_cache(profile: CIProfile, workflow: Workflow, workflow_path: str)
         if jp is None or jp.max_saving_seconds <= 0:
             continue
         covered = _job_covered(job)
-        for step in job.steps:
+        for step, occurrence in zip(job.steps, step_occurrences(job.steps), strict=True):
             if step.run is None or not _managers(step.run) - covered:
                 continue
-            sp = step_profile(profile, job.id, step)
+            sp = step_profile(profile, job.id, step, occurrence)
             if sp is None:
                 continue
+            label = step_label(step.name, occurrence)
             findings.append(
                 Finding(
                     skill="dep-cache",
                     workflow_path=workflow_path,
                     job=job.id,
-                    step=step.name,
+                    step=label,
                     bucket="setup",
-                    description=f"'{step.name}' installs dependencies on the critical path with no cache.",
+                    description=f"'{label}' installs dependencies on the critical path with no cache.",
                     expected_savings_seconds=min(SAVED_FRACTION * sp.median_seconds, jp.max_saving_seconds),
                     evidence={
                         "step_p50_seconds": sp.median_seconds,

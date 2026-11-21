@@ -69,6 +69,7 @@ class StepProfile:
     median_seconds: float
     p95_seconds: float
     samples: int
+    occurrence: int = 1  # 1 for the first step of this name in the job, 2 for the next, and so on
 
 
 @dataclass(frozen=True)
@@ -225,22 +226,26 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
 
 
 def step_profiles(workflow: Workflow, runs: list[WorkflowRun]) -> list[StepProfile]:
-    """Median and p95 per (job id, step name) across runs and matrix instances, slowest first.
+    """Median and p95 per (job id, step name, occurrence) across runs and matrix instances, slowest first.
 
     Skipped steps are left out so a step that rarely runs is not reported as fast. Commit SHAs
     in step names (e.g. `--title "Coverage for <sha>"`) are folded so each run's step groups together.
+    Steps sharing a name within one job run are told apart by their order: the first is occurrence 1.
     """
-    samples: dict[tuple[str, str], list[float]] = defaultdict(list)
+    samples: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for run in runs:
         for job in run.latest_jobs:
             job_id = workflow.job_id_for(job.name)
             if job_id is None:
                 continue
+            seen: Counter[str] = Counter()
             for step in job.steps:
+                name = SHA.sub("<sha>", step.name)
+                seen[name] += 1
                 if step.conclusion != "skipped":
-                    samples[(job_id, SHA.sub("<sha>", step.name))].append(step.seconds)
+                    samples[(job_id, name, seen[name])].append(step.seconds)
     steps = [
-        StepProfile(job_id, name, median(values), percentile(values, 95), len(values))
-        for (job_id, name), values in samples.items()
+        StepProfile(job_id, name, median(values), percentile(values, 95), len(values), occurrence)
+        for (job_id, name, occurrence), values in samples.items()
     ]
     return sorted(steps, key=lambda s: s.median_seconds, reverse=True)
