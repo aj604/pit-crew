@@ -59,7 +59,7 @@ Manual M2 verification checklist:
 
 1. Use a fork you own as `--repo`, and keep the ledger outside the repo (for example under `~/pit-crew-smoke/`).
 2. `export GEMINI_API_KEY=...`
-3. Analysis. Its `profile_ci` tool reads the workflow file on the machine running the CLI, not in the sandbox, so clone the fork locally and point the CLI at it with `--workspace <path>` (or `export PIT_CREW_WORKSPACE=<path>`; the default is `/workspace`). The command fails fast with `MissingWorkspaceError` if that directory does not exist.
+3. Analysis. Its `profile_ci` tool reads the workflow file on the machine running the CLI, not in the sandbox, so point the CLI at a local clone with `--workspace <path>` (or `export PIT_CREW_WORKSPACE=<path>`). With neither set, the CLI downloads the repository tarball at its default branch from the GitHub API (using `GITHUB_TOKEN` if set) into a temporary folder for the run and deletes it afterwards. The checkout is scoped to the run with a context variable, so `os.environ` is never changed. The command fails fast with `MissingWorkspaceError` if an explicit workspace directory does not exist.
    ```sh
    git clone https://github.com/<owner/name> ~/pit-crew-smoke/fork
    uv run python -m pit_crew.cli smoke-lane --lane analysis --repo <owner/name> --ledger ~/pit-crew-smoke/ledger.db --workspace ~/pit-crew-smoke/fork
