@@ -155,7 +155,28 @@ class _ReplayTarget:
 
     repo: str
     workflow: str
+    base_sha: str
     candidate: Candidate
+
+
+@dataclass(frozen=True)
+class _BranchReplaySpec:
+    """Parameters for creating, committing to, running, and deleting an ephemeral replay branch."""
+
+    branch: str
+    base_sha: str
+    files: dict[str, str]
+    message: str
+
+
+@dataclass(frozen=True)
+class _BugReplayResult:
+    """Outcome of replaying a single ``BugCase``."""
+
+    counted: bool
+    caught: bool
+    outcome: dict[str, Any]
+    run_urls: tuple[str, ...]
 
 
 class Dispatcher:
@@ -237,10 +258,17 @@ class Dispatcher:
         including cold Run #1 to cancel runner-load drift. Aborts timing collection for a
         side if any timing run concludes with a status other than ``"success"``.
 
-        Then replays each ``kind == "commit"`` ``BugCase`` in ``replay_plan.cases`` by
-        overlaying ``candidate.files`` onto ``bug_case.commit_sha`` on a temporary
-        ``pc/replay-<candidate_id>-<idx>`` branch and recording whether CI catches the
-        bug (concludes ``"failure"``).
+        Then replays each ``BugCase`` in ``replay_plan.cases`` on temporary branches that
+        are always deleted in ``finally``:
+
+        - ``kind == "commit"`` overlays ``candidate.files`` onto ``bug_case.commit_sha``
+          and marks the bug caught iff CI concludes ``"failure"``.
+        - ``kind == "mutation"`` first verifies anti-gaming baseline failure by committing
+          ``bug_case.mutated_files`` onto ``base_sha``; dud mutations that do not fail on
+          baseline are recorded with ``baseline_failed=False`` and excluded from
+          ``bugs_total``. Valid mutations are then replayed with
+          ``bug_case.mutated_files | candidate.files`` onto ``base_sha`` and counted as
+          caught iff the candidate run concludes ``"failure"``.
         """
         repo = self._resolve_repo(candidate)
         workflow_file = self._resolve_workflow(candidate, workflow)
@@ -255,7 +283,7 @@ class Dispatcher:
             base_sha=base_sha,
             candidate_ref=candidate_ref,
         )
-        target = _ReplayTarget(repo=repo, workflow=workflow_file, candidate=candidate)
+        target = _ReplayTarget(repo=repo, workflow=workflow_file, base_sha=base_sha, candidate=candidate)
         bugs_total, bugs_caught, replay_urls, bug_outcomes = self._collect_bug_replays(target, replay_plan)
         return Evidence(
             candidate_id=candidate.id,
@@ -341,44 +369,57 @@ class Dispatcher:
         bug_outcomes: list[dict[str, Any]] = []
 
         for idx, bug_case in enumerate(replay_plan.cases):
-            # TODO(dispatcher owner): wire mutation bug replay execution alongside commit replays.
-            if bug_case.kind != "commit":
-                continue
-            caught, outcome, run_url = self._replay_commit_case(target, bug_case, idx)
-            bugs_total += 1
-            if caught:
-                bugs_caught += 1
-            if run_url:
-                run_urls.append(run_url)
-            bug_outcomes.append(outcome)
+            result = self._replay_bug_case(target, bug_case, idx)
+            if result.counted:
+                bugs_total += 1
+                if result.caught:
+                    bugs_caught += 1
+            run_urls.extend(result.run_urls)
+            bug_outcomes.append(result.outcome)
 
         return bugs_total, bugs_caught, tuple(run_urls), tuple(bug_outcomes)
+
+    def _replay_bug_case(
+        self,
+        target: _ReplayTarget,
+        bug_case: BugCase,
+        idx: int,
+    ) -> _BugReplayResult:
+        if bug_case.kind == "commit":
+            return self._replay_commit_case(target, bug_case, idx)
+        if bug_case.kind == "mutation":
+            return self._replay_mutation_case(target, bug_case, idx)
+        msg = f"Unsupported bug case kind at index {idx}: {bug_case.kind!r}"
+        raise ValueError(msg)
+
+    def _run_ephemeral_branch(self, target: _ReplayTarget, spec: _BranchReplaySpec) -> WorkflowRunResult:
+        self.github.create_branch(target.repo, spec.branch, spec.base_sha)
+        try:
+            self.github.commit_files(target.repo, spec.branch, spec.base_sha, spec.files, spec.message)
+            return self._dispatch_and_poll(target.repo, target.workflow, spec.branch)
+        finally:
+            self.github.delete_branch(target.repo, spec.branch)
 
     def _replay_commit_case(
         self,
         target: _ReplayTarget,
         bug_case: BugCase,
         idx: int,
-    ) -> tuple[bool, dict[str, Any], str]:
+    ) -> _BugReplayResult:
         commit_sha = bug_case.commit_sha
         if not commit_sha:
             msg = f"Commit bug case at index {idx} is missing commit_sha"
             raise ValueError(msg)
 
-        replay_branch = f"pc/replay-{target.candidate.id}-{idx}"
-        self.github.create_branch(target.repo, replay_branch, commit_sha)
-        try:
-            self.github.commit_files(
-                target.repo,
-                replay_branch,
-                commit_sha,
-                dict(target.candidate.files),
-                f"Pit Crew replay: overlay candidate {target.candidate.id} onto {commit_sha}",
-            )
-            run = self._dispatch_and_poll(target.repo, target.workflow, replay_branch)
-        finally:
-            self.github.delete_branch(target.repo, replay_branch)
-
+        run = self._run_ephemeral_branch(
+            target,
+            _BranchReplaySpec(
+                branch=f"pc/replay-{target.candidate.id}-{idx}",
+                base_sha=commit_sha,
+                files=dict(target.candidate.files),
+                message=f"Pit Crew replay: overlay candidate {target.candidate.id} onto {commit_sha}",
+            ),
+        )
         caught = run.conclusion == "failure"
         outcome: dict[str, Any] = {
             "kind": "commit",
@@ -387,7 +428,61 @@ class Dispatcher:
             "baseline_failed": True,
             "run_url": run.html_url,
         }
-        return caught, outcome, run.html_url
+        run_urls = (run.html_url,) if run.html_url else ()
+        return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=run_urls)
+
+    def _replay_mutation_case(
+        self,
+        target: _ReplayTarget,
+        bug_case: BugCase,
+        idx: int,
+    ) -> _BugReplayResult:
+        if not bug_case.mutated_files:
+            msg = f"Mutation bug case at index {idx} is missing mutated_files"
+            raise ValueError(msg)
+
+        ref = bug_case.reason or ",".join(sorted(bug_case.mutated_files))
+        baseline_run = self._run_ephemeral_branch(
+            target,
+            _BranchReplaySpec(
+                branch=f"pc/replay-{target.candidate.id}-{idx}-base",
+                base_sha=target.base_sha,
+                files=dict(bug_case.mutated_files),
+                message=f"Pit Crew mutation baseline replay {idx} for candidate {target.candidate.id}",
+            ),
+        )
+        run_urls: list[str] = [baseline_run.html_url] if baseline_run.html_url else []
+        baseline_failed = baseline_run.conclusion == "failure"
+        if not baseline_failed:
+            outcome: dict[str, Any] = {
+                "kind": "mutation",
+                "ref": ref,
+                "caught": False,
+                "baseline_failed": False,
+                "run_url": baseline_run.html_url,
+            }
+            return _BugReplayResult(counted=False, caught=False, outcome=outcome, run_urls=tuple(run_urls))
+
+        candidate_run = self._run_ephemeral_branch(
+            target,
+            _BranchReplaySpec(
+                branch=f"pc/replay-{target.candidate.id}-{idx}-cand",
+                base_sha=target.base_sha,
+                files=bug_case.mutated_files | target.candidate.files,
+                message=f"Pit Crew mutation candidate replay {idx} for candidate {target.candidate.id}",
+            ),
+        )
+        if candidate_run.html_url:
+            run_urls.append(candidate_run.html_url)
+        caught = candidate_run.conclusion == "failure"
+        outcome = {
+            "kind": "mutation",
+            "ref": ref,
+            "caught": caught,
+            "baseline_failed": True,
+            "run_url": candidate_run.html_url,
+        }
+        return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=tuple(run_urls))
 
     def run_cycle(self, repo: str, base_sha: str | None = None) -> Verdict | None:
         """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any."""
