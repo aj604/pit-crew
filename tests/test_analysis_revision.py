@@ -246,7 +246,8 @@ def test_only_pull_request_runs_gives_no_findings_and_says_why(monkeypatch: pyte
     assert result["profile_summary"]["runs_analyzed"] == 0
     assert result["profile_summary"]["runs_excluded_event"] == 3
     assert len(result["uncovered"]) == 1
-    assert "Only pull-request runs" in result["uncovered"][0]
+    assert "No push, workflow_dispatch, schedule or merge_group runs were found" in result["uncovered"][0]
+    assert "Pull-request and other runs" in result["uncovered"][0]
     assert "branch=<default>" in result["uncovered"][0]
 
 

@@ -248,9 +248,10 @@ _NO_MATCHING_REVISION = (
     "Analyse the branch the history comes from: check that branch out and pass it as `branch`."
 )
 
-_ONLY_PULL_REQUEST_RUNS = (
-    "Only pull-request runs were found, and they cannot be matched to the checkout's workflow file: "
-    "pull_request runs execute the merge commit's workflow and pull_request_target the base branch's. "
+_NO_TRUSTED_EVENT_RUNS = (
+    "No push, workflow_dispatch, schedule or merge_group runs were found. Pull-request and other runs "
+    "cannot be matched to the checkout's workflow file: pull_request runs execute the merge commit's "
+    "workflow and pull_request_target the base branch's. "
     "Profile the default branch (`branch=<default>`) or runs from `push` / `workflow_dispatch`."
 )
 
@@ -334,7 +335,7 @@ def find_bottlenecks(
 
 def _uncovered_notes(ci: CIProfile, *, no_match: bool, only_other_events: bool) -> list[str]:
     if only_other_events:
-        return [_ONLY_PULL_REQUEST_RUNS]
+        return [_NO_TRUSTED_EVENT_RUNS]
     return [_NO_MATCHING_REVISION] if no_match else _uncovered(ci)
 
 
