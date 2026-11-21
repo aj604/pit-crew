@@ -51,6 +51,7 @@ _SETUP_COMMAND = re.compile(
 _SETUP_ACTION = re.compile(r"(?:^actions/checkout$|setup|cache|^actions/download-artifact$)", re.IGNORECASE)
 _UPLOAD_ACTION = "actions/upload-artifact"
 _RETRY_ACTION = re.compile(r"retry", re.IGNORECASE)
+_BROWSER_TESTS = re.compile(r"\b(?:playwright|cypress|wdio|webdriverio|puppeteer)\b", re.IGNORECASE)
 _DISABLED_IF = re.compile(r"^\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*$", re.IGNORECASE)
 _SHELL_SEPARATOR = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "do", "done", "esac", "{", "}"})
@@ -153,6 +154,7 @@ def _compare_workflow(path: str, before: str, new: Workflow, report: GuardReport
         report.problems.append(f"{path}: {exc}")
         return
     report.warnings.extend(f"{path}: {note}" for note in _setup_changes(old, new))
+    report.warnings.extend(f"{path}: {note}" for note in _missing_recordings(new))
 
 
 def _load(path: str, text: str, report: GuardReport) -> Workflow | None:
@@ -564,3 +566,18 @@ _COMPARISONS: tuple[Callable[[Workflow, Workflow], list[str]], ...] = (
     _no_new_weakening,
     _timeouts_kept,
 )
+
+
+def _missing_recordings(workflow: Workflow) -> list[str]:
+    """Jobs that run browser tests but upload nothing, so the Proof lane has no failure video."""
+    notes = []
+    for job_id, job in _jobs(workflow).items():
+        steps = _job_steps(job)
+        runs_browser = any(isinstance(s.get("run"), str) and _BROWSER_TESTS.search(s["run"]) for s in steps)
+        uploads = any(isinstance(s.get("uses"), str) and s["uses"].startswith(_UPLOAD_ACTION) for s in steps)
+        if runs_browser and not uploads:
+            notes.append(
+                f"job `{job_id}` runs browser tests but uploads no failure recordings; "
+                "apply the artifact-capture companion playbook"
+            )
+    return notes

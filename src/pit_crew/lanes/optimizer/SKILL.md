@@ -18,7 +18,8 @@ push: the host publishes your branch, and GitHub Actions measures it.
 2. Call `list_prior_attempts` for the repo. If this skill was already rejected for this
    bottleneck, read the reason and change what made it fail, or stop.
 3. Read the playbook for the skill at `.agents/skills/optimizer/playbooks/<skill>.md`, and only
-   that one. One hypothesis, one playbook, one change.
+   that one (plus the `artifact-capture` companion when the guard asks for it). One hypothesis,
+   one playbook, one change.
 4. Read the files you will change in full, and keep their original text.
 5. Make the change. Touch only `.github/**` and runner or build config files (`package.json`,
    `pyproject.toml`, `playwright.config.*` and the like). Never edit application code or tests.
@@ -37,6 +38,9 @@ push: the host publishes your branch, and GitHub Actions measures it.
   `--exit-zero`, or anything else that hides a failure. The guard rejects these, and so does
   the rater when a replayed bug stops failing.
 - Keep every failure artifact upload (screenshots, videos, traces). The Proof lane inspects them.
+  If a job you change runs browser tests and uploads no failure recordings (the guard warns),
+  also apply the `artifact-capture` companion playbook. It records only on failure, so it does
+  not slow green runs and does not count as a second change.
 - Keep existing job ids and names, since branch protection may require them. If you move a
   job's checks into new jobs, the old job becomes a gate: `needs:` them, `if: always()`, and a
   step that fails unless every needed job succeeded.
