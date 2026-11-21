@@ -55,17 +55,22 @@ class Workflow:
     def job_id_for(self, display_name: str) -> str | None:
         """The job id a display name from the API belongs to, or None if it matches no job."""
         jobs = list(self.jobs.values())
-        for job in jobs:  # a literal name is the strongest evidence
-            if _EXPRESSION.search(job.name) is None and job.name == display_name:
+        wanted = _normalize(display_name)
+        for job in jobs:  # a literal name, or the raw one GitHub shows for a skipped matrix job
+            if display_name == job.name or (_EXPRESSION.search(job.name) is None and wanted == _normalize(job.name)):
                 return job.id
         expanded = {job.id: _expand_name(job) for job in jobs}
         for job in jobs:  # `${{ matrix.key }}` names with known values are literal names in disguise
-            if display_name in (expanded[job.id] or ()):
+            if wanted in (expanded[job.id] or ()):
                 return job.id
-        # Names left over are patterns: most literal characters first, bare expressions last.
-        patterns = sorted((j for j in jobs if expanded[j.id] is None), key=lambda j: -_literal_length(j.name))
+        # Names left over are patterns, most literal characters first. A name with no literal text that
+        # could be expanded must never be a wildcard: it would swallow every unrelated job.
+        patterns = sorted(
+            (j for j in jobs if expanded[j.id] is None or _literal_length(j.name) > 0),
+            key=lambda j: -_literal_length(j.name),
+        )
         for job in patterns:
-            if _matches(job, display_name):
+            if _matches(job, wanted):
                 return job.id
         caller = display_name.split(" / ", 1)[0]  # reusable workflows report "caller / inner job"
         if caller != display_name:
@@ -150,14 +155,23 @@ def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], .
     for key, raw in matrix.items():
         if key in ("include", "exclude"):
             continue
-        if isinstance(raw, list) and all(isinstance(v, str | int | float | bool) for v in raw):
-            values[str(key)] = [str(v) for v in raw]
+        if isinstance(raw, list):
+            values[str(key)] = [str(v) for v in raw if _is_literal(v)]  # computed elements are left out
     includes = matrix.get("include")
     for entry in includes if isinstance(includes, list) else ():
         for key, value in entry.items() if isinstance(entry, dict) else ():
-            if isinstance(value, str | int | float | bool) and (str(key) in values or key not in matrix):
+            if _is_literal(value) and (str(key) in values or key not in matrix):
                 values.setdefault(str(key), []).append(str(value))
     return tuple((k, tuple(dict.fromkeys(v))) for k, v in values.items())
+
+
+def _is_literal(value: object) -> bool:
+    return isinstance(value, str | int | float | bool) and "${{" not in str(value)
+
+
+def _normalize(name: str) -> str:
+    """GitHub trims a display name and collapses runs of whitespace (an empty matrix value leaves a gap)."""
+    return " ".join(name.split())
 
 
 def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
@@ -180,7 +194,7 @@ def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
         pieces = [literals[0]]
         for key, literal in zip(keys, literals[1:], strict=True):
             pieces += [chosen[str(key)], literal]
-        names.append("".join(pieces))
+        names.append(_normalize("".join(pieces)))
     return tuple(names)
 
 

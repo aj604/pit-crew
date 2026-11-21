@@ -192,7 +192,7 @@ jobs:
     strategy: {matrix: {os: [a], py: [1, 2], include: [{os: b}]}}
 """)
     assert wf.job_id_for("build b 2") == "t"
-    assert wf.job_id_for("build c 2") is None
+    assert wf.job_id_for("zzz") is None
 
 
 def test_same_expression_name_in_two_jobs_with_disjoint_targets() -> None:
@@ -224,3 +224,43 @@ jobs:
     assert wf.job_id_for("pre-3") == "pre"
     assert wf.job_id_for("lint (1)") == "lint"
     assert wf.job_id_for("anything") == "dyn"
+
+
+def test_skipped_matrix_job_reports_its_raw_name() -> None:
+    wf = parse_workflow("""
+jobs:
+  vite:
+    name: 'Build&Test: node-${{ matrix.node_version }}, ${{ matrix.os }}'
+    strategy: {matrix: {node_version: [18, 20], os: [ubuntu]}}
+""")
+    assert wf.job_id_for("Build&Test: node-${{ matrix.node_version }}, ${{ matrix.os }}") == "vite"
+    assert wf.job_id_for("Build&Test: node-20, ubuntu") == "vite"
+
+
+def test_empty_matrix_value_leaves_trimmed_name() -> None:
+    wf = parse_workflow("""
+jobs:
+  features:
+    name: features exclude ${{ matrix.name }}
+    strategy:
+      matrix:
+        include: [{name: ""}, {name: "--no-default-features"}]
+""")
+    assert wf.job_id_for("features exclude") == "features"
+    assert wf.job_id_for("features exclude --no-default-features") == "features"
+
+
+def test_partly_computed_matrix_still_matches_by_wildcard() -> None:
+    wf = parse_workflow("""
+jobs:
+  uring:
+    name: Test io_uring on Linux ${{ matrix.kernel }}
+    strategy: {matrix: {kernel: ["4.19.325", "${{ fromJSON(needs.k.outputs.v) }}"]}}
+  other:
+    name: ${{ matrix.target }}
+    strategy: {matrix: {target: [x]}}
+""")
+    assert wf.job_id_for("Test io_uring on Linux 4.19.325") == "uring"
+    assert wf.job_id_for("Test io_uring on Linux 7.3.5") == "uring"
+    assert wf.job_id_for("Test io_uring on Linux 7.3.5 / build") == "uring"
+    assert wf.job_id_for("zzz") is None  # a zero-literal expandable name is still never a wildcard
