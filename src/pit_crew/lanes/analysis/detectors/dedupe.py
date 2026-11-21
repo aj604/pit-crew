@@ -6,7 +6,7 @@ from pit_crew.lanes.analysis.critical_path import CIProfile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
-StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
+StepSig = tuple[str, str, tuple[tuple[str, str], ...], str]  # uses, run, with, if
 Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...], str]
 
 
@@ -16,8 +16,8 @@ def _script(run: str | None) -> str:
 
 
 def _signature(job: JobSpec) -> Signature:
-    """What a job does and where: runner, matrix values, and each step's command and inputs. Step names are ignored."""
-    steps = tuple((s.uses or "", _script(s.run), tuple(sorted(s.with_.items()))) for s in job.steps)
+    """What a job does and where: runner, matrix, and each step's command, inputs and `if:`. Step names are ignored."""
+    steps = tuple((s.uses or "", _script(s.run), tuple(sorted(s.with_.items())), s.if_ or "") for s in job.steps)
     matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
     return (job.runs_on, job.matrix_keys, matrix, steps, job.matrix_definition)
 

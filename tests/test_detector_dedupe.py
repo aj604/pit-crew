@@ -251,3 +251,17 @@ def test_dedupe_ignores_scripts_that_differ_in_internal_whitespace() -> None:
         {"a": 100, "b": 200},
     )
     assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_jobs_whose_step_conditions_differ() -> None:
+    def steps(first: str, second: str) -> str:
+        return f"- run: make lint\n        if: {first}\n      - run: make test\n        if: {second}"
+
+    p, wf = profiled(
+        _pair(
+            step_a=steps("github.event_name == 'push'", "always()"),
+            step_b=steps("always()", "github.event_name == 'push'"),
+        ),
+        {"a": 100, "b": 200},
+    )
+    assert detect_dedupe_jobs(p, wf, PATH) == []
