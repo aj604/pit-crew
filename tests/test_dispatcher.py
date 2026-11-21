@@ -3422,6 +3422,8 @@ def test_dispatcher_records_replays_and_wires_multimodal_verification_into_evide
         "candidate_artifact_urls": [],
         "baseline_preview_path": "",
         "candidate_preview_path": "",
+        "baseline_video_url": "",
+        "candidate_video_url": "",
         "kind": "commit",
         "ref": "deadbeef01",
         "caught": True,

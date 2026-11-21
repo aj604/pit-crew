@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, get_args
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.demo import DemoEngine, create_demo_router
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.proof_bridge import MEDIA_URL_PREFIX, is_safe_mp4_filename
 from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
 
@@ -265,8 +266,73 @@ def _resolve_preview_url(repo: str, head_sha: str, raw_path: object) -> str:
     return ""
 
 
+def _resolve_video_url(raw_url: object) -> str:
+    """Resolve a playable replay MP4 URL (deployed ``/media/*.mp4`` or ``http(s)://``)."""
+    if not isinstance(raw_url, str):
+        return ""
+    value = raw_url.strip()
+    if not value:
+        return ""
+    if value.startswith(("https://", "http://")):
+        return value
+    prefix = f"{MEDIA_URL_PREFIX}/"
+    if value.startswith(prefix) and is_safe_mp4_filename(value[len(prefix) :]):
+        return value
+    return ""
+
+
+def _resolve_media_dir(ledger: Ledger, media_dir: Path | None) -> Path | None:
+    """Resolve the persistent MP4 media directory for the server."""
+    if media_dir is not None:
+        return media_dir
+    env_dir = os.environ.get("PIT_CREW_MEDIA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    if isinstance(ledger, SqliteLedger):
+        return ledger.path.resolve().parent / "media"
+    return None
+
+
+def _resolve_media_file(media_dir: Path | None, filename: str) -> Path:
+    """Validate ``filename`` and resolve an existing ``.mp4`` inside ``media_dir``."""
+    if media_dir is None or not is_safe_mp4_filename(filename):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    root = media_dir.resolve()
+    candidate = media_dir / filename
+    if candidate.is_symlink():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    return resolved
+
+
+def _make_media_token_dependency(
+    api_token: str,
+) -> Callable[[HTTPAuthorizationCredentials | None, str | None], None]:
+    """Build a FastAPI dependency enforcing Bearer header or ``?token=`` query auth on ``/media/*``."""
+
+    def _require_media_token(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+        token: Annotated[str | None, Query()] = None,
+    ) -> None:
+        provided = ""
+        if credentials is not None and credentials.scheme.lower() == "bearer" and credentials.credentials:
+            provided = credentials.credentials
+        elif token:
+            provided = token.strip()
+        if not provided or not hmac.compare_digest(provided, api_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return _require_media_token
+
+
 def _enrich_bug_outcome(repo: str, head_sha: str, outcome: dict[str, Any]) -> dict[str, Any]:
-    """Ensure attempt detail bug_outcomes expose multimodal fields and resolved preview URLs."""
+    """Ensure attempt detail bug_outcomes expose multimodal fields, preview URLs, and MP4 video URLs."""
     enriched = dict(outcome)
     enriched.setdefault("modality", "")
     enriched.setdefault("visual_evidence_seen", False)
@@ -285,6 +351,8 @@ def _enrich_bug_outcome(repo: str, head_sha: str, outcome: dict[str, Any]) -> di
         head_sha,
         enriched.get("candidate_preview_url") or enriched.get("candidate_preview_path"),
     )
+    enriched["baseline_video_url"] = _resolve_video_url(enriched.get("baseline_video_url"))
+    enriched["candidate_video_url"] = _resolve_video_url(enriched.get("candidate_video_url"))
     return enriched
 
 
@@ -329,6 +397,8 @@ def _attempt_detail(ledger: Ledger, repo: str, candidate_id: str) -> dict[str, A
                 "candidate_preview_path": str(row["candidate_preview_path"]),
                 "baseline_preview_url": row["baseline_preview_url"],
                 "candidate_preview_url": row["candidate_preview_url"],
+                "baseline_video_url": row["baseline_video_url"],
+                "candidate_video_url": row["candidate_video_url"],
             }
             for row in enriched_outcomes
         ]
@@ -418,24 +488,28 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
     *,
     brand_dir: Path | None = None,
     web_dir: Path | None = None,
+    media_dir: Path | None = None,
 ) -> FastAPI:
     """Create and configure the Pit Crew FastAPI application.
 
     The Pit Wall shell is served at ``/`` with its assets under ``/web``. Brand assets are mounted at
     ``/brand`` only when ``brand_dir`` exists, so an installed wheel without the repository's
-    ``brand/`` directory still starts cleanly.
+    ``brand/`` directory still starts cleanly. Persisted MP4 replay recordings are served at
+    ``/media/{filename}`` with HTTP Range streaming and optional ``?download=1`` attachment download.
     """
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
     progress_board = CycleProgressBoard()
     tracker = run_tracker if run_tracker is not None else RunTracker()
+    resolved_media_dir = _resolve_media_dir(ledger, media_dir)
     engine = DemoEngine()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
     app.state.run_tracker = tracker
     app.state.api_token = api_token
+    app.state.media_dir = resolved_media_dir
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
     app.state.progress_board = progress_board
@@ -523,9 +597,32 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
         """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
+    _register_media_route(app, media_dir=resolved_media_dir, api_token=api_token)
     resolved_brand = brand_dir if brand_dir is not None else _resolve_default_brand_dir()
     _mount_pit_wall(app, brand_dir=resolved_brand, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app
+
+
+def _register_media_route(app: FastAPI, *, media_dir: Path | None, api_token: str | None) -> None:
+    """Register ``GET /media/{filename}`` for Range-streamed and downloadable MP4 replays."""
+    cache_control = "private, max-age=3600" if api_token is not None else "public, max-age=3600"
+    media_auth_deps = [Depends(_make_media_token_dependency(api_token))] if api_token is not None else []
+
+    @app.get(f"{MEDIA_URL_PREFIX}/{{filename}}", dependencies=media_auth_deps)
+    def replay_media(
+        filename: str,
+        *,
+        download: Annotated[bool, Query()] = False,
+    ) -> FileResponse:
+        """Stream or download a persisted MP4 bug-replay video (supports HTTP Range seeking)."""
+        target = _resolve_media_file(media_dir, filename)
+        return FileResponse(
+            target,
+            media_type="video/mp4",
+            filename=filename,
+            content_disposition_type="attachment" if download else "inline",
+            headers={"Cache-Control": cache_control},
+        )
 
 
 def _mount_pit_wall(app: FastAPI, *, brand_dir: Path, web_dir: Path) -> None:

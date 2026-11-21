@@ -145,6 +145,8 @@ class Replay:
     candidate_artifact_urls: tuple[str, ...] = ()
     baseline_preview_path: str = ""
     candidate_preview_path: str = ""
+    baseline_video_url: str = ""
+    candidate_video_url: str = ""
     expected_checks: tuple[str, ...] = ()
     candidate_failed_checks: tuple[str, ...] = ()
 
@@ -183,6 +185,8 @@ class Replay:
             "candidate_artifact_urls": list(self.candidate_artifact_urls),
             "baseline_preview_path": self.baseline_preview_path,
             "candidate_preview_path": self.candidate_preview_path,
+            "baseline_video_url": self.baseline_video_url,
+            "candidate_video_url": self.candidate_video_url,
         }
 
 

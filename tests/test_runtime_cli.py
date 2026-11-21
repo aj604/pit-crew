@@ -16,7 +16,7 @@ from pit_crew import managed_agent, runtime_cli
 from pit_crew import workspace as host_workspace
 from pit_crew.contracts import BugCase, Candidate, Evidence, ReplayPlan, Verdict
 from pit_crew.dispatcher import Dispatcher, DispatcherConfig
-from pit_crew.github import HttpxGitHubClient, PullRequestClient, WorkflowRunResult
+from pit_crew.github import HttpxGitHubClient, PullRequestClient, RepoMetadata, WorkflowRunResult
 from pit_crew.ledger import SqliteLedger
 from pit_crew.proof_bridge import RECORD_SCRIPT_PATH, REPLAY_RECORD_ENV, ProofBridge, ProofHistoryClient
 from pit_crew.run_tracker import RunTracker
@@ -465,6 +465,15 @@ class _LiveRecordingGitHub(HttpxGitHubClient):
         _ = (repo, ref)
         return self._workflow_yaml if path == ".github/workflows/ci.yml" else None
 
+    @override
+    def get_repo_metadata(self, repo: str) -> RepoMetadata:
+        return RepoMetadata(full_name=repo, default_branch="main", can_push=True, parent_full_name=None)
+
+    @override
+    def list_workflow_files(self, repo: str) -> list[str]:
+        _ = repo
+        return ["ci.yml"]
+
 
 def _make_live_replay_transport(seen_log_job_ids: list[str]) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -567,3 +576,152 @@ def test_build_live_dispatcher_records_replays_and_forwards_aliases(
         assert REPLAY_RECORD_ENV in files[".github/workflows/ci.yml"]
     # Only the resolved failed job 501 ("Unit test") had its logs downloaded; unrelated 502 ("Lint") was skipped.
     assert seen_log_job_ids == ["501", "501"]
+
+
+def test_live_dispatcher_and_serve_persist_and_stream_replay_mp4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_yaml = (
+        "name: CI\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: pytest\n"
+    )
+    base_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00live-baseline-mp4"
+    cand_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00live-candidate-mp4"
+
+    def _zip_mp4(mp4: bytes) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("step-01.mp4", mp4)
+        return buf.getvalue()
+
+    zip_by_artifact = {101: _zip_mp4(base_mp4), 102: _zip_mp4(cand_mp4)}
+    routes: dict[str, httpx.Response] = {
+        "/repos/org/fork/actions/runs/1/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {
+                        "id": 101,
+                        "name": "pit-crew-replay-test-0",
+                        "size_in_bytes": len(zip_by_artifact[101]),
+                        "archive_download_url": "https://api.github.com/repos/org/fork/actions/artifacts/101/zip",
+                        "expired": False,
+                    }
+                ]
+            },
+        ),
+        "/repos/org/fork/actions/runs/2/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {
+                        "id": 102,
+                        "name": "pit-crew-replay-test-0",
+                        "size_in_bytes": len(zip_by_artifact[102]),
+                        "archive_download_url": "https://api.github.com/repos/org/fork/actions/artifacts/102/zip",
+                        "expired": False,
+                    }
+                ]
+            },
+        ),
+        "/repos/org/fork/actions/artifacts/101/zip": httpx.Response(200, content=zip_by_artifact[101]),
+        "/repos/org/fork/actions/artifacts/102/zip": httpx.Response(200, content=zip_by_artifact[102]),
+        "/repos/org/fork/actions/runs/1/jobs": httpx.Response(
+            200, json={"jobs": [{"id": 10, "name": "test", "conclusion": "failure"}]}
+        ),
+        "/repos/org/fork/actions/runs/2/jobs": httpx.Response(
+            200, json={"jobs": [{"id": 10, "name": "test", "conclusion": "failure"}]}
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/logs"):
+            return httpx.Response(200, content=b"FAILED test_app.py\n")
+        return routes.get(path, httpx.Response(404))
+
+    def fake_ask(
+        _model: str,
+        _parts: Sequence[tuple[str, str | bytes]],
+        _schema: Mapping[str, object],
+    ) -> str:
+        return json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "FAILED test_app.py",
+                "candidate_failure": "FAILED test_app.py",
+                "reason": "Identical terminal video failure.",
+                "visual_evidence_seen": True,
+                "visual_summary": "Terminal video shows identical FAILED test_app.py.",
+            }
+        )
+
+    monkeypatch.setattr(managed_agent, "ask_multimodal", fake_ask)
+    monkeypatch.setenv("PIT_CREW_PUBLIC_URL", "https://deployed.pit-crew.test")
+    ledger_path = tmp_path / "deploy.db"
+    media_dir = tmp_path / "media"
+    ledger = SqliteLedger(ledger_path)
+
+    with (
+        _LiveRecordingGitHub(workflow_yaml, transport=httpx.MockTransport(handler)) as gh,
+        ExitStack() as stack,
+    ):
+        dispatcher = runtime_cli._build_live_dispatcher(  # noqa: SLF001
+            ledger,
+            RunTracker(),
+            DispatcherConfig(timing_pairs=0, max_parallel_runs=2),
+            github=gh,
+            stack=stack,
+            media_dir=media_dir,
+        )
+        cand = Candidate(
+            id="cand-mp4",
+            hypothesis_id="h1",
+            branch="pc/mp4",
+            summary="cache",
+            repo="org/fork",
+            base_sha="base-sha",
+            head_sha="head-sha",
+            files={".github/workflows/ci.yml": workflow_yaml.replace("pytest", "pytest -q")},
+        )
+        plan = ReplayPlan(
+            candidate_id=cand.id,
+            cases=(BugCase(kind="commit", commit_sha="deadbeef", expected_checks=("CI/test",)),),
+        )
+        ev = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+        saved_videos = dispatcher.last_replay_videos
+
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert len(saved_videos) == 2
+    base_video_url = str(ev.bug_outcomes[0]["baseline_video_url"])
+    cand_video_url = str(ev.bug_outcomes[0]["candidate_video_url"])
+    assert base_video_url.startswith("/media/")
+    assert cand_video_url.startswith("/media/")
+
+    # Serving the same ledger + media_dir immediately streams both real MP4s.
+    captured_apps: list[FastAPI] = []
+    args = _parser().parse_args(
+        ["serve", "--ledger", str(ledger_path), "--media-dir", str(media_dir), "--port", "8765"]
+    )
+    summary, ok = runtime_cli.run_runtime_command(
+        args,
+        serve_runner=lambda app, **_kw: captured_apps.append(app),
+    )
+    assert ok is True
+    assert summary["media_dir"] == str(media_dir)
+    with TestClient(captured_apps[0]) as client:
+        base_resp = client.get(base_video_url)
+        cand_resp = client.get(f"{cand_video_url}?download=1")
+        assert base_resp.status_code == 200
+        assert base_resp.headers["content-type"] == "video/mp4"
+        assert base_resp.content == base_mp4
+        assert cand_resp.status_code == 200
+        assert cand_resp.headers["content-disposition"].startswith("attachment;")
+        assert cand_resp.content == cand_mp4

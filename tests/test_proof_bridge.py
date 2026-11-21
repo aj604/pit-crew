@@ -1,25 +1,33 @@
 import io
 import json
+import subprocess
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import pytest
 
 from pit_crew import managed_agent, rater
 from pit_crew.contracts import Candidate, Evidence, Verdict, is_allowed_candidate_path
+from pit_crew.lanes.proof.artifacts import MediaPart, score_artifact_name
 from pit_crew.lanes.proof.card import pr_body, render_card
 from pit_crew.lanes.proof.miner import JobRun
 from pit_crew.lanes.proof.verify import Replay
 from pit_crew.ledger import InMemoryLedger, Ledger
 from pit_crew.proof_bridge import (
+    MEDIA_URL_PREFIX,
     PROOF_CARD_PATH,
     MultimodalReplayVerifier,
     ProofBridge,
     ProofBridgeError,
     ProofPRConfig,
     ReplayRunPair,
+    default_media_dir,
+    extract_mp4_bytes,
+    is_safe_mp4_filename,
+    persist_replay_mp4,
     verify_replay_run_pairs,
 )
 
@@ -523,8 +531,8 @@ def test_verify_replay_runs_skips_verifier_when_not_both_failed() -> None:
 
 
 class FakePRGitHub(FakeProofGitHub):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, run_outputs: dict[tuple[str, str], bytes | Exception] | None = None) -> None:
+        super().__init__(run_outputs=run_outputs)
         self.committed: list[tuple[str, str, dict[str, str], str]] = []
         self.opened_prs: list[dict[str, str]] = []
 
@@ -1053,3 +1061,160 @@ def test_untargeted_sha_only_replay_and_job_id_aliases_verify_cleanly() -> None:
         assert aliased.bugs_caught == 1
         assert aliased.replays[0].status == "caught"
         assert downloaded_log_jobs == ["21", "31"]
+
+
+def test_mp4_extraction_transcoding_and_atomic_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41-video-body"
+    webm_bytes = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01-webm-body"
+
+    assert score_artifact_name("pit-crew-replay-test-0", "test")[0] < score_artifact_name("coverage-report", "test")[0]
+
+    # Direct MP4 extraction wins over WebM.
+    direct = extract_mp4_bytes(
+        [
+            MediaPart("browser.webm", "video/webm", webm_bytes, "browser_video"),
+            MediaPart("terminal.mp4", "video/mp4", mp4_bytes, "terminal_video"),
+        ]
+    )
+    assert direct == mp4_bytes
+
+    # WebM transcode via ffmpeg returns valid MP4 bytes when ffmpeg succeeds.
+    def fake_ffmpeg_ok(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        Path(cmd[-1]).write_bytes(mp4_bytes)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_ffmpeg_ok)
+    converted = extract_mp4_bytes([MediaPart("browser.webm", "video/webm", webm_bytes, "browser_video")])
+    assert converted == mp4_bytes
+
+    # Missing ffmpeg degrades cleanly to None.
+    def fake_ffmpeg_missing(_cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(subprocess, "run", fake_ffmpeg_missing)
+    assert extract_mp4_bytes([MediaPart("browser.webm", "video/webm", webm_bytes, "browser_video")]) is None
+    assert extract_mp4_bytes([MediaPart("log.txt", "text/plain", b"hello", "log")]) is None
+
+    # persist_replay_mp4 validates magic bytes, writes atomically, invokes hook, and survives hook failure.
+    assert persist_replay_mp4(tmp_path, b"not-an-mp4", sha="abc", run_id="1", side="baseline") is None
+    saved_hook_paths: list[Path] = []
+    res = persist_replay_mp4(
+        tmp_path,
+        mp4_bytes,
+        sha="../deadbeef",
+        run_id="run/99",
+        side="baseline",
+        on_saved=saved_hook_paths.append,
+    )
+    assert res is not None
+    media_url, file_path = res
+    assert media_url.startswith(f"{MEDIA_URL_PREFIX}/")
+    assert is_safe_mp4_filename(file_path.name)
+    assert file_path.read_bytes() == mp4_bytes
+    assert saved_hook_paths == [file_path]
+
+    # Idempotent rewrite skips disk write and hook exception is non-fatal.
+    def failing_hook(_path: Path) -> None:
+        raise OSError
+
+    res_again = persist_replay_mp4(
+        tmp_path, mp4_bytes, sha="../deadbeef", run_id="run/99", side="baseline", on_saved=failing_hook
+    )
+    assert res_again == (media_url, file_path)
+
+    # default_media_dir respects PIT_CREW_MEDIA_DIR, ledger sibling, and fallback.
+    monkeypatch.delenv("PIT_CREW_MEDIA_DIR", raising=False)
+    assert default_media_dir(tmp_path / "ledger.db") == (tmp_path / "media").resolve()
+    assert default_media_dir(None) == Path(".pit_crew/media")
+    monkeypatch.setenv("PIT_CREW_MEDIA_DIR", str(tmp_path / "custom-media"))
+    assert default_media_dir(tmp_path / "ledger.db") == tmp_path / "custom-media"
+
+
+def test_proof_bridge_and_verifier_persist_mp4_and_link_in_kept_pr(tmp_path: Path) -> None:
+    repo = "acme/demo"
+    base_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00baseline-video"
+    cand_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00candidate-video"
+    github = FakePRGitHub(
+        run_outputs={
+            (repo, "run-101"): base_mp4,
+            (repo, "run-102"): cand_mp4,
+        }
+    )
+    fake_client = _FakeModelsClient(
+        json.dumps(
+            {
+                "same": True,
+                "baseline_failure": "AssertionError: total mismatch",
+                "candidate_failure": "AssertionError: total mismatch",
+                "reason": "Identical failure recorded in both MP4 videos.",
+                "visual_evidence_seen": True,
+                "visual_summary": "Terminal shows AssertionError on both sides.",
+            }
+        )
+    )
+    ask = partial(managed_agent.ask_multimodal, client=fake_client)
+    media_dir = tmp_path / "media"
+    committed_hooks: list[Path] = []
+    bridge = ProofBridge(
+        github,
+        ask=ask,
+        media_dir=media_dir,
+        on_media_saved=committed_hooks.append,
+        public_base_url="https://pit-crew.example.test/",
+    )
+    assert bridge.media_dir == media_dir
+    assert bridge.public_base_url == "https://pit-crew.example.test"
+
+    pair = ReplayRunPair(
+        sha="deadbeef1234",
+        check="CI/Unit Tests",
+        baseline_conclusion="failure",
+        candidate_conclusion="failure",
+        baseline_run_id="run-101",
+        candidate_run_id="run-102",
+        baseline_run_url="https://github.com/acme/demo/actions/runs/101",
+        candidate_run_url="https://github.com/acme/demo/actions/runs/102",
+    )
+    verification = bridge.verify_replay_runs(repo, [pair])
+    assert verification.bugs_total == 1
+    assert verification.bugs_caught == 1
+    assert len(verification.video_paths) == 2
+    assert len(committed_hooks) == 2
+    assert all(Path(p).read_bytes() in {base_mp4, cand_mp4} for p in verification.video_paths)
+    replay = verification.replays[0]
+    assert replay.baseline_video_url.startswith("/media/")
+    assert replay.candidate_video_url.startswith("/media/")
+    assert verification.bug_outcomes[0]["baseline_video_url"] == replay.baseline_video_url
+    assert verification.bug_outcomes[0]["candidate_video_url"] == replay.candidate_video_url
+
+    # Opening a kept PR with public_base_url links directly to baseline.mp4 and candidate.mp4.
+    cand = Candidate(id="cand-mp4", hypothesis_id="h1", branch="pc/mp4", summary="cache deps", repo=repo)
+    ev = verification.to_evidence(cand.id, (120.0,) * 5, (48.0,) * 5)
+    verdict = rater.rate(ev)
+    opened = bridge.open_kept_pr(
+        cand,
+        ev,
+        verdict,
+        verification.replays,
+        config=ProofPRConfig(auto_open_pr=True, repo=repo),
+    )
+    assert opened is not None
+    assert f"[baseline.mp4](https://pit-crew.example.test{replay.baseline_video_url})" in opened.body
+    assert f"[candidate.mp4](https://pit-crew.example.test{replay.candidate_video_url})" in opened.body
+
+    # Even if Gemini fails (unverified), persisted MP4 URLs are still kept on the Replay.
+    bad_ask = partial(managed_agent.ask_multimodal, client=_FakeModelsClient(RuntimeError("gemini down")))
+    unverified = bridge.verify_replay_runs(repo, [pair], ask=bad_ask)
+    assert unverified.replays[0].status == "unverified"
+    assert unverified.replays[0].baseline_video_url.startswith("/media/")
+    assert unverified.replays[0].candidate_video_url.startswith("/media/")
+    assert len(unverified.video_paths) == 2
+
+    # Standalone MultimodalReplayVerifier also persists MP4 recordings when media_dir is configured.
+    verifier_media = tmp_path / "verifier-media"
+    verifier = MultimodalReplayVerifier(github, ask=ask, media_dir=verifier_media)
+    standalone = verifier.verify_replay_runs(repo, [pair])
+    assert standalone.bugs_caught == 1
+    assert len(standalone.video_paths) == 2
+    assert standalone.replays[0].baseline_video_url.startswith("/media/")
+    assert standalone.replays[0].candidate_video_url.startswith("/media/")

@@ -13,13 +13,17 @@ with ``gemini-4-carbon`` under fail-closed visual-downgrade and ``expected_check
 """
 
 import base64
+import hashlib
 import inspect
 import logging
+import os
 import re
+import subprocess
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
 from pit_crew.contracts import Candidate, Evidence, Verdict
@@ -31,6 +35,7 @@ from pit_crew.lanes.proof.artifacts import (
     MediaPart,
     UnsafeArchiveError,
     bundle_from_raw,
+    detect_magic_mime,
     extract_zip_artifact,
     is_png,
     score_artifact_name,
@@ -67,6 +72,8 @@ __all__ = [
     "HISTORICAL_MAX_SCREENSHOTS",
     "HISTORICAL_MAX_SCREENSHOT_BYTES",
     "HISTORICAL_MAX_TOTAL_BYTES",
+    "MAX_SAVED_VIDEO_BYTES",
+    "MEDIA_URL_PREFIX",
     "PROOF_ARTIFACTS_DIR",
     "PROOF_CARD_PATH",
     "PR_MAX_PREVIEW_BYTES",
@@ -89,8 +96,12 @@ __all__ = [
     "ReplayRunPair",
     "ReplayVerification",
     "build_replay_overlay",
+    "default_media_dir",
+    "extract_mp4_bytes",
     "extract_replay_video",
     "instrument_workflow",
+    "is_safe_mp4_filename",
+    "persist_replay_mp4",
     "resolve_workflow_check_aliases",
     "verify_replay_run_pairs",
 ]
@@ -100,6 +111,8 @@ logger = logging.getLogger(__name__)
 PROOF_CARD_PATH = ".github/pit-crew/proof-card.svg"
 PROOF_ARTIFACTS_DIR = ".github/pit-crew/proof-artifacts"
 SANDBOX_ARTIFACTS_DIR = "/workspace/.pit-crew/artifacts"
+MEDIA_URL_PREFIX = "/media"
+MAX_SAVED_VIDEO_BYTES = 25 * 1024 * 1024  # 25 MiB per persisted replay MP4
 
 HISTORICAL_MAX_SCREENSHOTS = 3
 HISTORICAL_MAX_SCREENSHOT_BYTES = 512 * 1024  # 512 KiB per historical screenshot
@@ -110,6 +123,8 @@ PR_MAX_PREVIEW_BYTES = 500 * 1024  # 500 KiB per committed PR failure PNG
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SAFE_MP4_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp4$")
+_FFMPEG_TRANSCODE_TIMEOUT_SECONDS = 60
 
 
 class ProofBridgeError(ValueError):
@@ -185,13 +200,14 @@ class ReplayRunPair:
 
 @dataclass(frozen=True)
 class ReplayVerification:
-    """Verified replay outcomes ready to populate ``Evidence`` and PR visual previews."""
+    """Verified replay outcomes ready to populate ``Evidence``, PR visual previews, and MP4 exports."""
 
     replays: tuple[Replay, ...]
     bugs_total: int
     bugs_caught: int
     bug_outcomes: tuple[dict[str, object], ...]
     preview_files: tuple[tuple[str, bytes], ...] = ()
+    video_paths: tuple[str, ...] = ()
 
     def to_evidence(
         self,
@@ -220,6 +236,7 @@ class ProofPRConfig:
     auto_open_pr: bool = False
     base_branch: str = "main"
     repo: str = ""
+    media_base_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,39 +268,172 @@ class ProofContext:
     extra_sources: tuple[dict[str, str], ...] = ()
 
 
-def verify_replay_run_pairs(
+def default_media_dir(ledger_path: str | Path | None = None) -> Path:
+    """Return the default persistent directory for replay MP4 recordings."""
+    env_dir = os.environ.get("PIT_CREW_MEDIA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    if ledger_path is not None:
+        return Path(ledger_path).resolve().parent / "media"
+    return Path(".pit_crew/media")
+
+
+def is_safe_mp4_filename(name: str) -> bool:
+    """Return True when ``name`` is a single safe ``.mp4`` filename with no path traversal."""
+    return bool(_SAFE_MP4_NAME_RE.fullmatch(name)) and ".." not in name
+
+
+def extract_mp4_bytes(parts: Iterable[MediaPart]) -> bytes | None:
+    """Extract playable H.264 MP4 bytes from ``parts``, transcoding WebM via ``ffmpeg`` when needed."""
+    collected = list(parts)
+    for part in collected:
+        if 0 < len(part.data) <= MAX_SAVED_VIDEO_BYTES and detect_magic_mime(part.data) == "video/mp4":
+            return part.data
+    for part in collected:
+        if 0 < len(part.data) <= MAX_SAVED_VIDEO_BYTES and detect_magic_mime(part.data) == "video/webm":
+            converted = _transcode_webm_to_mp4(part.data)
+            if converted is not None:
+                return converted
+    return None
+
+
+def _transcode_webm_to_mp4(data: bytes) -> bytes | None:
+    """Transcode WebM video bytes to faststart H.264 MP4 via ``ffmpeg``; returns ``None`` if unavailable."""
+    with tempfile.TemporaryDirectory(prefix="pit-crew-mp4-") as tmp:
+        src = Path(tmp) / "input.webm"
+        dst = Path(tmp) / "output.mp4"
+        src.write_bytes(data)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+        try:
+            subprocess.run(  # noqa: S603  fixed command arguments with temp file paths
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=_FFMPEG_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            logger.debug("Skipping WebM->MP4 transcode: %s", error)
+            return None
+        if not dst.is_file():
+            return None
+        converted = dst.read_bytes()
+        if 0 < len(converted) <= MAX_SAVED_VIDEO_BYTES and detect_magic_mime(converted) == "video/mp4":
+            return converted
+        return None
+
+
+def persist_replay_mp4(  # noqa: PLR0913  explicit naming fields and storage hook
+    media_dir: Path,
+    data: bytes,
+    *,
+    sha: str,
+    run_id: str,
+    side: str,
+    on_saved: Callable[[Path], None] | None = None,
+) -> tuple[str, Path] | None:
+    """Persist validated MP4 bytes atomically into ``media_dir`` and return ``(media_url, file_path)``."""
+    if not (0 < len(data) <= MAX_SAVED_VIDEO_BYTES and detect_magic_mime(data) == "video/mp4"):
+        return None
+    sha_slug = _safe_slug(sha[:12], fallback="bug")
+    run_slug = _safe_slug(str(run_id)[:24], fallback="run")
+    side_slug = "baseline" if side == "baseline" else "candidate"
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    filename = f"{sha_slug}-{run_slug}-{side_slug}-{digest}.mp4"
+    if not is_safe_mp4_filename(filename):
+        return None
+
+    media_dir.mkdir(parents=True, exist_ok=True)
+    dest = media_dir / filename
+    if not dest.is_file():
+        fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".mp4", dir=media_dir)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            tmp_path.replace(dest)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    if on_saved is not None:
+        try:
+            on_saved(dest)
+        except Exception:
+            logger.warning("Replay media persistence hook failed for %s", dest, exc_info=True)
+    return f"{MEDIA_URL_PREFIX}/{filename}", dest
+
+
+def _safe_slug(raw: str, *, fallback: str) -> str:
+    cleaned = _SAFE_FILENAME_RE.sub("-", raw).strip(".-")
+    return cleaned or fallback
+
+
+def verify_replay_run_pairs(  # noqa: PLR0913  optional media persistence hooks
     github: ReplayFailureOutputClient,
     repo: str,
     runs: Iterable[ReplayRunPair],
     *,
     ask: AskModel,
+    media_dir: Path | str | None = None,
+    on_media_saved: Callable[[Path], None] | None = None,
 ) -> ReplayVerification:
     """Verify replay pairs via ``verify_replays``, ``tally``, and ``Replay.as_outcome``.
 
     Resolves expected checks against completed job outcomes on both baseline and candidate runs
     when available, downloads only check-scoped recording artifacts (verifying ``replay-meta.json``
-    when present), extracts MP4 bytes safely, and delegates multimodal equivalence checking to
-    ``compare_failures(..., ask=ask)``. Any check mismatch, ambiguous/missing video, corrupt
-    archive, or model error fails closed and does not increment ``bugs_caught``.
+    when present), extracts MP4 bytes safely, optionally persists MP4 files under ``media_dir``,
+    and delegates multimodal equivalence checking to ``compare_failures(..., ask=ask)``. Any check
+    mismatch, ambiguous/missing video, corrupt archive, or model error fails closed and does not
+    increment ``bugs_caught``.
     """
     compare = partial(compare_failures, ask=ask)
-    verified_tuple = tuple(_verify_replay_run_pair(github, repo, pair, compare=compare) for pair in runs)
+    resolved_dir = Path(media_dir) if media_dir is not None else None
+    verified: list[Replay] = []
+    saved_paths: list[str] = []
+    for pair in runs:
+        replay, pair_paths = _verify_replay_run_pair(
+            github,
+            repo,
+            pair,
+            compare=compare,
+            media_dir=resolved_dir,
+            on_media_saved=on_media_saved,
+        )
+        verified.append(replay)
+        saved_paths.extend(pair_paths)
+    verified_tuple = tuple(verified)
     bugs_total, bugs_caught = tally(verified_tuple)
     return ReplayVerification(
         replays=verified_tuple,
         bugs_total=bugs_total,
         bugs_caught=bugs_caught,
         bug_outcomes=tuple(replay.as_outcome() for replay in verified_tuple),
+        video_paths=tuple(dict.fromkeys(saved_paths)),
     )
 
 
-def _verify_replay_run_pair(
+def _verify_replay_run_pair(  # noqa: PLR0913  internal helper mirroring verify_replay_run_pairs
     github: ReplayFailureOutputClient,
     repo: str,
     pair: ReplayRunPair,
     *,
     compare: Callable[[bytes, bytes, str], FailureMatch],
-) -> Replay:
+    media_dir: Path | None = None,
+    on_media_saved: Callable[[Path], None] | None = None,
+) -> tuple[Replay, list[str]]:
     expected = _effective_expected_checks(pair)
     raw = Replay(
         sha=pair.sha,
@@ -296,11 +446,13 @@ def _verify_replay_run_pair(
         candidate_failed_checks=pair.candidate_failed_checks,
     )
     if not (raw.baseline_failed and raw.candidate_failed):
-        return raw
+        return raw, []
 
     guard_result = _check_pair_job_identities(github, repo, pair, raw, expected)
     if guard_result is not None:
-        return guard_result
+        return guard_result, []
+
+    loaded_sides: dict[str, bytes] = {}
 
     def load_side(run_id: str) -> bytes:
         raw_bytes = _load_failure_output(
@@ -311,9 +463,61 @@ def _verify_replay_run_pair(
             expected_checks=expected,
             check_aliases=pair.check_aliases,
         )
-        return extract_replay_video(raw_bytes, expected_checks=expected, check_aliases=pair.check_aliases)
+        video_bytes = extract_replay_video(raw_bytes, expected_checks=expected, check_aliases=pair.check_aliases)
+        side = "baseline" if "baseline" not in loaded_sides else "candidate"
+        loaded_sides[side] = video_bytes
+        return video_bytes
 
-    return verify_replays([raw], load=load_side, compare=compare)[0]
+    checked = verify_replays([raw], load=load_side, compare=compare)[0]
+    if media_dir is None:
+        return checked, []
+    return _attach_persisted_pair_mp4s(
+        checked,
+        pair,
+        base_mp4=loaded_sides.get("baseline"),
+        cand_mp4=loaded_sides.get("candidate"),
+        media_dir=media_dir,
+        on_media_saved=on_media_saved,
+    )
+
+
+def _attach_persisted_pair_mp4s(  # noqa: PLR0913
+    replay: Replay,
+    pair: ReplayRunPair,
+    *,
+    base_mp4: bytes | None,
+    cand_mp4: bytes | None,
+    media_dir: Path,
+    on_media_saved: Callable[[Path], None] | None,
+) -> tuple[Replay, list[str]]:
+    saved_paths: list[str] = []
+    base_url = replay.baseline_video_url
+    cand_url = replay.candidate_video_url
+    if base_mp4 is not None:
+        saved = persist_replay_mp4(
+            media_dir,
+            base_mp4,
+            sha=pair.sha,
+            run_id=pair.baseline_run_id,
+            side="baseline",
+            on_saved=on_media_saved,
+        )
+        if saved is not None:
+            base_url = saved[0]
+            saved_paths.append(str(saved[1]))
+    if cand_mp4 is not None:
+        saved = persist_replay_mp4(
+            media_dir,
+            cand_mp4,
+            sha=pair.sha,
+            run_id=pair.candidate_run_id,
+            side="candidate",
+            on_saved=on_media_saved,
+        )
+        if saved is not None:
+            cand_url = saved[0]
+            saved_paths.append(str(saved[1]))
+    return replace(replay, baseline_video_url=base_url, candidate_video_url=cand_url), saved_paths
 
 
 def _effective_expected_checks(pair: ReplayRunPair) -> tuple[str, ...]:
@@ -399,10 +603,19 @@ def _fetch_failed_job_names_from(github: object, repo: str, run_id: str) -> tupl
 class MultimodalReplayVerifier:
     """Standalone replay verifier wiring ``ReplayFailureOutputClient`` and multimodal ``ask``."""
 
-    def __init__(self, github: ReplayFailureOutputClient, ask: AskModel) -> None:
-        """Create a verifier backed by ``github`` artifact loading and ``ask`` multimodal calls."""
+    def __init__(
+        self,
+        github: ReplayFailureOutputClient,
+        ask: AskModel,
+        *,
+        media_dir: Path | str | None = None,
+        on_media_saved: Callable[[Path], None] | None = None,
+    ) -> None:
+        """Create a verifier backed by ``github`` artifact loading, ``ask``, and optional MP4 persistence."""
         self._github = github
         self._ask = ask
+        self._media_dir = Path(media_dir) if media_dir is not None else None
+        self._on_media_saved = on_media_saved
 
     def verify_replay_runs(
         self,
@@ -412,25 +625,48 @@ class MultimodalReplayVerifier:
         ask: AskModel | None = None,
     ) -> ReplayVerification:
         """Verify replay pairs and return ``ReplayVerification`` ready for ``Evidence``."""
-        return verify_replay_run_pairs(self._github, repo, runs, ask=ask if ask is not None else self._ask)
+        return verify_replay_run_pairs(
+            self._github,
+            repo,
+            runs,
+            ask=ask if ask is not None else self._ask,
+            media_dir=self._media_dir,
+            on_media_saved=self._on_media_saved,
+        )
 
 
 class ProofBridge:
     """Computes deterministic pre-Proof context, collects multimodal bundles, and opens kept PRs."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  optional runtime hooks for media persistence and deployed URLs
         self,
         github: ProofHistoryClient,
         run_lane: LaneRunner | None = None,
         *,
         replay_limit: int = MAX_REPLAYS,
         ask: AskModel | None = None,
+        media_dir: Path | str | None = None,
+        on_media_saved: Callable[[Path], None] | None = None,
+        public_base_url: str = "",
     ) -> None:
-        """Create a bridge using ``github`` for history/base files, optional ``run_lane``, and optional ``ask``."""
+        """Create a bridge using ``github``, optional ``run_lane``, ``ask``, and optional MP4 storage."""
         self._github = github
         self._run_lane = run_lane
         self._replay_limit = replay_limit
         self._ask = ask
+        self._media_dir = Path(media_dir) if media_dir is not None else None
+        self._on_media_saved = on_media_saved
+        self._public_base_url = public_base_url.strip().rstrip("/")
+
+    @property
+    def media_dir(self) -> Path | None:
+        """Return the configured persistent directory for replay MP4 recordings, if any."""
+        return self._media_dir
+
+    @property
+    def public_base_url(self) -> str:
+        """Return the configured public base URL for deployed MP4 links, if any."""
+        return self._public_base_url
 
     def prepare_context(
         self,
@@ -570,6 +806,28 @@ class ProofBridge:
         failed job logs. Falls back to sniffing ``get_run_failure_output()`` for legacy
         clients without artifact endpoints.
         """
+        bundle, _ = self._collect_run_failure_bundle_with_mp4(
+            repo,
+            run_id,
+            check=check,
+            expected_checks=expected_checks,
+            check_aliases=check_aliases,
+            run_url=run_url,
+            extract_video=False,
+        )
+        return bundle
+
+    def _collect_run_failure_bundle_with_mp4(  # noqa: PLR0913
+        self,
+        repo: str,
+        run_id: str,
+        *,
+        check: str = "",
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
+        run_url: str = "",
+        extract_video: bool = True,
+    ) -> tuple[ArtifactBundle, bytes | None]:
         resolved_url = run_url or _default_run_url(repo, run_id)
         if not isinstance(self._github, RunArtifactsClient):
             raw = _load_failure_output(
@@ -580,7 +838,9 @@ class ProofBridge:
                 expected_checks=tuple(expected_checks),
                 check_aliases=tuple(check_aliases),
             )
-            return bundle_from_raw(raw, run_id=str(run_id), run_url=run_url, fallback_mime="video/mp4")
+            bundle = bundle_from_raw(raw, run_id=str(run_id), run_url=run_url, fallback_mime="video/mp4")
+            mp4 = extract_mp4_bytes(bundle.parts) if extract_video else None
+            return bundle, mp4
 
         parts: list[MediaPart] = []
         artifacts = self._github.list_run_artifacts(repo, run_id)
@@ -610,7 +870,9 @@ class ProofBridge:
                     source_url=resolved_url,
                 )
             )
-        return select_bundle_parts(parts, run_id=str(run_id), run_url=resolved_url)
+        bundle = select_bundle_parts(parts, run_id=str(run_id), run_url=resolved_url)
+        mp4 = extract_mp4_bytes((*bundle.parts, *parts)) if extract_video else None
+        return bundle, mp4
 
     def verify_replay_runs(
         self,
@@ -622,8 +884,9 @@ class ProofBridge:
         """Verify multimodal failure equivalence for replay pairs where both runs failed.
 
         Collects typed ``ArtifactBundle``s per failing pair, enforces ``expected_checks`` and
-        visual-downgrade rules fail-closed, extracts up to 3 paired PNG previews for kept PRs,
-        and delegates multimodal judgment to ``compare_bundles(..., ask=ask)``.
+        visual-downgrade rules fail-closed, persists playable MP4 recordings when ``media_dir`` is
+        configured, extracts up to 3 paired PNG previews for kept PRs, and delegates multimodal
+        judgment to ``compare_bundles(..., ask=ask)``.
         """
         verifier = ask if ask is not None else self._ask
         if verifier is None:
@@ -631,10 +894,11 @@ class ProofBridge:
 
         verified: list[Replay] = []
         preview_files: list[tuple[str, bytes]] = []
+        video_paths: list[str] = []
         preview_pairs_captured = 0
 
         for idx, pair in enumerate(runs):
-            replay, pair_previews = self._verify_single_pair(
+            replay, pair_previews, pair_videos = self._verify_single_pair(
                 repo,
                 pair,
                 idx,
@@ -642,6 +906,7 @@ class ProofBridge:
                 capture_preview=preview_pairs_captured < PR_MAX_PREVIEW_PAIRS,
             )
             verified.append(replay)
+            video_paths.extend(pair_videos)
             if pair_previews:
                 preview_files.extend(pair_previews)
                 preview_pairs_captured += 1
@@ -654,6 +919,7 @@ class ProofBridge:
             bugs_caught=bugs_caught,
             bug_outcomes=tuple(replay.as_outcome() for replay in verified_tuple),
             preview_files=tuple(preview_files),
+            video_paths=tuple(dict.fromkeys(video_paths)),
         )
 
     def open_kept_pr(  # noqa: PLR0913  optional preview_files keeps existing signature backwards-compatible
@@ -694,6 +960,7 @@ class ProofBridge:
             replays,
             card_url=card_url,
             preview_base_url=raw_base if valid_previews else "",
+            media_base_url=effective.media_base_url or self._public_base_url,
         )
         title = _pr_title(candidate)
         url = self._github.open_pull_request(
@@ -721,7 +988,7 @@ class ProofBridge:
         verifier: AskModel,
         *,
         capture_preview: bool,
-    ) -> tuple[Replay, list[tuple[str, bytes]]]:
+    ) -> tuple[Replay, list[tuple[str, bytes]], list[str]]:
         base_replay = Replay(
             sha=pair.sha,
             check=pair.check,
@@ -733,7 +1000,7 @@ class ProofBridge:
             candidate_failed_checks=pair.candidate_failed_checks,
         )
         if not (base_replay.baseline_failed and base_replay.candidate_failed):
-            return base_replay, []
+            return base_replay, [], []
 
         effective_expected = _effective_expected_checks(pair)
         expected_with_aliases = tuple(dict.fromkeys((*pair.expected_checks, *pair.check_aliases)))
@@ -745,26 +1012,39 @@ class ProofBridge:
                 expected_list = ", ".join(pair.expected_checks)
                 actual_list = ", ".join(base_failed)
                 note = f"not verified: expected check(s) ({expected_list}) did not fail on baseline ({actual_list})"
-                return replace(base_replay, note=note), []
+                return replace(base_replay, note=note), [], []
 
         filter_check = pair.check if effective_expected else ""
+        saved_videos: list[str] = []
+        extract_video = self._media_dir is not None
         try:
-            baseline_bundle = self.collect_run_failure_bundle(
+            baseline_bundle, base_mp4 = self._collect_run_failure_bundle_with_mp4(
                 repo,
                 pair.baseline_run_id,
                 check=filter_check,
                 expected_checks=effective_expected,
                 check_aliases=pair.check_aliases,
                 run_url=pair.baseline_run_url,
+                extract_video=extract_video,
             )
-            candidate_bundle = self.collect_run_failure_bundle(
+            candidate_bundle, cand_mp4 = self._collect_run_failure_bundle_with_mp4(
                 repo,
                 pair.candidate_run_id,
                 check=filter_check,
                 expected_checks=effective_expected,
                 check_aliases=pair.check_aliases,
                 run_url=pair.candidate_run_url,
+                extract_video=extract_video,
             )
+            if self._media_dir is not None:
+                base_replay, saved_videos = _attach_persisted_pair_mp4s(
+                    base_replay,
+                    pair,
+                    base_mp4=base_mp4,
+                    cand_mp4=cand_mp4,
+                    media_dir=self._media_dir,
+                    on_media_saved=self._on_media_saved,
+                )
             failed_checks = pair.candidate_failed_checks or self._fetch_failed_checks(
                 repo, pair.candidate_run_id, expected_with_aliases
             )
@@ -777,7 +1057,7 @@ class ProofBridge:
                 candidate_failed_checks=failed_checks,
             )
         except Exception as error:  # noqa: BLE001  fail closed: any fetch, ZIP, or model error leaves replay unverified
-            return replace(base_replay, note=f"not verified: {_describe(error)}"), []
+            return replace(base_replay, note=f"not verified: {_describe(error)}"), [], saved_videos
 
         previews, base_preview_path, cand_preview_path = (
             _extract_preview_pair(pair.sha, idx, baseline_bundle, candidate_bundle) if capture_preview else ([], "", "")
@@ -794,7 +1074,7 @@ class ProofBridge:
             candidate_preview_path=cand_preview_path,
             candidate_failed_checks=failed_checks,
         )
-        return checked, previews
+        return checked, previews, saved_videos
 
     def _fetch_failed_checks(
         self,

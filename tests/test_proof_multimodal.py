@@ -1444,3 +1444,187 @@ def test_github_redirect_edge_cases_and_historical_errors() -> None:
     ctx = ProofBridge(github).prepare_context(cand, historical_run_ids={"aaaa1111": "500"})
     assert ctx.mounted_artifacts == ()
     assert ctx.extra_sources == ()
+
+
+def test_server_media_endpoint_streams_mp4_enforces_auth_and_blocks_traversal(tmp_path: Path) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41-stream-payload"
+    mp4_file = media_dir / "deadbee-101-baseline-a1b2c3d4e5f6.mp4"
+    mp4_file.write_bytes(mp4_bytes)
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(mp4_bytes)
+    symlink_mp4 = media_dir / "escape.mp4"
+    symlink_mp4.symlink_to(outside)
+
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(id="h1", repo="acme/shop", description="cache", skill="dep-cache", expected_savings_seconds=60.0)
+    cand = Candidate(id="c1", hypothesis_id="h1", branch="pc/1", summary="cache", repo="acme/shop", head_sha="hsha")
+    ev = Evidence(
+        id="e1",
+        candidate_id="c1",
+        baseline_seconds=(120.0,) * 5,
+        candidate_seconds=(50.0,) * 5,
+        bugs_total=1,
+        bugs_caught=1,
+        bug_outcomes=(
+            {
+                "sha": "deadbeef",
+                "check": "CI/test",
+                "status": "caught",
+                "baseline_failed": True,
+                "candidate_failed": True,
+                "modality": "terminal_video",
+                "visual_evidence_seen": True,
+                "visual_summary": "Same pytest failure video.",
+                "baseline_video_url": f"/media/{mp4_file.name}",
+                "candidate_video_url": "javascript:alert(1)",
+            },
+        ),
+    )
+    for rec in (hyp, cand, ev, rater.rate(ev)):
+        ledger.add(rec)
+
+    # Unauthenticated server serves MP4 inline with Range support and ?download=1 attachment.
+    public_client = TestClient(create_app(ledger, media_dir=media_dir))
+    res = public_client.get(f"/media/{mp4_file.name}")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "video/mp4"
+    assert res.headers["content-disposition"].startswith("inline;")
+    assert res.content == mp4_bytes
+
+    ranged = public_client.get(f"/media/{mp4_file.name}", headers={"Range": "bytes=0-11"})
+    assert ranged.status_code == 206
+    assert ranged.content == mp4_bytes[:12]
+
+    dl = public_client.get(f"/media/{mp4_file.name}?download=1")
+    assert dl.status_code == 200
+    assert dl.headers["content-disposition"].startswith("attachment;")
+
+    # Traversal, non-mp4, symlink, and missing files are blocked with 404.
+    assert public_client.get("/media/escape.mp4").status_code == 404
+    assert public_client.get("/media/missing.mp4").status_code == 404
+    assert public_client.get("/media/notes.txt").status_code == 404
+
+    # Attempt detail exposes validated MP4 video URLs and drops unsafe schemes.
+    detail = public_client.get("/api/repos/acme/shop/attempts/c1").json()
+    assert detail["visual_proof"][0]["baseline_video_url"] == f"/media/{mp4_file.name}"
+    assert detail["visual_proof"][0]["candidate_video_url"] == ""
+
+    # Token-protected server enforces Bearer header or ?token= query param on /media/*.
+    protected_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    assert protected_client.get(f"/media/{mp4_file.name}").status_code == 401
+    assert protected_client.get(f"/media/{mp4_file.name}?token=wrong").status_code == 401
+    ok_query = protected_client.get(f"/media/{mp4_file.name}?token=tok-xyz")
+    assert ok_query.status_code == 200
+    assert "private" in ok_query.headers["cache-control"]
+    ok_header = protected_client.get(f"/media/{mp4_file.name}", headers={"Authorization": "Bearer tok-xyz"})
+    assert ok_header.status_code == 200
+
+
+_UI_VIDEO_PLAYBACK_SCRIPT = """
+const makeNode = (tag, ns = null) => ({
+  tag, ns, className: "", hidden: false, textContent: "", title: "", value: "", disabled: false,
+  dataset: {}, attrs: {}, kids: [],
+  setAttribute(k, v) { this.attrs[k] = String(v); },
+  addEventListener() {},
+  replaceChildren(...kids) { this.kids = kids; },
+  append(...kids) { this.kids.push(...kids); },
+  querySelectorAll() { return []; },
+});
+const walk = (n, pred, acc = []) => {
+  if (!n) return acc;
+  if (pred(n)) acc.push(n);
+  for (const c of n.kids ?? []) walk(c, pred, acc);
+  return acc;
+};
+const tel = await import(process.argv[1]);
+const storeMod = await import(process.argv[2]);
+const store = storeMod.createPitWallStore();
+const slot = makeNode("section");
+const root = {
+  createElement: (t) => makeNode(t, null),
+  createElementNS: (ns, t) => makeNode(t, ns),
+  defaultView: { sessionStorage: { getItem: (k) => (k === "pit_crew_api_token" ? "tok-123" : null) } },
+};
+tel.createTelemetryCenter(root, slot, store);
+store.setMode("live");
+store.setRepo("acme/shop");
+store.setLiveData({
+  status: { repo: "acme/shop", active: false, base_sha: "head1111" },
+  attempts: [{ candidate_id: "c1", head_sha: "head1111", rated: true }],
+  records: {
+    candidates: [{ id: "c1", repo: "acme/shop", head_sha: "head1111" }],
+    evidence: [{
+      candidate_id: "c1",
+      baseline_seconds: [100, 95],
+      candidate_seconds: [50, 48],
+      bugs_total: 1,
+      bugs_caught: 1,
+      bug_outcomes: [{
+        sha: "deadbeef",
+        status: "caught",
+        baseline_failed: true,
+        modality: "terminal_video",
+        visual_evidence_seen: true,
+        visual_summary: "Same pytest failure recorded in MP4.",
+        baseline_video_url: "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4",
+        candidate_video_url: "https://cdn.example.test/cand.mp4",
+      }],
+    }],
+    verdicts: [],
+  },
+});
+const videos = walk(slot, (n) => n.tag === "video").map((n) => ({
+  src: n.attrs.src, controls: "controls" in n.attrs, preload: n.attrs.preload,
+}));
+const downloads = walk(slot, (n) => n.tag === "a" && n.textContent === "Download MP4").map((n) => n.attrs.href);
+console.log(JSON.stringify({
+  videos,
+  downloads,
+  safeVideoChecks: [
+    tel.isSafeVideoUrl("/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4"),
+    tel.isSafeVideoUrl("/media/../secret.mp4"),
+    tel.isSafeVideoUrl("/media/not-a-video.txt"),
+    tel.isSafeVideoUrl("javascript:alert(1)"),
+    tel.isSafeVideoUrl("https://cdn.example.test/video.mp4"),
+  ],
+}));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_pit_wall_ui_renders_inline_mp4_video_players_and_download_links() -> None:
+    assert NODE is not None
+    result = subprocess.run(  # noqa: S603
+        [
+            NODE,
+            "--input-type=module",
+            "-e",
+            _UI_VIDEO_PLAYBACK_SCRIPT,
+            (WEB_DIR / "telemetry.js").as_uri(),
+            (WEB_DIR / "store.js").as_uri(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = json.loads(result.stdout)
+    assert out["safeVideoChecks"] == [True, False, False, False, True]
+    assert out["videos"] == [
+        {
+            "src": "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=tok-123",
+            "controls": True,
+            "preload": "metadata",
+        },
+        {
+            "src": "https://cdn.example.test/cand.mp4",
+            "controls": True,
+            "preload": "metadata",
+        },
+    ]
+    assert out["downloads"] == [
+        "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=tok-123&download=1",
+        "https://cdn.example.test/cand.mp4",
+    ]

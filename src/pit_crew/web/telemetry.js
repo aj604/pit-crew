@@ -16,6 +16,8 @@ const MODALITY_LABELS = Object.freeze({
   log: "LOG",
 });
 const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const SAFE_MEDIA_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp4$/;
+const API_TOKEN_STORAGE_KEY = "pit_crew_api_token";
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const isNonNeg = (v) => isNum(v) && v >= 0;
@@ -66,6 +68,57 @@ export function isSafePreviewUrl(url) {
     return !trimmed.includes("..") && !trimmed.includes("\\");
   }
   return isSafeExternalUrl(trimmed);
+}
+
+/** Pure: allow playable replay MP4 URLs under `/media/*.mp4`, `/web/`, `/brand/`, or `http(s)://`. */
+export function isSafeVideoUrl(url) {
+  if (typeof url !== "string") return false;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.includes("\\")) return false;
+  if (trimmed.startsWith("/media/")) {
+    const pathOnly = trimmed.split(/[?#]/, 1)[0];
+    const filename = pathOnly.slice("/media/".length);
+    return SAFE_MEDIA_FILE_RE.test(filename) && !filename.includes("..");
+  }
+  if (trimmed.startsWith("/web/") || trimmed.startsWith("/brand/")) {
+    return !trimmed.includes("..");
+  }
+  return isSafeExternalUrl(trimmed);
+}
+
+/** Pure: resolve a playable replay MP4 URL, attaching an optional session token only on same-origin `/media/` paths. */
+export function resolveVideoUrl(rawUrl, token = "") {
+  if (!isSafeVideoUrl(rawUrl)) return null;
+  const trimmed = rawUrl.trim();
+  const cleanToken = typeof token === "string" ? token.trim() : "";
+  if (trimmed.startsWith("/media/") && cleanToken) {
+    const [pathOnly, query = ""] = trimmed.split("?", 2);
+    const params = new URLSearchParams(query);
+    params.set("token", cleanToken);
+    return `${pathOnly}?${params.toString()}`;
+  }
+  return trimmed;
+}
+
+function buildDownloadVideoUrl(videoUrl) {
+  if (!videoUrl) return "";
+  if (videoUrl.startsWith("/media/")) {
+    const [pathOnly, query = ""] = videoUrl.split("?", 2);
+    const params = new URLSearchParams(query);
+    params.set("download", "1");
+    return `${pathOnly}?${params.toString()}`;
+  }
+  return videoUrl;
+}
+
+function readStoredApiToken(root) {
+  try {
+    const storage = root?.defaultView?.sessionStorage ?? globalThis.sessionStorage ?? null;
+    const raw = storage?.getItem?.(API_TOKEN_STORAGE_KEY);
+    return typeof raw === "string" ? raw.trim() : "";
+  } catch {
+    return "";
+  }
 }
 
 /** Pure: resolve a committed preview path or URL to a safe image URL for the Pit Wall UI. */
@@ -152,6 +205,9 @@ export function normalizeBugOutcome(outcome, context = null) {
       : "";
   const baselinePreviewUrl = resolvePreviewUrl(item.baseline_preview_url ?? item.baseline_preview_path ?? "", context);
   const candidatePreviewUrl = resolvePreviewUrl(item.candidate_preview_url ?? item.candidate_preview_path ?? "", context);
+  const apiToken = typeof context?.apiToken === "string" ? context.apiToken : "";
+  const baselineVideoUrl = resolveVideoUrl(item.baseline_video_url ?? "", apiToken);
+  const candidateVideoUrl = resolveVideoUrl(item.candidate_video_url ?? "", apiToken);
   const baselineArtifactUrls = safeUrlList(item.baseline_artifact_urls);
   const candidateArtifactUrls = safeUrlList(item.candidate_artifact_urls);
   return {
@@ -160,8 +216,10 @@ export function normalizeBugOutcome(outcome, context = null) {
     caught, statusLabel, runUrl: isSafeExternalUrl(rawUrl) ? rawUrl : null,
     modality, modalityLabel, visualEvidenceSeen, visualSummary: rawSummary,
     baselinePreviewUrl, candidatePreviewUrl,
+    baselineVideoUrl, candidateVideoUrl,
     baselineArtifactUrls, candidateArtifactUrls,
     hasVisualPreview: Boolean(baselinePreviewUrl && candidatePreviewUrl),
+    hasVideoReplay: Boolean(baselineVideoUrl || candidateVideoUrl),
   };
 }
 
@@ -240,7 +298,7 @@ export function buildBugMatrixModel(evidence, context = null) {
   );
   const total = isNonNeg(evidence.bugs_total) && evidence.bugs_total >= rows.length ? evidence.bugs_total : rows.length;
   const caught = rows.length > 0 ? rows.filter((r) => r.caught).length : isNonNeg(evidence.bugs_caught) ? evidence.bugs_caught : 0;
-  const visualRows = rows.filter((r) => r.hasVisualPreview || r.visualSummary || r.modality);
+  const visualRows = rows.filter((r) => r.hasVisualPreview || r.hasVideoReplay || r.visualSummary || r.modality);
   return { hasEvidence: true, rows, total, caught, missed: Math.max(0, total - caught), visualRows };
 }
 
@@ -410,6 +468,36 @@ function renderVisualProofPanel(root, model) {
       card.append(makeEl(root, "p", "visual-proof__summary", row.visualSummary));
     }
 
+    if (row.hasVideoReplay) {
+      const videoGrid = makeEl(root, "div", "visual-proof__videos");
+      for (const [side, label, url] of [
+        ["baseline", "Baseline", row.baselineVideoUrl],
+        ["candidate", "Candidate", row.candidateVideoUrl],
+      ]) {
+        if (!url) continue;
+        const fig = makeEl(root, "figure", `visual-proof__frame visual-proof__frame--${side}`);
+        const captionRow = makeEl(root, "figcaption", "visual-proof__caption-row");
+        captionRow.append(
+          makeEl(root, "span", "visual-proof__caption telemetry", `${label} \u00b7 MP4`),
+          makeEl(root, "a", "bug-matrix__link telemetry", "Download MP4", {
+            href: buildDownloadVideoUrl(url),
+            download: "",
+            "aria-label": `Download ${label.toLowerCase()} MP4 recording for ${row.displayRef}`,
+          }),
+        );
+        const video = makeEl(root, "video", "visual-proof__video", "", {
+          src: url,
+          controls: "",
+          playsinline: "",
+          preload: "metadata",
+          "aria-label": `${label} MP4 failure recording for ${row.displayRef}`,
+        });
+        fig.append(captionRow, video);
+        videoGrid.append(fig);
+      }
+      card.append(videoGrid);
+    }
+
     if (row.hasVisualPreview) {
       const grid = makeEl(root, "div", "visual-proof__frames");
       for (const [side, label, url] of [
@@ -508,6 +596,7 @@ export function createTelemetryCenter(root, slot, store) {
     const previewContext = {
       repo: state?.status?.repo || state?.repo || matchedCandidate?.repo || "",
       headSha: state?.selectedAttempt?.head_sha || matchedCandidate?.head_sha || "",
+      apiToken: readStoredApiToken(root),
     };
     const chart = buildTimingChartModel(evidence, verdict);
     const matrix = buildBugMatrixModel(evidence, previewContext);

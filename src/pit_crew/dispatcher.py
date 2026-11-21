@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from pit_crew import workspace as host_workspace
@@ -176,13 +176,20 @@ def build_multimodal_verifier(
     github: ReplayFailureOutputClient,
     *,
     ask: AskMultimodal | None = None,
+    media_dir: Path | str | None = None,
+    on_media_saved: Callable[[Path], None] | None = None,
 ) -> MultimodalReplayVerifier:
     """Build a replay verifier wired to ``verify_replays``, ``tally``, and ``Replay.as_outcome``.
 
     Defaults ``ask`` to ``pit_crew.managed_agent.ask_multimodal`` (resolved lazily so
     ``dispatcher`` never statically imports ``google-genai``).
     """
-    return MultimodalReplayVerifier(github, ask=ask if ask is not None else _default_ask_multimodal)
+    return MultimodalReplayVerifier(
+        github,
+        ask=ask if ask is not None else _default_ask_multimodal,
+        media_dir=media_dir,
+        on_media_saved=on_media_saved,
+    )
 
 
 def _is_completed_lane_result(result: object) -> bool:
@@ -671,9 +678,11 @@ class Dispatcher:
         self,
         replays: tuple[Any, ...],
         preview_files: tuple[tuple[str, bytes], ...] = (),
+        video_paths: tuple[str, ...] = (),
     ) -> None:
         self._cycle_local.verified_replays = replays
         self._cycle_local.preview_files = preview_files
+        self._cycle_local.saved_video_paths = video_paths
 
     def _get_verified_replays(self) -> tuple[Any, ...]:
         replays: tuple[Any, ...] = getattr(self._cycle_local, "verified_replays", ())
@@ -682,6 +691,12 @@ class Dispatcher:
     def _get_preview_files(self) -> tuple[tuple[str, bytes], ...]:
         previews: tuple[tuple[str, bytes], ...] = getattr(self._cycle_local, "preview_files", ())
         return previews
+
+    @property
+    def last_replay_videos(self) -> tuple[str, ...]:
+        """Return persisted local MP4 replay file paths from the most recent cycle."""
+        paths: tuple[str, ...] = getattr(self._cycle_local, "saved_video_paths", ())
+        return paths
 
     @property
     def last_opened_pr_url(self) -> str | None:
@@ -1015,7 +1030,11 @@ class Dispatcher:
         if self._proof_bridge is not None:
             pairs = [res.pair for res in results if res.pair is not None]
             verification = self._proof_bridge.verify_replay_runs(repo, pairs)
-            self._set_verified_replays(verification.replays, getattr(verification, "preview_files", ()))
+            self._set_verified_replays(
+                verification.replays,
+                getattr(verification, "preview_files", ()),
+                getattr(verification, "video_paths", ()),
+            )
             conflict_outcomes = tuple(res.outcome for res in results if res.pair is None)
             return (
                 verification.bugs_total,
@@ -1043,9 +1062,15 @@ class Dispatcher:
         ]
         outcomes: list[dict[str, Any]] = [result.outcome for result in results]
         if not paired:
+            self._set_verified_replays(())
             return 0, 0, tuple(outcomes)
 
         verification = self._replay_verifier.verify_replay_runs(repo, [pair for _, pair, _ in paired])
+        self._set_verified_replays(
+            verification.replays,
+            getattr(verification, "preview_files", ()),
+            getattr(verification, "video_paths", ()),
+        )
         for pos, (result_idx, _pair, meta) in enumerate(paired):
             replay = verification.replays[pos]
             verified_row = dict(verification.bug_outcomes[pos])
@@ -1667,6 +1692,7 @@ class Dispatcher:
                         auto_open_pr=True,
                         base_branch=ctx.base_branch,
                         repo=ctx.work_repo,
+                        media_base_url=str(getattr(self._proof_bridge, "public_base_url", "") or ""),
                     ),
                     preview_files=self._get_preview_files(),
                 )
