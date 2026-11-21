@@ -1,8 +1,10 @@
 import base64
 import gzip
 import json
+import urllib.error
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +14,9 @@ from pit_crew import tools
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, is_setup_step, job_buckets
 from pit_crew.lanes.analysis.critical_path import critical_path, job_timings, max_saving, profile
-from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, next_link, parse_runs
+from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, fetch_workflow, next_link, parse_runs
 from pit_crew.lanes.analysis.stats import percentile
+from pit_crew.lanes.analysis.tools import WorkflowNotFoundError
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow, topological_order
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import build_request
@@ -487,7 +490,7 @@ def test_profile_ci_accepts_workflow_content_without_host_checkout(
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
     raw = fastapi_raw()
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
-    monkeypatch.setattr(history, "fetch_workflow_content", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
 
     build_request("analysis", "")
     result = tools.call(
@@ -502,20 +505,18 @@ def test_profile_ci_accepts_workflow_content_without_host_checkout(
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
 
 
-def test_profile_ci_falls_back_to_github_contents_without_host_checkout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_profile_ci_accepts_explicit_ref_without_host_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
     raw = fastapi_raw()
     workflow_text = (FIXTURES / "fastapi" / "test.yml").read_text()
     fetched: list[tuple[str, str, str | None]] = []
 
-    def fake_fetch_content(repo: str, workflow: str, *, ref: str | None = None) -> str:
+    def fake_fetch_workflow(repo: str, workflow: str, *, ref: str | None = None) -> str:
         fetched.append((repo, workflow, ref))
         return workflow_text
 
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
-    monkeypatch.setattr(history, "fetch_workflow_content", fake_fetch_content)
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
 
     build_request("analysis", "")
     result = tools.call(
@@ -527,21 +528,151 @@ def test_profile_ci_falls_back_to_github_contents_without_host_checkout(
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
 
 
-def test_fetch_workflow_content_decodes_base64_and_validates_payload() -> None:
-    encoded = base64.b64encode(WORKFLOW.encode("utf-8")).decode("ascii")
-    urls: list[str] = []
+def test_fetch_workflow_decodes_github_contents_response() -> None:
+    yaml_text = "name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+    encoded = base64.encodebytes(yaml_text.encode("utf-8")).decode("ascii")
+    seen: list[str] = []
 
-    def getter(url: str) -> tuple[Any, str | None]:
-        urls.append(url)
-        return {"encoding": "base64", "content": encoded}, None
+    def fake_get(url: str) -> tuple[Any, str | None]:
+        seen.append(url)
+        return {"type": "file", "encoding": "base64", "content": encoded}, None
 
-    assert history.fetch_workflow_content("o/r", "ci.yml", ref="abc123", get=getter) == WORKFLOW
-    assert urls == ["https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml?ref=abc123"]
+    assert fetch_workflow("o/r", "ci.yml", get=fake_get) == yaml_text
+    assert fetch_workflow("o/r", "ci.yml", ref="feat/x", get=fake_get) == yaml_text
+    assert seen == [
+        "https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml",
+        "https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml?ref=feat%2Fx",
+    ]
 
-    assert history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ({"content": "jobs: {}\n"}, None)) == (
-        "jobs: {}\n"
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"type": "dir", "encoding": "base64", "content": ""},
+        {"type": "file", "encoding": "none", "content": ""},
+        {"type": "file", "encoding": "base64", "content": None},
+    ],
+)
+def test_fetch_workflow_rejects_unexpected_github_payloads(payload: object) -> None:
+    with pytest.raises(ValueError, match="unexpected GitHub contents response"):
+        fetch_workflow("o/r", "ci.yml", get=lambda _url: (payload, None))
+
+
+def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    yaml_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    raw = fastapi_raw()
+    fetched: list[tuple[str, str, str | None]] = []
+
+    def fake_fetch_workflow(repo: str, workflow: str, *, ref: str | None = None) -> str:
+        fetched.append((repo, workflow, ref))
+        return yaml_text
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "master"}
     )
-    with pytest.raises(TypeError, match="unexpected response"):
-        history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ([], None))
-    with pytest.raises(TypeError, match="no text content"):
-        history.fetch_workflow_content("o/r", "ci.yml", get=lambda _u: ({"encoding": "base64"}, None))
+
+    assert fetched == [("fastapi/fastapi", "test.yml", "master")]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.github.com/repos/o/r", code, "err", Message(), None)
+
+
+def test_profile_ci_resolves_deleted_branch_workflow_from_run_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    yaml_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    raw = fastapi_raw()
+    expected_sha = next(r["head_sha"] for r in raw if r.get("head_sha"))
+    refs_tried: list[str | None] = []
+
+    def fake_fetch_workflow(_repo: str, _workflow: str, *, ref: str | None = None) -> str:
+        refs_tried.append(ref)
+        if ref == "release/1.2":
+            raise _http_error(404)
+        assert ref == expected_sha
+        return yaml_text
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "release/1.2"}
+    )
+
+    assert refs_tried == ["release/1.2", expected_sha]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def test_profile_ci_errors_explicitly_when_deleted_branch_has_no_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(404)))
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [])
+
+    build_request("analysis", "")
+    with pytest.raises(WorkflowNotFoundError, match="no completed runs record a commit"):
+        tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml", "branch": "release/1.2"})
+
+
+def test_profile_ci_errors_explicitly_when_deleted_branch_commit_is_also_404(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: (_ for _ in ()).throw(_http_error(404)))
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+
+    build_request("analysis", "")
+    with pytest.raises(WorkflowNotFoundError, match="deadbeef"):
+        tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml", "branch": "release/1.2"})
+
+
+@pytest.mark.parametrize(
+    ("branch", "first_code", "second_code"),
+    [
+        (None, 404, None),
+        ("release/1.2", 403, None),
+        ("release/1.2", 404, 403),
+    ],
+)
+def test_profile_ci_propagates_non_fallback_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    branch: str | None,
+    first_code: int,
+    second_code: int | None,
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    codes = [first_code] if second_code is None else [first_code, second_code]
+
+    def fake_fetch_workflow(*_args: object, **_kwargs: object) -> str:
+        raise _http_error(codes.pop(0))
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(
+        history,
+        "fetch_history",
+        (lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
+        if second_code is not None
+        else (lambda *_args, **_kwargs: pytest.fail("must not fetch history")),
+    )
+
+    build_request("analysis", "")
+    args: dict[str, Any] = {"repo": "o/r", "workflow": "ci.yml"}
+    if branch is not None:
+        args["branch"] = branch
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        tools.call("profile_ci", InMemoryLedger(), args)
+    assert exc_info.value.code == (second_code if second_code is not None else first_code)

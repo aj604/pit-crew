@@ -1,12 +1,24 @@
+import asyncio
+import logging
+import queue
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.ledger import InMemoryLedger, Ledger, SqliteLedger
-from pit_crew.server import create_app
+from pit_crew.server import (
+    CYCLE_STAGES,
+    CycleProgressBoard,
+    ProgressCallback,
+    _accepts_on_progress,
+    _run_cycle_task,
+    create_app,
+)
 
 
 class _StubDispatcher:
@@ -367,6 +379,9 @@ def test_repo_status_idle_empty(backend: str, tmp_path: Path) -> None:
         "base_sha": None,
         "latest_verdict": None,
         "sla_met": False,
+        "stage": None,
+        "completed_runs": 0,
+        "total_runs": 0,
     }
 
 
@@ -527,6 +542,9 @@ def test_repo_status_post_verdict_and_base_sha_progression(backend: str, tmp_pat
             "sla_met": True,
         },
         "sla_met": True,
+        "stage": None,
+        "completed_runs": 0,
+        "total_runs": 0,
     }
 
 
@@ -781,3 +799,340 @@ def test_openapi_declares_http_bearer_security_scheme() -> None:
 
     for path, method in protected_routes:
         assert "security" not in unauth_schema["paths"][path][method]
+
+
+_Step = tuple[Any, Any, Any]  # deliberately loose so tests can send invalid updates
+
+
+class _ProgressStubDispatcher:
+    """Sync dispatcher that reports progress one step at a time, driven by the test."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.steps: queue.Queue[_Step | None] = queue.Queue()
+        self.reported: queue.Queue[None] = queue.Queue()
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self.callbacks: list[ProgressCallback] = []
+        self.fail = fail
+
+    def _drive(self, on_progress: ProgressCallback | None) -> None:
+        assert on_progress is not None
+        self.callbacks.append(on_progress)
+        self.started.set()
+        try:
+            while (step := self.steps.get(timeout=5)) is not None:
+                on_progress(*step)
+                self.reported.put(None)
+            if self.fail:
+                msg = "boom"
+                raise RuntimeError(msg)
+        finally:
+            self.finished.set()
+
+    def run_cycle(self, repo: str, *, on_progress: ProgressCallback | None = None) -> None:
+        self.calls.append(("run_cycle", repo))
+        self._drive(on_progress)
+
+    def run_until_sla(self, repo: str, *, on_progress: ProgressCallback | None = None) -> None:
+        self.calls.append(("run_until_sla", repo))
+        self._drive(on_progress)
+
+    def report(self, stage: object, completed_runs: object = 0, total_runs: object = 0) -> None:
+        self.steps.put((stage, completed_runs, total_runs))
+        self.reported.get(timeout=5)
+
+
+class _AsyncProgressStubDispatcher:
+    """Async dispatcher that reports progress one step at a time, driven by the test."""
+
+    def __init__(self) -> None:
+        self.steps: queue.Queue[_Step | None] = queue.Queue()
+        self.reported: queue.Queue[None] = queue.Queue()
+        self.finished = threading.Event()
+
+    async def run_cycle(self, repo: str, on_progress: ProgressCallback | None = None) -> None:
+        self.repo = repo
+        assert on_progress is not None
+        try:
+            while (step := await asyncio.to_thread(self.steps.get, timeout=5)) is not None:
+                on_progress(*step)
+                self.reported.put(None)
+        finally:
+            self.finished.set()
+
+    async def run_until_sla(self, repo: str, on_progress: ProgressCallback | None = None) -> None:
+        await self.run_cycle(repo, on_progress)
+
+    def report(self, stage: object, completed_runs: object = 0, total_runs: object = 0) -> None:
+        self.steps.put((stage, completed_runs, total_runs))
+        self.reported.get(timeout=5)
+
+
+class _KwargsProgressStubDispatcher:
+    """Dispatcher that accepts progress through ``**kwargs``."""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.release = threading.Event()
+        self.reported = threading.Event()
+
+    def run_cycle(self, repo: str, **kwargs: ProgressCallback) -> None:
+        self.run_until_sla(repo, **kwargs)
+
+    def run_until_sla(self, repo: str, **kwargs: ProgressCallback) -> None:
+        self.repo = repo
+        kwargs["on_progress"]("timing", completed_runs=1, total_runs=4)
+        self.reported.set()
+        self.release.wait(timeout=5)
+        self.finished.set()
+
+
+def _progress(client: TestClient, repo: str = "acme/widget") -> dict[str, Any]:
+    body = client.get(f"/api/repos/{repo}/status").json()
+    return {key: body[key] for key in ("active", "stage", "completed_runs", "total_runs")}
+
+
+def _wait_idle(app: FastAPI, client: TestClient, repo_key: str = "acme/widget") -> None:
+    while repo_key in app.state.active_repos:
+        client.get("/health")
+
+
+_IDLE = {"active": False, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+
+@pytest.mark.parametrize("until_sla", [False, True])
+def test_repo_status_reports_progress_through_every_stage(*, until_sla: bool) -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert _progress(client) == _IDLE
+        trigger = client.post("/triggers/cycle", json={"repo": "acme/widget", "until_sla": until_sla})
+        assert trigger.status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        script: list[tuple[str, int, int]] = [
+            ("analysis", 0, 0),
+            ("optimizer", 0, 0),
+            ("proof", 0, 0),
+            ("timing", 0, 6),
+            ("timing", 3, 6),
+            ("timing", 6, 6),
+            ("replay", 0, 4),
+            ("replay", 4, 4),
+            ("rating", 10, 10),
+        ]
+        assert {stage for stage, _, _ in script} == set(CYCLE_STAGES)
+        for stage, completed, total in script:
+            dispatcher.report(stage, completed, total)
+            assert _progress(client) == {
+                "active": True,
+                "stage": stage,
+                "completed_runs": completed,
+                "total_runs": total,
+            }
+            assert _progress(client, "other/repo") == _IDLE
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+    expected_call = "run_until_sla" if until_sla else "run_cycle"
+    assert dispatcher.calls == [(expected_call, "acme/widget")]
+
+
+def test_repo_status_progress_resets_after_failure_and_next_cycle_starts_clean() -> None:
+    dispatcher = _ProgressStubDispatcher(fail=True)
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("replay", 2, 5)
+        assert _progress(client) == {"active": True, "stage": "replay", "completed_runs": 2, "total_runs": 5}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+        dispatcher.fail = False
+        dispatcher.started.clear()
+        dispatcher.finished.clear()
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+def test_repo_status_ignores_progress_from_finished_cycle() -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("proof")
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        stale = dispatcher.callbacks[0]
+
+        stale("rating", 1, 1)
+        assert _progress(client) == _IDLE
+        assert app.state.progress_board.get("acme/widget").stage is None
+
+        dispatcher.started.clear()
+        dispatcher.finished.clear()
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        dispatcher.report("analysis")
+
+        stale("rating", 1, 1)
+        assert _progress(client) == {"active": True, "stage": "analysis", "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+
+
+def test_repo_status_drops_invalid_progress_updates(caplog: pytest.LogCaptureFixture) -> None:
+    dispatcher = _ProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        dispatcher.report("timing", 1, 3)
+        valid = {"active": True, "stage": "timing", "completed_runs": 1, "total_runs": 3}
+
+        with caplog.at_level(logging.WARNING, logger="pit_crew.server"):
+            for bad in [
+                ("deploy", 0, 0),
+                (None, 0, 0),
+                ("timing", 4, 3),
+                ("timing", -1, 3),
+                ("timing", 1, -1),
+                ("timing", True, 3),
+                ("timing", 1, 3.0),
+                ("timing", "1", 3),
+            ]:
+                dispatcher.report(*bad)
+                assert _progress(client) == valid
+        assert sum("Ignoring invalid progress" in r.getMessage() for r in caplog.records) == 8
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+@pytest.mark.parametrize("until_sla", [False, True])
+def test_repo_status_reports_progress_from_async_dispatcher(*, until_sla: bool) -> None:
+    dispatcher = _AsyncProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget", "until_sla": until_sla}).status_code == 202
+        dispatcher.report("optimizer")
+        assert _progress(client) == {"active": True, "stage": "optimizer", "completed_runs": 0, "total_runs": 0}
+        dispatcher.report("replay", completed_runs=1, total_runs=2)
+        assert _progress(client) == {"active": True, "stage": "replay", "completed_runs": 1, "total_runs": 2}
+
+        dispatcher.steps.put(None)
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+
+def test_repo_status_reports_progress_from_kwargs_dispatcher_with_mixed_case_repo() -> None:
+    dispatcher = _KwargsProgressStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "Acme/Widget", "until_sla": True}).status_code == 202
+        assert dispatcher.reported.wait(timeout=5)
+        timing = {"active": True, "stage": "timing", "completed_runs": 1, "total_runs": 4}
+        assert _progress(client, "acme/widget") == timing
+        assert _progress(client, "ACME/WIDGET") == timing
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client, "Acme/Widget") == _IDLE
+
+
+def test_repo_status_legacy_dispatcher_without_progress_shows_active_without_stage() -> None:
+    dispatcher = _StubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+        assert _progress(client) == {"active": True, "stage": None, "completed_runs": 0, "total_runs": 0}
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        _wait_idle(app, client)
+        assert _progress(client) == _IDLE
+
+    assert dispatcher.calls == [("run_cycle", "acme/widget")]
+
+
+def test_run_cycle_task_without_board_still_releases_lock() -> None:
+    dispatcher = _KwargsProgressStubDispatcher()
+    dispatcher.release.set()
+    active_repos = {"acme/widget"}
+
+    asyncio.run(_run_cycle_task(dispatcher, "Acme/Widget", until_sla=False, active_repos=active_repos))
+
+    assert dispatcher.finished.is_set()
+    assert active_repos == set()
+
+
+def test_progress_board_isolates_tokens() -> None:
+    board = CycleProgressBoard()
+    first = board.start("acme/widget")
+    second = board.start("acme/widget")
+
+    assert board.get("acme/widget").stage is None
+    board.reporter("acme/widget", first)("proof")
+    assert board.get("acme/widget").stage is None
+    board.reporter("acme/widget", second)("proof")
+    assert board.get("acme/widget").stage == "proof"
+
+    board.clear("acme/widget", first)
+    assert board.get("acme/widget").stage == "proof"
+    board.clear("acme/widget", second)
+    assert board.get("acme/widget").stage is None
+    board.clear("acme/widget", second)
+    assert board.get("other/repo").stage is None
+
+
+class _BadSignature:
+    __signature__ = "not a signature"
+
+    def __call__(self, repo: str) -> None: ...
+
+
+def test_accepts_on_progress_detects_supported_signatures() -> None:
+    def keyword_only(repo: str, *, on_progress: ProgressCallback) -> None: ...
+
+    def positional_or_keyword(repo: str, on_progress: ProgressCallback | None = None) -> None: ...
+
+    def var_keyword(repo: str, **kwargs: object) -> None: ...
+
+    def positional_only(repo: str, on_progress: ProgressCallback, /) -> None: ...
+
+    def legacy(repo: str) -> None: ...
+
+    assert _accepts_on_progress(keyword_only)
+    assert _accepts_on_progress(positional_or_keyword)
+    assert _accepts_on_progress(var_keyword)
+    assert not _accepts_on_progress(positional_only)
+    assert not _accepts_on_progress(legacy)
+    assert not _accepts_on_progress(_BadSignature())

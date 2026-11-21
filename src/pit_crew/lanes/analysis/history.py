@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 API = "https://api.github.com"
 DEFAULT_RUNS = 150  # the architect's audit window
@@ -133,7 +133,7 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
 
 
-def fetch_workflow_content(
+def fetch_workflow(
     repo: str,
     workflow: str,
     *,
@@ -141,23 +141,22 @@ def fetch_workflow_content(
     token: str | None = None,
     get: Getter | None = None,
 ) -> str:
-    """Fetch ``.github/workflows/<workflow>`` from GitHub's Contents API for ``repo`` at ``ref``."""
+    """Fetch a workflow YAML file under ``.github/workflows/`` from GitHub's Contents API."""
     get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
-    url = f"{API}/repos/{repo}/contents/.github/workflows/{quote(workflow, safe='')}"
+    url = f"{API}/repos/{repo}/contents/.github/workflows/{workflow}"
     if ref:
         url = f"{url}?{urlencode({'ref': ref})}"
     body, _ = get(url)
-    if not isinstance(body, dict):
-        msg = f"unexpected response reading workflow {workflow!r} from {repo!r}"
-        raise TypeError(msg)
-    raw_content = body.get("content")
-    if not isinstance(raw_content, str):
-        msg = f"workflow {workflow!r} in {repo!r} has no text content"
-        raise TypeError(msg)
-    encoding = body.get("encoding")
-    if encoding == "base64":
-        return base64.b64decode(raw_content).decode("utf-8")
-    return raw_content
+    content = body.get("content") if isinstance(body, dict) else None
+    if (
+        not isinstance(body, dict)
+        or body.get("type") != "file"
+        or body.get("encoding") != "base64"
+        or not isinstance(content, str)
+    ):
+        msg = f"unexpected GitHub contents response for {repo}/.github/workflows/{workflow}"
+        raise ValueError(msg)
+    return base64.b64decode(content).decode("utf-8")
 
 
 def parse_runs(raw: list[dict[str, Any]]) -> list[WorkflowRun]:

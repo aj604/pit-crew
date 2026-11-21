@@ -547,7 +547,8 @@ def test_check_workflow_change_tool(ledger: InMemoryLedger) -> None:
 
 def test_every_playbook_skill_has_a_playbook_and_it_is_mounted() -> None:
     playbooks = Path(optimizer.__file__).parent / "playbooks"
-    assert {p.stem for p in playbooks.glob("*.md")} == set(PLAYBOOK_SKILLS)
+    stems = {p.stem for p in playbooks.glob("*.md")}
+    assert stems == {*PLAYBOOK_SKILLS, "artifact-capture"}  # artifact-capture is a companion, not a skill
 
     targets = {s["target"] for s in build_request("optimizer", "")["environment"]["sources"]}
     assert {f".agents/skills/optimizer/playbooks/{skill}.md" for skill in PLAYBOOK_SKILLS} <= targets
@@ -557,3 +558,79 @@ def test_optimizer_exposes_its_four_tools() -> None:
     build_request("optimizer", "")
     names = {t.name for t in tools.for_lane("optimizer")}
     assert names == {"get_hypothesis", "list_prior_attempts", "check_workflow_change", "report_candidate"}
+
+
+def test_browser_tests_without_recordings_get_a_warning() -> None:
+    upload = (
+        "      - uses: actions/upload-artifact@v4\n"
+        "        if: failure()\n"
+        "        with:\n"
+        "          name: report\n"
+        "          path: test-results/\n"
+    )
+    no_upload = BASE.replace(upload, "")
+    report = check_change(CI, no_upload, no_upload)
+    assert report.ok
+    assert report.warnings == [
+        (
+            f"{CI}: job `test` runs browser tests but uploads no failure recordings; "
+            "apply the artifact-capture companion playbook"
+        )
+    ]
+    assert check_change(CI, BASE, BASE).warnings == []
+
+
+def test_artifact_capture_upload_passes_the_guard() -> None:
+    playbook = (Path(optimizer.__file__).parent / "playbooks" / "artifact-capture.md").read_text()
+    assert "if: failure()" in playbook
+    capture = (
+        "      - uses: actions/upload-artifact@v4\n"
+        "        if: failure()\n"
+        "        with:\n"
+        "          name: failure-recordings-${{ github.job }}-${{ strategy.job-index }}\n"
+        "          path: test-results/\n"
+    )
+    head = "on: push\njobs:\n  e2e:\n    runs-on: x\n    steps:\n      - run: npx playwright test\n"
+    report = check_change(CI, head, head + capture)
+    assert report.ok
+    assert report.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [
+        # a coverage upload that only runs on success carries no failure recording
+        (
+            (
+                "      - run: npx playwright test\n      - uses: actions/upload-artifact@v4\n"
+                "        with:\n          path: coverage/\n"
+            ),
+            "no upload both runs on failure",
+        ),
+        # browser tests behind a package script
+        ("      - run: pnpm run test:e2e\n", "uploads no failure recordings"),
+        ("      - run: npm run playwright\n", "uploads no failure recordings"),
+        # a proper failure upload of recordings: no warning
+        (
+            (
+                "      - run: npx playwright test\n      - uses: actions/upload-artifact@v4\n"
+                "        if: ${{ !cancelled() }}\n        with:\n          path: playwright-report/\n"
+            ),
+            None,
+        ),
+        ("      - run: npm run lint\n", None),
+    ],
+)
+def test_recording_warning_needs_a_failure_upload_of_recordings(steps: str, expected: str | None) -> None:
+    workflow = "on: push\njobs:\n  e2e:\n    runs-on: x\n    steps:\n" + steps
+    warnings = check_change(CI, workflow, workflow).warnings
+    if expected is None:
+        assert warnings == []
+    else:
+        assert any(expected in w for w in warnings), warnings
+
+
+def test_artifact_capture_keeps_recording_off_in_timing_runs() -> None:
+    playbook = (Path(optimizer.__file__).parent / "playbooks" / "artifact-capture.md").read_text()
+    assert "PIT_CREW_RECORD" in playbook
+    assert "costs nothing" not in playbook

@@ -10,7 +10,8 @@ from dataclasses import asdict
 from typing import Any
 
 from pit_crew.contracts import Candidate, Hypothesis, is_allowed_candidate_path
-from pit_crew.lanes.optimizer.validate import GuardReport, check_change
+from pit_crew.lanes.optimizer.configs import check_config
+from pit_crew.lanes.optimizer.validate import YAML_SUFFIXES, GuardReport, check_change
 from pit_crew.ledger import Ledger
 from pit_crew.tools import tool
 
@@ -75,7 +76,10 @@ def check_workflow_change(ledger: Ledger, path: str, before: str, after: str) ->
     Returns ok, problems and warnings. Problems block the candidate: a path you may not change,
     YAML that does not parse, or anything that makes CI check less (a dropped command, trigger,
     matrix value or artifact upload; continue-on-error; if: false; a wider timeout; retries;
-    flags such as `|| true`, `-k` or `--exit-zero`). Fix every problem, then check again.
+    flags such as `|| true`, `-k` or `--exit-zero`). Config files are checked too: package.json
+    scripts, pytest and coverage settings, tox and Makefile commands, Cargo test profiles, test
+    runner configs (retries, ignores, failure recordings) and tsconfig strictness. Fix every
+    problem, then check again.
     """
     return _guard(path, before, after).to_dict()
 
@@ -157,4 +161,6 @@ def _candidate_problems(branch: str, files: dict[str, str], originals: dict[str,
 def _guard(path: str, before: str, after: str) -> GuardReport:
     if not is_allowed_candidate_path(path):
         return GuardReport(problems=[f"{path}: outside what Optimizer may change (.github/** and runner configs)"])
-    return check_change(path, before, after)
+    if path.endswith(YAML_SUFFIXES):
+        return check_change(path, before, after)
+    return check_config(path, before, after)

@@ -5,11 +5,12 @@ Pure logic lives in `history.py` (fetch + parse run history), `workflow.py` (job
 """
 
 import math
-import os
 import re
+import urllib.error
 from pathlib import Path
 from typing import Any
 
+from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Hypothesis
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.critical_path import profile
@@ -21,11 +22,31 @@ from pit_crew.tools import tool
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _WORKFLOW_FILE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml")
+_HTTP_NOT_FOUND = 404
+
+
+class WorkflowNotFoundError(FileNotFoundError):
+    """Raised when a remote workflow cannot be resolved for a deleted branch."""
+
+    @classmethod
+    def no_recorded_commit(cls, repo: str, workflow: str, branch: str) -> "WorkflowNotFoundError":
+        """Build error when a deleted branch has no completed runs with a commit SHA."""
+        return cls(
+            f"branch {branch!r} not found and no completed runs record a commit for {repo}/.github/workflows/{workflow}"
+        )
+
+    @classmethod
+    def inaccessible_commit(cls, repo: str, workflow: str, branch: str, sha: str) -> "WorkflowNotFoundError":
+        """Build error when neither the deleted branch nor its latest run's commit is accessible."""
+        return cls(
+            f"branch {branch!r} not found and run commit {sha!r} could not be fetched for "
+            f"{repo}/.github/workflows/{workflow}"
+        )
 
 
 def workspace() -> Path:
-    """Where the fork is checked out: /workspace in the managed-agent sandbox."""
-    return Path(os.environ.get("PIT_CREW_WORKSPACE", "/workspace"))
+    """Where the fork is checked out: the context's workspace, else PIT_CREW_WORKSPACE, else /workspace."""
+    return host_workspace.active_workspace()
 
 
 def _validate_workflow_name(workflow: str) -> None:
@@ -45,20 +66,51 @@ def workflow_path(workflow: str) -> Path:
     return path
 
 
-def _read_workflow_text(
+def _load_workflow_and_history(  # noqa: PLR0913  mirrors profile_ci parameters
     repo: str,
     workflow: str,
     *,
+    runs: int,
+    branch: str | None,
     workflow_content: str | None,
     ref: str | None,
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
+    """Load workflow YAML and run history, falling back to a run's commit SHA if ``branch`` was deleted."""
     if workflow_content is not None:
         _validate_workflow_name(workflow)
-        return workflow_content
+        return workflow_content, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+
     path = workflow_path(workflow)
     if path.is_file():
-        return path.read_text()
-    return history.fetch_workflow_content(repo, workflow, ref=ref)
+        return path.read_text(), history.fetch_history(repo, workflow, runs=runs, branch=branch)
+
+    fetch_ref = ref or branch
+    try:
+        yaml_text = history.fetch_workflow(repo, workflow, ref=fetch_ref)
+    except urllib.error.HTTPError as exc:
+        if ref is not None or branch is None or exc.code != _HTTP_NOT_FOUND:
+            raise
+        raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
+        return _fetch_workflow_from_runs(repo, workflow, branch, raw), raw
+
+    return yaml_text, history.fetch_history(repo, workflow, runs=runs, branch=branch)
+
+
+def _fetch_workflow_from_runs(
+    repo: str,
+    workflow: str,
+    branch: str,
+    raw: list[dict[str, Any]],
+) -> str:
+    sha = next((str(run["head_sha"]) for run in raw if run.get("head_sha")), "")
+    if not sha:
+        raise WorkflowNotFoundError.no_recorded_commit(repo, workflow, branch)
+    try:
+        return history.fetch_workflow(repo, workflow, ref=sha)
+    except urllib.error.HTTPError as exc:
+        if exc.code == _HTTP_NOT_FOUND:
+            raise WorkflowNotFoundError.inaccessible_commit(repo, workflow, branch, sha) from exc
+        raise
 
 
 @tool(
@@ -104,10 +156,15 @@ def profile_ci(  # noqa: PLR0913  optional workflow_content/ref allow remote san
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    workflow_text = _read_workflow_text(repo, workflow, workflow_content=workflow_content, ref=ref or branch)
-    spec = parse_workflow(workflow_text)
-    raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
-    return profile(spec, history.parse_runs(raw)).to_dict()
+    yaml_text, raw = _load_workflow_and_history(
+        repo,
+        workflow,
+        runs=runs,
+        branch=branch,
+        workflow_content=workflow_content,
+        ref=ref,
+    )
+    return profile(parse_workflow(yaml_text), history.parse_runs(raw)).to_dict()
 
 
 class InvalidRecordError(ValueError):

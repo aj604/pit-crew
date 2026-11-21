@@ -2442,6 +2442,7 @@ class _FakeInteractionOutcome:
     status: str | None
     steps: list[_FakeToolStep] | None = None
     continuation_token: str | None = None
+    environment_id: str | None = None
 
 
 def test_default_runner_profiles_ci_and_records_hypothesis_without_host_checkout(
@@ -2487,7 +2488,7 @@ def test_default_runner_profiles_ci_and_records_hypothesis_without_host_checkout
         }
     ]
     monkeypatch.setattr(analysis_history, "fetch_history", lambda *_a, **_kw: sample_runs)
-    monkeypatch.setattr(analysis_history, "fetch_workflow_content", lambda *_a, **_kw: workflow_yaml)
+    monkeypatch.setattr(analysis_history, "fetch_workflow", lambda *_a, **_kw: workflow_yaml)
 
     class _FakeInteractions:
         def __init__(self) -> None:

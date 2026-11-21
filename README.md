@@ -98,6 +98,8 @@ uv run python -m pit_crew.cli smoke-lane \
   --workspace ~/pit-crew-smoke/fork
 ```
 
+Omit `--workspace` (and `PIT_CREW_WORKSPACE`) to have the CLI download the repository tarball into a temporary folder for the run instead.
+
 See the [Lane Owner Guide](docs/lane-guide.md#live-smoke-test-milestone-2) for the full chained `analysis → optimizer → proof` walkthrough.
 
 ## Locked Architecture Decisions
