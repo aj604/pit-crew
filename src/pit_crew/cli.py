@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from pit_crew import benchmark_seeder, check_target, managed_agent
+from pit_crew import benchmark_seeder, check_target, managed_agent, runtime_cli
 from pit_crew import workspace as host_workspace
 from pit_crew.contracts import Candidate, Hypothesis, Record, ReplayPlan
 from pit_crew.ledger import Ledger, SqliteLedger, normalize_repo
@@ -302,6 +302,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_seed_target(commands)
     _add_check_target(commands)
+    runtime_cli.add_runtime_subcommands(commands)
     return parser
 
 
@@ -324,6 +325,8 @@ def main(
         summary, passed = seed_target(args, github)
     elif args.command == "check-target":
         summary, passed = run_check_target(args, get=get, find_bottlenecks=find_bottlenecks)
+    elif args.command in {"run-cycle", "serve", "register-webhook"}:
+        summary, passed = runtime_cli.run_runtime_command(args)
     else:
         summary, passed = smoke_lane(
             args.lane, args.repo, args.ledger, args.task, workspace=args.workspace, client=client

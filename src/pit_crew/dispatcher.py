@@ -3,19 +3,22 @@
 Drives a single optimization cycle through ``analysis -> optimizer -> proof`` while
 keeping all ledger state, workflow timing collection, Rater verdicts, and trust
 boundaries on the host. Never imports ``google`` or any lane module directly; lane
-execution goes through the injected ``LaneRunner``.
+execution goes through the injected ``LaneRunner`` or ``ProofBridge``.
 """
 
 import difflib
 import json
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module
 from pathlib import PurePosixPath
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
+from pit_crew import workspace as host_workspace
 from pit_crew.contracts import (
     BugCase,
     Candidate,
@@ -27,9 +30,12 @@ from pit_crew.contracts import (
     is_allowed_candidate_path,
 )
 from pit_crew.github import GitHubClient, WorkflowRunResult
+from pit_crew.lanes.optimizer.tools import check_candidate_files
 from pit_crew.ledger import Ledger, normalize_repo
 from pit_crew.proof_bridge import (
     MultimodalReplayVerifier,
+    ProofBridgeError,
+    ProofPRConfig,
     ReplayFailureOutputClient,
     ReplayRunPair,
     ReplayVerification,
@@ -39,9 +45,15 @@ from pit_crew.proof_bridge import (
 from pit_crew.rater import rate
 
 DISALLOWED_PATH_REASON = "disallowed path modified"
+CHECKS_LESS_REASON = "candidate checks less than its base"
 NO_REPLAY_PLAN_REASON = "no replay plan produced, so safety is unproven"
 
+CycleStage = Literal["analysis", "optimizer", "proof", "timing", "replay", "rating"]
+ProgressReporter = Callable[[CycleStage, int, int], None]
+
 _Hunk = tuple[int, int, list[str]]
+_MISSING_RUNNER_MSG = str(ProofBridgeError.missing_runner())
+_MISSING_PR_CLIENT_MSG = str(ProofBridgeError.missing_pr_client())
 
 
 def next_lane(record: Record) -> str | None:
@@ -64,6 +76,7 @@ class DispatcherConfig:
     poll_interval_seconds: float = 5.0
     auto_open_pr: bool = True
     base_branch: str = "main"
+    max_parallel_runs: int = 1
 
 
 @runtime_checkable
@@ -162,6 +175,32 @@ def _is_allowed_mutation_path(path: str) -> bool:
     if any(part in {"", ".", ".."} for part in parts):
         return False
     return parts[0].lower() != ".github"
+
+
+def _validate_bug_case(bug_case: BugCase, idx: int) -> None:
+    """Validate a single ``BugCase`` up front before creating any replay branches."""
+    if bug_case.kind == "commit":
+        if not bug_case.commit_sha:
+            msg = f"Commit bug case at index {idx} is missing commit_sha"
+            raise ValueError(msg)
+        return
+    if bug_case.kind == "mutation":
+        if not bug_case.mutated_files:
+            msg = f"Mutation bug case at index {idx} is missing mutated_files"
+            raise ValueError(msg)
+        for path in sorted(bug_case.mutated_files):
+            if not _is_allowed_mutation_path(path):
+                msg = f"Disallowed mutation path at index {idx}: {path!r}"
+                raise ValueError(msg)
+        return
+    msg = f"Unsupported bug case kind at index {idx}: {bug_case.kind!r}"
+    raise ValueError(msg)
+
+
+def _check_label_for_case(bug_case: BugCase, workflow: str) -> str:
+    if bug_case.expected_checks:
+        return bug_case.expected_checks[0]
+    return workflow
 
 
 def _change_hunks(base_lines: list[str], other_lines: list[str]) -> list[_Hunk]:
@@ -413,12 +452,13 @@ class _ReplayTarget:
 
 @dataclass(frozen=True)
 class _BranchReplaySpec:
-    """Parameters for creating, committing to, running, and deleting an ephemeral replay branch."""
+    """Parameters for creating, optionally committing to, running, and deleting an ephemeral replay branch."""
 
     branch: str
     base_sha: str
     files: dict[str, str]
     message: str
+    commit: bool = True
 
 
 @dataclass(frozen=True)
@@ -467,6 +507,29 @@ def _inconclusive_replay_result(
     return _BugReplayResult(counted=False, caught=False, outcome=outcome, run_urls=run_urls)
 
 
+def _fold_parallel_timings(
+    runs: list[tuple[str, WorkflowRunResult]],
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[str, ...]]:
+    baseline_durations: list[float] = []
+    cand_durations: list[float] = []
+    run_urls: list[str] = []
+    base_active = True
+    cand_active = True
+    for side_name, run in runs:
+        if run.html_url:
+            run_urls.append(run.html_url)
+        if side_name == "base":
+            if base_active and run.conclusion == "success":
+                baseline_durations.append(run.duration_seconds)
+            elif run.conclusion != "success":
+                base_active = False
+        elif cand_active and run.conclusion == "success":
+            cand_durations.append(run.duration_seconds)
+        elif run.conclusion != "success":
+            cand_active = False
+    return tuple(baseline_durations), tuple(cand_durations), tuple(run_urls)
+
+
 class Dispatcher:
     """Host-side orchestrator driving lane handoffs, timing measurement, and candidate safety guards."""
 
@@ -481,8 +544,11 @@ class Dispatcher:
         monotonic: Callable[[], float] = time.monotonic,
         replay_verifier: ReplayVerifier | None = None,
         record_replays: bool | None = None,
+        run_tracker: Any | None = None,  # noqa: ANN401
+        use_host_workspace: bool = False,
+        proof_bridge: Any | None = None,  # noqa: ANN401
     ) -> None:
-        """Initialize the Dispatcher with a ledger, GitHub client, lane runner, config, and hooks."""
+        """Initialize the Dispatcher with a ledger, GitHub client, lane runner, config, and runtime hooks."""
         self.ledger = ledger
         self.github = github
         self.lane_runner: LaneRunner = lane_runner if lane_runner is not None else _default_lane_runner
@@ -491,7 +557,38 @@ class Dispatcher:
         self._monotonic = monotonic
         self._replay_verifier = replay_verifier
         self._record_replays = record_replays if record_replays is not None else (replay_verifier is not None)
+        self._run_tracker = run_tracker
+        self._use_host_workspace = use_host_workspace
+        self._proof_bridge = proof_bridge
         self._declined_hypothesis_ids: set[str] = set()
+        self._cycle_local = threading.local()
+
+    def _report_progress(self, stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
+        reporter: ProgressReporter | None = getattr(self._cycle_local, "on_progress", None)
+        if reporter is not None:
+            reporter(stage, completed_runs, total_runs)
+
+    def _set_verified_replays(
+        self,
+        replays: tuple[Any, ...],
+        preview_files: tuple[tuple[str, bytes], ...] = (),
+    ) -> None:
+        self._cycle_local.verified_replays = replays
+        self._cycle_local.preview_files = preview_files
+
+    def _get_verified_replays(self) -> tuple[Any, ...]:
+        replays: tuple[Any, ...] = getattr(self._cycle_local, "verified_replays", ())
+        return replays
+
+    def _get_preview_files(self) -> tuple[tuple[str, bytes], ...]:
+        previews: tuple[tuple[str, bytes], ...] = getattr(self._cycle_local, "preview_files", ())
+        return previews
+
+    @property
+    def last_opened_pr_url(self) -> str | None:
+        """Return the URL of the pull request opened in the most recent cycle, if any."""
+        url: str | None = getattr(self._cycle_local, "last_pr_url", None)
+        return url
 
     def resolve_base_sha(self, repo: str, base_sha: str | None = None) -> str:
         """Resolve the commit SHA to optimize atop for ``repo``.
@@ -520,21 +617,41 @@ class Dispatcher:
         paths = dict.fromkeys((*candidate.changed_files, *candidate.files))
         return tuple(path for path in paths if not is_allowed_candidate_path(path))
 
+    def guard_candidate(self, repo: str, base_sha: str, candidate: Candidate) -> list[str]:
+        """Run the Optimizer's never-check-less guard against the real files at ``base_sha``.
+
+        The agent reports `original_files` itself; re-checking against GitHub's copy means a wrong or
+        invented "before" text cannot get a weakening change published.
+        """
+        fetched = {path: self.github.get_file_content(repo, path, base_sha) for path in candidate.files}
+        base = {path: text for path, text in fetched.items() if text is not None}
+        return check_candidate_files(candidate.files, base)
+
     def poll_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
         """Poll ``github.get_workflow_run`` until ``run_id`` completes or times out."""
-        start = self._monotonic()
-        while True:
-            run = self.github.get_workflow_run(repo, run_id)
-            if run.status == "completed":
-                return run
-            elapsed = self._monotonic() - start
-            if elapsed >= self.config.run_timeout_seconds:
-                msg = (
-                    f"Workflow run {run_id} in {repo} did not complete within "
-                    f"{self.config.run_timeout_seconds}s (last status: {run.status!r})"
-                )
-                raise TimeoutError(msg)
-            self._sleep(self.config.poll_interval_seconds)
+        if self._run_tracker is not None:
+            self._run_tracker.register(run_id)
+        try:
+            start = self._monotonic()
+            while True:
+                run = self.github.get_workflow_run(repo, run_id)
+                if run.status == "completed":
+                    return run
+                elapsed = self._monotonic() - start
+                if elapsed >= self.config.run_timeout_seconds:
+                    msg = (
+                        f"Workflow run {run_id} in {repo} did not complete within "
+                        f"{self.config.run_timeout_seconds}s (last status: {run.status!r})"
+                    )
+                    raise TimeoutError(msg)
+                if self._run_tracker is not None:
+                    wait_for = min(self.config.poll_interval_seconds, self.config.run_timeout_seconds - elapsed)
+                    self._run_tracker.wait_sync(run_id, timeout=wait_for)
+                else:
+                    self._sleep(self.config.poll_interval_seconds)
+        finally:
+            if self._run_tracker is not None:
+                self._run_tracker.discard(run_id)
 
     def collect_evidence(
         self,
@@ -544,26 +661,7 @@ class Dispatcher:
         *,
         workflow: str | None = None,
     ) -> Evidence:
-        """Collect interleaved CI timing and bug-replay evidence for ``candidate`` against ``base_sha``.
-
-        Creates a temporary named branch pinned to ``base_sha`` (and a temporary branch
-        for ``candidate.head_sha`` if ``candidate.branch`` is empty) so GitHub Actions
-        ``workflow_dispatch`` always receives a named ref rather than a raw commit SHA.
-        Alternates baseline and candidate workflow dispatches for ``config.timing_pairs``
-        pairs, including cold Run #1 to cancel runner-load drift, and cleans up temporary
-        refs in ``finally``.
-
-        Then replays each ``BugCase`` in ``replay_plan.cases`` on temporary branches that
-        are always deleted in ``finally``:
-
-        - ``kind == "commit"`` applies a 3-way merge of ``candidate.files`` onto
-          ``bug_case.commit_sha`` and marks the bug caught iff CI concludes ``"failure"``.
-        - ``kind == "mutation"`` rejects any mutation touching ``.github/``, first verifies
-          anti-gaming baseline failure onto ``base_sha``, excludes dud mutations, and
-          applies a 3-way merge of ``candidate.files`` onto ``bug_case.mutated_files``
-          before running the candidate replay. Overlay conflicts are recorded as
-          inconclusive rather than scoring a replay that erased the bug.
-        """
+        """Collect interleaved CI timing and bug-replay evidence for ``candidate`` against ``base_sha``."""
         repo = self._resolve_repo(candidate)
         workflow_file = self._resolve_workflow(candidate, workflow)
         if not candidate.branch and not candidate.head_sha:
@@ -673,8 +771,15 @@ class Dispatcher:
         candidate: Candidate,
     ) -> tuple[tuple[float, ...], tuple[float, ...], tuple[str, ...]]:
         if self.config.timing_pairs <= 0:
+            self._report_progress("timing", 0, 0)
             return (), (), ()
 
+        if self.config.max_parallel_runs > 1:
+            return self._collect_parallel_timings(repo=repo, workflow=workflow, base_sha=base_sha, candidate=candidate)
+
+        total_runs = self.config.timing_pairs * 2
+        completed_runs = 0
+        self._report_progress("timing", 0, total_runs)
         run_urls: list[str] = []
         with ExitStack() as stack:
             baseline_branch = f"pc/baseline-{candidate.id}"
@@ -694,10 +799,55 @@ class Dispatcher:
                 for side in (baseline, cand_side):
                     if side.active:
                         self._record_timing_run(repo, workflow, side, run_urls)
+                        completed_runs += 1
+                        self._report_progress("timing", completed_runs, total_runs)
                 if not baseline.active and not cand_side.active:
                     break
 
         return tuple(baseline.durations), tuple(cand_side.durations), tuple(run_urls)
+
+    def _collect_parallel_timings(
+        self,
+        *,
+        repo: str,
+        workflow: str,
+        base_sha: str,
+        candidate: Candidate,
+    ) -> tuple[tuple[float, ...], tuple[float, ...], tuple[str, ...]]:
+        total_runs = self.config.timing_pairs * 2
+        completed_runs = 0
+        lock = threading.Lock()
+        self._report_progress("timing", 0, total_runs)
+
+        def run_slot(side_name: str, ref: str) -> tuple[str, WorkflowRunResult]:
+            nonlocal completed_runs
+            run = self._dispatch_and_poll(repo, workflow, ref)
+            with lock:
+                completed_runs += 1
+                done = completed_runs
+            self._report_progress("timing", done, total_runs)
+            return side_name, run
+
+        with ExitStack() as stack:
+            slots: list[tuple[str, str]] = []
+            for idx in range(self.config.timing_pairs):
+                base_ref = f"pc/base-{candidate.id}-{idx}"
+                self.github.create_branch(repo, base_ref, base_sha)
+                stack.callback(self.github.delete_branch, repo, base_ref)
+                if candidate.head_sha:
+                    cand_ref = f"pc/cand-{candidate.id}-{idx}"
+                    self.github.create_branch(repo, cand_ref, candidate.head_sha)
+                    stack.callback(self.github.delete_branch, repo, cand_ref)
+                else:
+                    cand_ref = candidate.branch
+                slots.append(("base", base_ref))
+                slots.append(("cand", cand_ref))
+
+            with ThreadPoolExecutor(max_workers=self.config.max_parallel_runs) as pool:
+                futures = [pool.submit(run_slot, side_name, ref) for side_name, ref in slots]
+                ordered_runs = [future.result() for future in futures]
+
+        return _fold_parallel_timings(ordered_runs)
 
     def _record_timing_run(
         self,
@@ -719,24 +869,61 @@ class Dispatcher:
         target: _ReplayTarget,
         replay_plan: ReplayPlan,
     ) -> tuple[int, int, tuple[str, ...], tuple[dict[str, Any], ...]]:
-        results = [self._replay_bug_case(target, bug_case, idx) for idx, bug_case in enumerate(replay_plan.cases)]
-        run_urls: list[str] = [url for result in results for url in result.run_urls]
+        cases = replay_plan.cases
+        total_cases = len(cases)
+        self._report_progress("replay", 0, total_cases)
+        for idx, bug_case in enumerate(cases):
+            _validate_bug_case(bug_case, idx)
 
+        completed_cases = 0
+        lock = threading.Lock()
+        sem = threading.BoundedSemaphore(max(1, self.config.max_parallel_runs))
+
+        def run_case(idx: int, bug_case: BugCase) -> _BugReplayResult:
+            nonlocal completed_cases
+            res = self._replay_bug_case(target, bug_case, idx, sem=sem)
+            with lock:
+                completed_cases += 1
+                done = completed_cases
+            self._report_progress("replay", done, total_cases)
+            return res
+
+        if self.config.max_parallel_runs > 1 and cases:
+            with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+                futures = [pool.submit(run_case, idx, bug_case) for idx, bug_case in enumerate(cases)]
+                results = [future.result() for future in futures]
+        else:
+            results = [run_case(idx, bug_case) for idx, bug_case in enumerate(cases)]
+
+        return self._summarize_replay_results(target.repo, results)
+
+    def _summarize_replay_results(
+        self,
+        repo: str,
+        results: list[_BugReplayResult],
+    ) -> tuple[int, int, tuple[str, ...], tuple[dict[str, Any], ...]]:
+        run_urls: list[str] = [url for res in results for url in res.run_urls]
         if self._replay_verifier is not None:
-            bugs_total, bugs_caught, verified_outcomes = self._verify_replay_results(target.repo, results)
+            bugs_total, bugs_caught, verified_outcomes = self._verify_replay_results(repo, results)
             return bugs_total, bugs_caught, tuple(run_urls), verified_outcomes
 
-        bugs_total = 0
-        bugs_caught = 0
-        bug_outcomes: list[dict[str, Any]] = []
-        for result in results:
-            if result.counted:
-                bugs_total += 1
-                if result.caught:
-                    bugs_caught += 1
-            bug_outcomes.append(result.outcome)
+        if self._proof_bridge is not None:
+            pairs = [res.pair for res in results if res.pair is not None]
+            verification = self._proof_bridge.verify_replay_runs(repo, pairs)
+            self._set_verified_replays(verification.replays, getattr(verification, "preview_files", ()))
+            conflict_outcomes = tuple(res.outcome for res in results if res.pair is None)
+            return (
+                verification.bugs_total,
+                verification.bugs_caught,
+                tuple(run_urls),
+                (*verification.bug_outcomes, *conflict_outcomes),
+            )
 
-        return bugs_total, bugs_caught, tuple(run_urls), tuple(bug_outcomes)
+        self._set_verified_replays(())
+        bugs_total = sum(1 for res in results if res.counted)
+        bugs_caught = sum(1 for res in results if res.counted and res.caught)
+        bug_outcomes = tuple(res.outcome for res in results)
+        return bugs_total, bugs_caught, tuple(run_urls), bug_outcomes
 
     def _verify_replay_results(
         self,
@@ -793,21 +980,47 @@ class Dispatcher:
         target: _ReplayTarget,
         bug_case: BugCase,
         idx: int,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
     ) -> _BugReplayResult:
+        _validate_bug_case(bug_case, idx)
         if bug_case.kind == "commit":
-            return self._replay_commit_case(target, bug_case, idx)
-        if bug_case.kind == "mutation":
-            return self._replay_mutation_case(target, bug_case, idx)
-        msg = f"Unsupported bug case kind at index {idx}: {bug_case.kind!r}"
-        raise ValueError(msg)
+            return self._replay_commit_case(target, bug_case, idx, sem=sem)
+        return self._replay_mutation_case(target, bug_case, idx, sem=sem)
 
-    def _run_ephemeral_branch(self, target: _ReplayTarget, spec: _BranchReplaySpec) -> WorkflowRunResult:
-        self.github.create_branch(target.repo, spec.branch, spec.base_sha)
-        try:
-            self.github.commit_files(target.repo, spec.branch, spec.base_sha, spec.files, spec.message)
-            return self._dispatch_and_poll(target.repo, target.workflow, spec.branch)
-        finally:
-            self.github.delete_branch(target.repo, spec.branch)
+    def _run_ephemeral_branch(
+        self,
+        target: _ReplayTarget,
+        spec: _BranchReplaySpec,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
+    ) -> WorkflowRunResult:
+        guard = sem if sem is not None else nullcontext()
+        with guard:
+            self.github.create_branch(target.repo, spec.branch, spec.base_sha)
+            try:
+                if spec.commit:
+                    self.github.commit_files(target.repo, spec.branch, spec.base_sha, spec.files, spec.message)
+                return self._dispatch_and_poll(target.repo, target.workflow, spec.branch)
+            finally:
+                self.github.delete_branch(target.repo, spec.branch)
+
+    def _run_branch_pair(
+        self,
+        target: _ReplayTarget,
+        base_spec: _BranchReplaySpec,
+        cand_spec: _BranchReplaySpec,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
+    ) -> tuple[WorkflowRunResult, WorkflowRunResult]:
+        if self.config.max_parallel_runs > 1:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                base_fut = pool.submit(self._run_ephemeral_branch, target, base_spec, sem=sem)
+                cand_fut = pool.submit(self._run_ephemeral_branch, target, cand_spec, sem=sem)
+                return base_fut.result(), cand_fut.result()
+        base_run = self._run_ephemeral_branch(target, base_spec, sem=sem)
+        cand_run = self._run_ephemeral_branch(target, cand_spec, sem=sem)
+        return base_run, cand_run
 
     def _build_commit_replay_files(
         self,
@@ -852,36 +1065,49 @@ class Dispatcher:
         target: _ReplayTarget,
         bug_case: BugCase,
         idx: int,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
     ) -> _BugReplayResult:
-        commit_sha = bug_case.commit_sha
-        if not commit_sha:
-            msg = f"Commit bug case at index {idx} is missing commit_sha"
-            raise ValueError(msg)
-
+        commit_sha = str(bug_case.commit_sha)
         overlay_files, conflicts = self._build_commit_replay_files(target, commit_sha)
         if conflicts:
             return _inconclusive_replay_result("commit", commit_sha, conflicts)
 
-        if not self._record_replays and self._replay_verifier is None:
-            return self._replay_commit_candidate_only(target, commit_sha, overlay_files, idx)
-        return self._replay_commit_pair(target, bug_case, commit_sha, overlay_files, idx)
+        if self._record_replays or self._replay_verifier is not None:
+            return self._replay_commit_pair(target, bug_case, commit_sha, overlay_files, idx, sem=sem)
 
-    def _replay_commit_candidate_only(
-        self,
-        target: _ReplayTarget,
-        commit_sha: str,
-        overlay_files: dict[str, str],
-        idx: int,
-    ) -> _BugReplayResult:
-        run = self._run_ephemeral_branch(
-            target,
-            _BranchReplaySpec(
-                branch=f"pc/replay-{target.candidate.id}-{idx}",
-                base_sha=commit_sha,
-                files=overlay_files,
-                message=f"Pit Crew replay: overlay candidate {target.candidate.id} onto {commit_sha}",
-            ),
+        cand_spec = _BranchReplaySpec(
+            branch=f"pc/replay-{target.candidate.id}-{idx}",
+            base_sha=commit_sha,
+            files=overlay_files,
+            message=f"Pit Crew replay: overlay candidate {target.candidate.id} onto {commit_sha}",
         )
+        if self._proof_bridge is not None:
+            base_spec = _BranchReplaySpec(
+                branch=f"pc/replay-{target.candidate.id}-{idx}-base",
+                base_sha=commit_sha,
+                files={},
+                message="",
+                commit=False,
+            )
+            base_run, run = self._run_branch_pair(target, base_spec, cand_spec, sem=sem)
+            urls = tuple(u for u in (base_run.html_url, run.html_url) if u)
+            pair = ReplayRunPair(
+                sha=commit_sha,
+                check=_check_label_for_case(bug_case, target.workflow),
+                baseline_conclusion=base_run.conclusion or "",
+                candidate_conclusion=run.conclusion or "",
+                baseline_run_id=str(base_run.run_id),
+                candidate_run_id=str(run.run_id),
+                baseline_run_url=base_run.html_url,
+                candidate_run_url=run.html_url,
+                expected_checks=bug_case.expected_checks,
+            )
+        else:
+            run = self._run_ephemeral_branch(target, cand_spec, sem=sem)
+            urls = (run.html_url,) if run.html_url else ()
+            pair = None
+
         caught = run.conclusion == "failure"
         outcome: dict[str, Any] = {
             "kind": "commit",
@@ -890,16 +1116,17 @@ class Dispatcher:
             "baseline_failed": True,
             "run_url": run.html_url,
         }
-        run_urls = (run.html_url,) if run.html_url else ()
-        return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=run_urls)
+        return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=urls, pair=pair)
 
-    def _replay_commit_pair(
+    def _replay_commit_pair(  # noqa: PLR0913
         self,
         target: _ReplayTarget,
         bug_case: BugCase,
         commit_sha: str,
         overlay_files: dict[str, str],
         idx: int,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
     ) -> _BugReplayResult:
         check_name = _primary_check_name(bug_case, target.workflow)
         base_files, base_aliases = self._instrument_replay_files(target, commit_sha, {}, bug_case.expected_checks)
@@ -911,6 +1138,7 @@ class Dispatcher:
                 files=base_files,
                 message=f"Pit Crew commit baseline replay {idx} for candidate {target.candidate.id} at {commit_sha}",
             ),
+            sem=sem,
         )
         run_urls: list[str] = [baseline_run.html_url] if baseline_run.html_url else []
         if baseline_run.conclusion != "failure":
@@ -958,6 +1186,7 @@ class Dispatcher:
                 files=cand_files,
                 message=f"Pit Crew commit candidate replay {idx}: overlay {target.candidate.id} onto {commit_sha}",
             ),
+            sem=sem,
         )
         if candidate_run.html_url:
             run_urls.append(candidate_run.html_url)
@@ -1001,53 +1230,86 @@ class Dispatcher:
         target: _ReplayTarget,
         bug_case: BugCase,
         idx: int,
+        *,
+        sem: threading.BoundedSemaphore | None = None,
     ) -> _BugReplayResult:
-        if not bug_case.mutated_files:
-            msg = f"Mutation bug case at index {idx} is missing mutated_files"
-            raise ValueError(msg)
-
-        for path in sorted(bug_case.mutated_files):
-            if not _is_allowed_mutation_path(path):
-                msg = f"Disallowed mutation path at index {idx}: {path!r}"
-                raise ValueError(msg)
-
         ref = bug_case.reason or ",".join(sorted(bug_case.mutated_files))
-        check_name = _primary_check_name(bug_case, target.workflow)
-        mutation_sha = f"mutation-{idx}"
+        check_label = (
+            _primary_check_name(bug_case, target.workflow)
+            if (self._replay_verifier is not None or self._record_replays)
+            else _check_label_for_case(bug_case, target.workflow)
+        )
         base_files, base_aliases = self._instrument_replay_files(
             target,
             target.base_sha,
             dict(bug_case.mutated_files),
             bug_case.expected_checks,
         )
-        baseline_run = self._run_ephemeral_branch(
-            target,
-            _BranchReplaySpec(
-                branch=f"pc/replay-{target.candidate.id}-{idx}-base",
-                base_sha=target.base_sha,
-                files=base_files,
-                message=f"Pit Crew mutation baseline replay {idx} for candidate {target.candidate.id}",
-            ),
+        base_spec = _BranchReplaySpec(
+            branch=f"pc/replay-{target.candidate.id}-{idx}-base",
+            base_sha=target.base_sha,
+            files=base_files,
+            message=f"Pit Crew mutation baseline replay {idx} for candidate {target.candidate.id}",
         )
+        if self.config.max_parallel_runs > 1:
+            return self._replay_mutation_parallel(
+                target,
+                bug_case,
+                idx,
+                ref=ref,
+                check_label=check_label,
+                base_spec=base_spec,
+                base_aliases=base_aliases,
+                sem=sem,
+            )
+        return self._replay_mutation_sequential(
+            target,
+            bug_case,
+            idx,
+            ref=ref,
+            check_label=check_label,
+            base_spec=base_spec,
+            base_aliases=base_aliases,
+            sem=sem,
+        )
+
+    def _replay_mutation_sequential(  # noqa: PLR0913
+        self,
+        target: _ReplayTarget,
+        bug_case: BugCase,
+        idx: int,
+        *,
+        ref: str,
+        check_label: str,
+        base_spec: _BranchReplaySpec,
+        base_aliases: tuple[str, ...] = (),
+        sem: threading.BoundedSemaphore | None = None,
+    ) -> _BugReplayResult:
+        baseline_run = self._run_ephemeral_branch(target, base_spec, sem=sem)
         run_urls: list[str] = [baseline_run.html_url] if baseline_run.html_url else []
-        baseline_failed = baseline_run.conclusion == "failure"
-        if not baseline_failed:
+        use_pair_meta = self._replay_verifier is not None or self._record_replays
+        mutation_sha = f"mutation-{idx}" if use_pair_meta else ref
+        if baseline_run.conclusion != "failure":
             pair = ReplayRunPair(
                 sha=mutation_sha,
-                check=check_name,
+                check=check_label,
                 baseline_conclusion=baseline_run.conclusion or "",
-                candidate_conclusion="skipped",
+                candidate_conclusion="skipped" if use_pair_meta else "",
                 baseline_run_id=str(baseline_run.run_id),
                 candidate_run_id="",
                 baseline_run_url=baseline_run.html_url,
                 expected_checks=bug_case.expected_checks,
                 check_aliases=base_aliases,
             )
-            meta = _ReplayPairMeta(
-                kind="mutation",
-                ref=ref,
-                baseline_run_url=baseline_run.html_url,
-                candidate_run_url="",
+            meta = (
+                _ReplayPairMeta(
+                    kind="mutation",
+                    ref=ref,
+                    baseline_run_url=baseline_run.html_url,
+                    candidate_run_url="",
+                )
+                if use_pair_meta
+                else None
             )
             outcome: dict[str, Any] = {
                 "kind": "mutation",
@@ -1078,88 +1340,159 @@ class Dispatcher:
         cand_files, cand_aliases = self._instrument_replay_files(
             target, target.base_sha, overlay_files, bug_case.expected_checks
         )
-        candidate_run = self._run_ephemeral_branch(
-            target,
-            _BranchReplaySpec(
-                branch=f"pc/replay-{target.candidate.id}-{idx}-cand",
-                base_sha=target.base_sha,
-                files=cand_files,
-                message=f"Pit Crew mutation candidate replay {idx} for candidate {target.candidate.id}",
-            ),
+        cand_spec = _BranchReplaySpec(
+            branch=f"pc/replay-{target.candidate.id}-{idx}-cand",
+            base_sha=target.base_sha,
+            files=cand_files,
+            message=f"Pit Crew mutation candidate replay {idx} for candidate {target.candidate.id}",
         )
-        if candidate_run.html_url:
-            run_urls.append(candidate_run.html_url)
-        caught = candidate_run.conclusion == "failure"
-        pair = ReplayRunPair(
+        candidate_run = self._run_ephemeral_branch(target, cand_spec, sem=sem)
+        return _finalize_mutation_pair(
+            ref,
+            check_label,
+            baseline_run,
+            candidate_run,
             sha=mutation_sha,
-            check=check_name,
-            baseline_conclusion=baseline_run.conclusion or "",
-            candidate_conclusion=candidate_run.conclusion or "",
-            baseline_run_id=str(baseline_run.run_id),
-            candidate_run_id=str(candidate_run.run_id),
-            baseline_run_url=baseline_run.html_url,
-            candidate_run_url=candidate_run.html_url,
             expected_checks=bug_case.expected_checks,
             check_aliases=tuple(dict.fromkeys((*base_aliases, *cand_aliases))),
-        )
-        meta = _ReplayPairMeta(
-            kind="mutation",
-            ref=ref,
-            baseline_run_url=baseline_run.html_url,
-            candidate_run_url=candidate_run.html_url,
-        )
-        outcome = {
-            "kind": "mutation",
-            "ref": ref,
-            "caught": caught,
-            "baseline_failed": True,
-            "run_url": candidate_run.html_url,
-        }
-        return _BugReplayResult(
-            counted=True,
-            caught=caught,
-            outcome=outcome,
-            run_urls=tuple(run_urls),
-            pair=pair,
-            pair_meta=meta,
+            include_meta=use_pair_meta,
         )
 
-    def run_cycle(self, repo: str, base_sha: str | None = None) -> Verdict | None:
-        """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any.
+    def _replay_mutation_parallel(  # noqa: PLR0913
+        self,
+        target: _ReplayTarget,
+        bug_case: BugCase,
+        idx: int,
+        *,
+        ref: str,
+        check_label: str,
+        base_spec: _BranchReplaySpec,
+        base_aliases: tuple[str, ...] = (),
+        sem: threading.BoundedSemaphore | None = None,
+    ) -> _BugReplayResult:
+        use_pair_meta = self._replay_verifier is not None or self._record_replays
+        mutation_sha = f"mutation-{idx}" if use_pair_meta else ref
+        overlay_files, conflicts = self._build_mutation_replay_files(target, bug_case.mutated_files)
+        if conflicts:
+            baseline_run = self._run_ephemeral_branch(target, base_spec, sem=sem)
+            urls = (baseline_run.html_url,) if baseline_run.html_url else ()
+            if baseline_run.conclusion != "failure":
+                pair = ReplayRunPair(
+                    sha=mutation_sha,
+                    check=check_label,
+                    baseline_conclusion=baseline_run.conclusion or "",
+                    candidate_conclusion="skipped" if use_pair_meta else "",
+                    baseline_run_id=str(baseline_run.run_id),
+                    candidate_run_id="",
+                    baseline_run_url=baseline_run.html_url,
+                    expected_checks=bug_case.expected_checks,
+                    check_aliases=base_aliases,
+                )
+                meta = (
+                    _ReplayPairMeta(
+                        kind="mutation",
+                        ref=ref,
+                        baseline_run_url=baseline_run.html_url,
+                        candidate_run_url="",
+                    )
+                    if use_pair_meta
+                    else None
+                )
+                dud: dict[str, Any] = {
+                    "kind": "mutation",
+                    "ref": ref,
+                    "caught": False,
+                    "baseline_failed": False,
+                    "run_url": baseline_run.html_url,
+                }
+                return _BugReplayResult(
+                    counted=False, caught=False, outcome=dud, run_urls=urls, pair=pair, pair_meta=meta
+                )
+            return _inconclusive_replay_result(
+                "mutation",
+                ref,
+                conflicts,
+                run_url=baseline_run.html_url,
+                run_urls=urls,
+            )
 
-        Resumes any pending unrated ``Candidate`` first so incomplete Proof or evidence
-        steps are not permanently skipped. Otherwise runs ``analysis -> optimizer``,
-        publishes validated candidate branches atop the resolved cycle base, runs
-        ``proof``, collects evidence, and persists the Rater ``Verdict``. When
-        ``verdict.keep`` and ``config.auto_open_pr`` are both ``True``, opens a pull
-        request for ``candidate.branch`` targeting ``config.base_branch``.
-        """
-        pending = self._select_pending_candidate(repo)
-        if pending is not None:
-            pending_base = base_sha or pending.base_sha or self.resolve_base_sha(repo)
-            return self._evaluate_candidate(repo, pending_base, pending, self._find_hypothesis(pending.hypothesis_id))
+        cand_files, cand_aliases = self._instrument_replay_files(
+            target, target.base_sha, overlay_files, bug_case.expected_checks
+        )
+        cand_spec = _BranchReplaySpec(
+            branch=f"pc/replay-{target.candidate.id}-{idx}-cand",
+            base_sha=target.base_sha,
+            files=cand_files,
+            message=f"Pit Crew mutation candidate replay {idx} for candidate {target.candidate.id}",
+        )
+        baseline_run, candidate_run = self._run_branch_pair(target, base_spec, cand_spec, sem=sem)
+        return _finalize_mutation_pair(
+            ref,
+            check_label,
+            baseline_run,
+            candidate_run,
+            sha=mutation_sha,
+            expected_checks=bug_case.expected_checks,
+            check_aliases=tuple(dict.fromkeys((*base_aliases, *cand_aliases))),
+            include_meta=use_pair_meta,
+        )
 
-        resolved_base_sha = self.resolve_base_sha(repo, base_sha)
+    def run_cycle(
+        self,
+        repo: str,
+        base_sha: str | None = None,
+        *,
+        on_progress: ProgressReporter | None = None,
+    ) -> Verdict | None:
+        """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any."""
+        prev_progress = getattr(self._cycle_local, "on_progress", None)
+        self._cycle_local.on_progress = on_progress
+        self._set_verified_replays(())
+        try:
+            pending = self._select_pending_candidate(repo)
+            if pending is not None:
+                pending_base = base_sha or pending.base_sha or self.resolve_base_sha(repo)
+                return self._evaluate_candidate(
+                    repo,
+                    pending_base,
+                    pending,
+                    self._find_hypothesis(pending.hypothesis_id),
+                )
 
+            resolved_base_sha = self.resolve_base_sha(repo, base_sha)
+            self._report_progress("analysis", 0, 0)
+            self._run_analysis(repo, resolved_base_sha)
+
+            hypothesis = self.select_next_hypothesis(repo)
+            if hypothesis is None:
+                return None
+
+            self._report_progress("optimizer", 0, 0)
+            candidate, optimizer_completed = self._run_optimizer(repo, resolved_base_sha, hypothesis)
+            if candidate is None:
+                if optimizer_completed:
+                    self._declined_hypothesis_ids.add(hypothesis.id)
+                return None
+
+            return self._evaluate_candidate(repo, resolved_base_sha, candidate, hypothesis)
+        finally:
+            self._cycle_local.on_progress = prev_progress
+
+    def _run_analysis(self, repo: str, resolved_base_sha: str) -> None:
         analysis_task = _build_analysis_task(
             repo=repo,
             base_sha=resolved_base_sha,
             workflow_file=self.config.workflow_file,
             prior_attempts=self.ledger.prior_attempts(repo),
         )
-        self.lane_runner("analysis", analysis_task, self.ledger, repo=repo)
-
-        hypothesis = self.select_next_hypothesis(repo)
-        if hypothesis is None:
-            return None
-
-        candidate, optimizer_completed = self._run_optimizer(repo, resolved_base_sha, hypothesis)
-        if candidate is None:
-            if optimizer_completed:
-                self._declined_hypothesis_ids.add(hypothesis.id)
-            return None
-
-        return self._evaluate_candidate(repo, resolved_base_sha, candidate, hypothesis)
+        if self._use_host_workspace and host_workspace.configured_workspace() is None:
+            with (
+                host_workspace.materialize(repo) as checkout,
+                host_workspace.use_workspace(checkout),
+            ):
+                self.lane_runner("analysis", analysis_task, self.ledger, repo=repo)
+        else:
+            self.lane_runner("analysis", analysis_task, self.ledger, repo=repo)
 
     def _evaluate_candidate(
         self,
@@ -1179,10 +1512,22 @@ class Dispatcher:
             self.ledger.add(verdict)
             return verdict
 
+        if problems := self.guard_candidate(repo, resolved_base_sha, candidate):
+            verdict = Verdict(
+                candidate_id=candidate.id,
+                keep=False,
+                speedup=0.0,
+                p_value=None,
+                reason=f"{CHECKS_LESS_REASON}: {problems[0]}",
+            )
+            self.ledger.add(verdict)
+            return verdict
+
         candidate = self._publish_candidate(repo, resolved_base_sha, candidate)
 
         replay_plan = self._existing_replay_plan(candidate.id)
         if replay_plan is None:
+            self._report_progress("proof", 0, 0)
             replay_plan, proof_completed = self._run_proof(repo, resolved_base_sha, candidate)
             if replay_plan is None:
                 if proof_completed:
@@ -1204,17 +1549,49 @@ class Dispatcher:
         )
         evidence = self.collect_evidence(candidate, replay_plan, resolved_base_sha, workflow=workflow)
         self.ledger.add(evidence)
+        self._report_progress("rating", 0, 0)
         verdict = rate(evidence)
         self.ledger.add(verdict)
-        if verdict.keep and self.config.auto_open_pr and hypothesis is not None:
-            self.github.open_pull_request(
+        if verdict.keep and self.config.auto_open_pr:
+            self._open_kept_pull_request(repo, hypothesis, candidate, evidence, verdict)
+        return verdict
+
+    def _open_kept_pull_request(
+        self,
+        repo: str,
+        hypothesis: Hypothesis | None,
+        candidate: Candidate,
+        evidence: Evidence,
+        verdict: Verdict,
+    ) -> None:
+        opened = None
+        if self._proof_bridge is not None:
+            try:
+                opened = self._proof_bridge.open_kept_pr(
+                    candidate,
+                    evidence,
+                    verdict,
+                    self._get_verified_replays(),
+                    config=ProofPRConfig(
+                        auto_open_pr=True,
+                        base_branch=self.config.base_branch,
+                        repo=repo,
+                    ),
+                    preview_files=self._get_preview_files(),
+                )
+            except ProofBridgeError as exc:
+                if str(exc) != _MISSING_PR_CLIENT_MSG:
+                    raise
+        if opened is not None:
+            self._cycle_local.last_pr_url = getattr(opened, "url", None)
+        elif hypothesis is not None:
+            self._cycle_local.last_pr_url = self.github.open_pull_request(
                 repo,
                 title=format_pr_title(hypothesis, candidate, verdict),
                 body=format_pr_body(hypothesis, candidate, evidence, verdict),
                 head=candidate.branch,
                 base=self.config.base_branch,
             )
-        return verdict
 
     def _run_optimizer(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> tuple[Candidate | None, bool]:
         existing_ids = {cand.id for cand in self.ledger.all(Candidate)}
@@ -1234,8 +1611,18 @@ class Dispatcher:
 
     def _run_proof(self, repo: str, base_sha: str, candidate: Candidate) -> tuple[ReplayPlan | None, bool]:
         existing_ids = {plan.id for plan in self.ledger.all(ReplayPlan)}
-        task = _build_proof_task(repo=repo, base_sha=base_sha, candidate=candidate)
-        result = self.lane_runner("proof", task, self.ledger, repo=repo)
+        if self._proof_bridge is not None:
+            try:
+                _, result = self._proof_bridge.run(candidate, ledger=self.ledger, repo=repo, base_sha=base_sha)
+            except ProofBridgeError as exc:
+                if str(exc) != _MISSING_RUNNER_MSG:
+                    raise
+                ctx = self._proof_bridge.prepare_context(candidate, repo=repo, base_sha=base_sha)
+                prompt = self._proof_bridge.build_prompt(ctx)
+                result = self.lane_runner("proof", prompt, self.ledger, repo=repo)
+        else:
+            task = _build_proof_task(repo=repo, base_sha=base_sha, candidate=candidate)
+            result = self.lane_runner("proof", task, self.ledger, repo=repo)
         new_plans = [
             plan
             for plan in self.ledger.all(ReplayPlan)
@@ -1243,20 +1630,17 @@ class Dispatcher:
         ]
         return (new_plans[-1] if new_plans else None), _is_completed_lane_result(result)
 
-    def run_until_sla(self, repo: str) -> list[Verdict]:
-        """Run compounding optimization cycles for ``repo`` until the CI SLA is met or cycles are exhausted.
-
-        Repeatedly invokes ``run_cycle(repo)`` up to ``config.max_compounding_cycles`` iterations,
-        collecting each non-``None`` ``Verdict``. Each subsequent cycle automatically advances
-        ``base_sha`` to ``ledger.latest_kept_candidate(repo).head_sha`` after a kept candidate,
-        while retaining the previous ``base_sha`` after a rejected candidate. Continues past
-        hypotheses definitively declined by Optimizer while remaining hypotheses exist, and
-        stops early only when a kept verdict for ``config.workflow_file`` satisfies the CI SLA.
-        """
+    def run_until_sla(
+        self,
+        repo: str,
+        *,
+        on_progress: ProgressReporter | None = None,
+    ) -> list[Verdict]:
+        """Run compounding optimization cycles for ``repo`` until the CI SLA is met or cycles are exhausted."""
         verdicts: list[Verdict] = []
         for _ in range(self.config.max_compounding_cycles):
             declined_before = len(self._declined_hypothesis_ids)
-            verdict = self.run_cycle(repo)
+            verdict = self.run_cycle(repo, on_progress=on_progress)
             if verdict is None:
                 if (
                     len(self._declined_hypothesis_ids) > declined_before
@@ -1268,3 +1652,61 @@ class Dispatcher:
             if verdict.keep and verdict.sla_met and self._verdict_matches_target_workflow(verdict):
                 break
         return verdicts
+
+
+def _finalize_mutation_pair(  # noqa: PLR0913
+    ref: str,
+    check_label: str,
+    baseline_run: WorkflowRunResult,
+    candidate_run: WorkflowRunResult,
+    *,
+    sha: str | None = None,
+    expected_checks: tuple[str, ...] = (),
+    check_aliases: tuple[str, ...] = (),
+    include_meta: bool = False,
+) -> _BugReplayResult:
+    urls = tuple(u for u in (baseline_run.html_url, candidate_run.html_url) if u)
+    pair = ReplayRunPair(
+        sha=sha if sha is not None else ref,
+        check=check_label,
+        baseline_conclusion=baseline_run.conclusion or "",
+        candidate_conclusion=candidate_run.conclusion or "",
+        baseline_run_id=str(baseline_run.run_id),
+        candidate_run_id=str(candidate_run.run_id),
+        baseline_run_url=baseline_run.html_url,
+        candidate_run_url=candidate_run.html_url,
+        expected_checks=expected_checks,
+        check_aliases=check_aliases,
+    )
+    meta = (
+        _ReplayPairMeta(
+            kind="mutation",
+            ref=ref,
+            baseline_run_url=baseline_run.html_url,
+            candidate_run_url=candidate_run.html_url if baseline_run.conclusion == "failure" else "",
+        )
+        if include_meta
+        else None
+    )
+    if baseline_run.conclusion != "failure":
+        dud_outcome: dict[str, Any] = {
+            "kind": "mutation",
+            "ref": ref,
+            "caught": False,
+            "baseline_failed": False,
+            "run_url": baseline_run.html_url,
+        }
+        base_urls = (baseline_run.html_url,) if baseline_run.html_url else ()
+        return _BugReplayResult(
+            counted=False, caught=False, outcome=dud_outcome, run_urls=base_urls, pair=pair, pair_meta=meta
+        )
+
+    caught = candidate_run.conclusion == "failure"
+    outcome: dict[str, Any] = {
+        "kind": "mutation",
+        "ref": ref,
+        "caught": caught,
+        "baseline_failed": True,
+        "run_url": candidate_run.html_url,
+    }
+    return _BugReplayResult(counted=True, caught=caught, outcome=outcome, run_urls=urls, pair=pair, pair_meta=meta)

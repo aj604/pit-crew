@@ -38,7 +38,8 @@ MAX_MATRIX_COMBINATIONS = 256
 
 _SETUP_COMMAND = re.compile(
     r"^(?:sudo\s+)?(?:"
-    r"(?:npm|pnpm|yarn|bun)\s+(?:install|ci|i)\b"
+    r"(?:npx\s+|pnpm\s+(?:exec\s+)?|yarn\s+|bunx\s+)?playwright\s+install\b"
+    r"|(?:npm|pnpm|yarn|bun)\s+(?:install|ci|i)\b"
     r"|(?:python3?\s+-m\s+)?pip3?\s+install\b"
     r"|uv\s+(?:sync|venv|pip\s+install|python\s+install)\b"
     r"|poetry\s+install\b"
@@ -48,7 +49,9 @@ _SETUP_COMMAND = re.compile(
     r"|go\s+mod\s+download\b"
     r")"
 )
-_SETUP_ACTION = re.compile(r"(?:^actions/checkout$|setup|cache|^actions/download-artifact$)", re.IGNORECASE)
+_SETUP_ACTION = re.compile(
+    r"(?:^actions/checkout$|setup|cache|install-action|^actions/download-artifact$)", re.IGNORECASE
+)
 _UPLOAD_ACTION = "actions/upload-artifact"
 _RETRY_ACTION = re.compile(r"retry", re.IGNORECASE)
 _BROWSER_TESTS = re.compile(r"\b(?:playwright|cypress|wdio|webdriverio|puppeteer)\b", re.IGNORECASE)
@@ -65,8 +68,23 @@ _RUNS_ON_FAILURE = re.compile(r"\b(?:failure|always)\(\)|!\s*cancelled\(\)")
 _DISABLED_IF = re.compile(r"^\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*$", re.IGNORECASE)
 _SHELL_SEPARATOR = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "do", "done", "esac", "{", "}"})
+# Commands that print, set variables or move around: they decide nothing about pass or fail, so
+# dropping one is not dropping a check. `exit 1`, `test`, `[ ... ]` and real tools stay checks.
+_NOT_A_CHECK = re.compile(
+    r"^(?:"
+    r"(?:echo|printf)\b(?!.*\bGITHUB_OUTPUT\b)"  # console/summary/env output; GITHUB_OUTPUT may gate later checks
+    r"|(?:ls|mv|cp|rm|touch|chmod|ln)\s"  # moving files around
+    r"|git\s+(?:clone|fetch|checkout|switch|config|apply|submodule|remote)\b"  # getting code; `git diff` stays a check
+    r"|export\s+\w+="
+    r"|\$env:\w+\s*="  # PowerShell assignment
+    r"|\w+=(?:\S*|\"[^\"]*\"|'[^']*')$"  # a bare shell assignment, X=... with no command after it
+    r"|\w+=[\"']?\$\(.*\)[\"']?$"  # X="$(...)": capturing output to a variable
+    r"|(?:done|fi|esac)\b"  # closing a block, maybe redirecting its output
+    r"|cd\s|pushd\s|popd\b|mkdir\s|set\s+(?:[-+][xv]+|[-+]o\s+(?:xtrace|verbose))$"
+    r"|(?:if|elif|while|until|for|case)\b.*(?:then|do|in)$"  # control-flow headers; their bodies are lines too
+    r")"
+)
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
-_SHELL_OPERATOR = re.compile(r"\s*(&&|\|\||;)\s*")
 _MASKING_TAIL = re.compile(r"\s*\|\|\s*(?:true|:|exit\s+0)\s*$")
 _EXTENSION_OPERATOR = re.compile(r"[;&|]")
 # Arguments a check may gain: they split, parallelize or report on the same tests; none runs fewer.
@@ -263,18 +281,40 @@ def _command_lines(workflow: Workflow) -> list[str]:
     return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in run_lines(step["run"])]
 
 
+def split_shell(line: str) -> tuple[list[str], list[str]]:
+    """Split a command line on `&&`, `||` and `;` outside quotes: (commands, operators between them)."""
+    commands, operators, current, quote, i = [], [], "", "", 0
+    while i < len(line):
+        char = line[i]
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif line.startswith(("&&", "||"), i) or char == ";":
+            operator = ";" if char == ";" else line[i : i + 2]
+            commands.append(current.strip())
+            operators.append(operator)
+            current, i = "", i + len(operator)
+            continue
+        current += char
+        i += 1
+    return [*commands, current.strip()], operators
+
+
 def check_line(line: str) -> str:
     """A run line as a check: install commands become `<install>`, shell operators are kept.
 
     Keeping `&&`, `||` and `;` means rewiring how two checks chain is a change. Returns "" for a
-    line that only installs. A trailing `|| true` is dropped: removing one makes CI stricter, and
-    adding one is caught by WEAKENING_FLAGS.
+    line that only installs, prints or sets variables (`echo ... >> $GITHUB_ENV`, `export X=1`,
+    `cd dir`); those decide nothing about pass or fail. A trailing `|| true` is dropped: removing one
+    makes CI stricter, and adding one is caught by WEAKENING_FLAGS.
     """
-    parts = _SHELL_OPERATOR.split(_MASKING_TAIL.sub("", line))
-    commands, operators = parts[0::2], parts[1::2]
-    if all(c in _NO_OP_SEGMENTS or _SETUP_COMMAND.match(c) for c in commands):
+    commands, operators = split_shell(_MASKING_TAIL.sub("", line))
+    if all(c in _NO_OP_SEGMENTS or _SETUP_COMMAND.match(c) or _NOT_A_CHECK.match(c) for c in commands):
         return ""
-    normalized = ["<install>" if _SETUP_COMMAND.match(c) else c for c in commands]
+    normalized = [
+        "<install>" if _SETUP_COMMAND.match(c) else "<setup>" if _NOT_A_CHECK.match(c) else c for c in commands
+    ]
     return normalized[0] + "".join(f" {op} {cmd}" for op, cmd in zip(operators, normalized[1:], strict=True))
 
 

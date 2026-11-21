@@ -44,23 +44,34 @@ See [docs/architecture.md](docs/architecture.md) for system design and [docs/lan
 
 ## Optimizer Lane (`src/pit_crew/lanes/optimizer/`)
 
-- [ ] Create playbook sub-skills for the initial fix catalog:
+- [x] Create playbook sub-skills for the initial fix catalog (`contracts.PLAYBOOK_SKILLS`):
   - [x] `dep-cache`
   - [x] `shard-by-timing`
   - [x] `affected-tests`
   - [x] `parallelize-dag`
-  - [ ] `fail-fast-order`
-  - [ ] `flake-quarantine`
   - [x] `dedupe-jobs`
-- [x] Add a read-only tool to inspect prior `Candidate` and `Verdict` records for the target repo so failed approaches are not repeated.
-- [x] Add static validation helper/tool for workflow changes (YAML syntax, required job/step structure, no deleted checks).
-- [x] Define branch naming convention on the fork (e.g., `pc/<hypothesis_id>-<skill>`) and clean bail-out behavior when a hypothesis cannot be safely implemented.
-- [x] Refine `SKILL.md` to enforce strictly one change per candidate.
+  - [x] `artifact-capture` companion: failure recordings for the Proof lane, off in timing runs (#89)
+- [x] ~~`fail-fast-order`~~ Left out of v1 on purpose. It shortens time-to-red, not green-run time, and the
+  rater measures green-run medians, so every candidate would be rejected as "within noise". Revisit
+  if the rater gains a time-to-first-failure metric.
+- [x] ~~`flake-quarantine`~~ Left out of v1 on purpose. Quarantining a flaky test hides failures, which the
+  guard rejects by design ("a check that needs a retry has a bug"), and the Optimizer may not edit
+  test code to fix the flake. Analysis has no flake detector feeding it either.
+- [x] Read-only tool for prior `Candidate`/`Verdict` records (`list_prior_attempts`).
+- [x] Static "never check less" guard for workflows (`validate.py`) and runner configs (`configs.py`),
+  enforced by `check_workflow_change` and `report_candidate`.
+- [x] Branch naming `pc/<hypothesis_id>-<skill>` and bail-out behavior in `SKILL.md`.
+- [x] `SKILL.md` enforces one change per candidate.
+- [x] Eval against baselines (`uv run python -m pit_crew.evals.optimizer_guard`): 100% of weakening edits
+  caught and 0% of safe edits blocked on 18 held-out repos; every live single-call Gemini rewrite
+  tried was blocked (#116).
+- [x] Dispatcher re-checks each candidate against the real base files before publishing, so the
+  guard never relies on the agent's `original_files`.
 
 **Deliverables:**
 - Playbook skill files + updated `src/pit_crew/lanes/optimizer/SKILL.md`.
-- Read-only history lookup and static workflow validation tools in `src/pit_crew/lanes/optimizer/tools.py`.
-- Unit tests in `tests/test_optimizer.py` covering valid candidate reporting, unknown-hypothesis rejection, prior-attempt lookup, and invalid-workflow rejection.
+- Read-only history lookup and static workflow and config validation tools in `src/pit_crew/lanes/optimizer/tools.py`.
+- Unit tests in `tests/test_optimizer*.py` and `tests/test_eval_optimizer_guard.py`.
 
 ---
 

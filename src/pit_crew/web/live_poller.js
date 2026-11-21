@@ -3,12 +3,39 @@
 
 export const LIVE_POLL_ACTIVE_MS = 3000;
 export const LIVE_POLL_IDLE_MS = 15000;
+export const API_TOKEN_STORAGE_KEY = "pit_crew_api_token";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const RECORD_KEYS = Object.freeze(["hypotheses", "candidates", "replay_plans", "evidence", "verdicts"]);
 
 const isRepoSlug = (v) => typeof v === "string" && REPO_PATTERN.test(v.trim());
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** Resolve an optional Bearer token from `?token=` (persisting to `sessionStorage`) or `sessionStorage`. */
+export function resolveApiToken(options = {}, root = null) {
+  const rawSearch = typeof options.search === "string"
+    ? options.search
+    : (root?.defaultView?.location?.search ?? root?.location?.search ?? globalThis.location?.search ?? "");
+  const storage = options.storage !== undefined
+    ? options.storage
+    : (root?.defaultView?.sessionStorage ?? globalThis.sessionStorage ?? null);
+  const params = new URLSearchParams(typeof rawSearch === "string" ? rawSearch : "");
+  const fromUrl = (params.get("token") ?? "").trim();
+  if (fromUrl) {
+    try { storage?.setItem?.(API_TOKEN_STORAGE_KEY, fromUrl); } catch { /* ignore restricted storage */ }
+    return fromUrl;
+  }
+  try {
+    const stored = storage?.getItem?.(API_TOKEN_STORAGE_KEY);
+    return typeof stored === "string" ? stored.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function withBearerHeader(baseHeaders, token) {
+  return token ? { ...baseHeaders, Authorization: `Bearer ${token}` } : baseHeaders;
+}
 
 /** Build URL-encoded Spec 1B API paths for an `owner/name` slug, or `null` if invalid. */
 export function repoApiPaths(repo) {
@@ -38,8 +65,9 @@ async function readJsonSafe(response) {
   try { return await response.json(); } catch { return null; }
 }
 
-async function fetchJsonEndpoint(fetchFn, url, label, signal) {
-  const response = await fetchFn(url, { method: "GET", headers: { Accept: "application/json" }, ...(signal ? { signal } : {}) });
+async function fetchJsonEndpoint(fetchFn, url, label, signal, token = "") {
+  const headers = withBearerHeader({ Accept: "application/json" }, token);
+  const response = await fetchFn(url, { method: "GET", headers, ...(signal ? { signal } : {}) });
   if (!response?.ok) {
     const detail = extractErrorDetail(await readJsonSafe(response));
     const code = typeof response?.status === "number" ? response.status : "error";
@@ -74,6 +102,12 @@ export function createLivePoller(root, header, store, options = {}) {
   const timer = options.timer ?? globalThis;
   const doc = options.doc ?? root;
   const { pill, textNode } = mountStatusPill(root);
+  let cachedApiToken = resolveApiToken(options, root);
+  const currentApiToken = () => {
+    const resolved = resolveApiToken(options, root);
+    if (resolved) cachedApiToken = resolved;
+    return cachedApiToken;
+  };
 
   let destroyed = false, contextGen = 0, pollGen = 0, pollTimer = null, lastPollDelayMs = null;
   let activeController = null, triggerInFlight = false, assumedActive = false;
@@ -114,11 +148,12 @@ export function createLivePoller(root, header, store, options = {}) {
     const ctx = contextGen, pollToken = ++pollGen;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     activeController = controller;
+    const token = currentApiToken();
     try {
       const [status, attempts, records] = await Promise.all([
-        fetchJsonEndpoint(fetchFn, paths.status, "status", controller?.signal),
-        fetchJsonEndpoint(fetchFn, paths.attempts, "attempts", controller?.signal),
-        fetchJsonEndpoint(fetchFn, paths.records, "records", controller?.signal),
+        fetchJsonEndpoint(fetchFn, paths.status, "status", controller?.signal, token),
+        fetchJsonEndpoint(fetchFn, paths.attempts, "attempts", controller?.signal, token),
+        fetchJsonEndpoint(fetchFn, paths.records, "records", controller?.signal, token),
       ]);
       const cur = store.getState();
       if (destroyed || ctx !== contextGen || pollToken !== pollGen || cur.mode !== "live" || cur.repo.trim() !== paths.repo) return false;
@@ -163,7 +198,8 @@ export function createLivePoller(root, header, store, options = {}) {
     syncRunButton(store.getState());
     try {
       const response = await fetchFn("/triggers/cycle", {
-        method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+        method: "POST",
+        headers: withBearerHeader({ "Content-Type": "application/json", Accept: "application/json" }, currentApiToken()),
         body: JSON.stringify({ repo, until_sla: false }),
       });
       if (isStaleTrigger(ctx)) return false;

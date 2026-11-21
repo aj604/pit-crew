@@ -870,3 +870,98 @@ def test_live_mode_browser_verification_desktop_and_mobile() -> None:
     mob = out["mobile"]
     assert (mob["pillHidden"], "Upstream telemetry down" in mob["pillText"], mob["overflow"]) == (False, True, False)
     assert (mob["pillColor"], mob["laps"], mob["sha"]) == ("rgb(255, 208, 0)", 1, "e9b17d3")
+
+
+_LIVE_TOKEN_NODE_SCRIPT = (
+    _NODE_HARNESS
+    + """
+const app = await import(process.argv[1]), lp = await import(process.argv[2]), seed = JSON.parse(process.argv[3]);
+const mem = new Map();
+const storage = {
+  getItem(k) { return mem.get(k) ?? null; },
+  setItem(k, v) { mem.set(k, String(v)); },
+};
+
+// 1) Initial load with ?token= saves to sessionStorage and sends Bearer header on GET and POST
+const d1 = fakeDoc(), t1 = makeTimer(), seen1 = [];
+const fetch1 = async (url, init = {}) => {
+  seen1.push({ method: init.method ?? "GET", url, auth: init.headers?.Authorization ?? null });
+  if (init.method === "POST") return jr(202, { status: "started", repo: "aj604/pit-crew" });
+  if (url.endsWith("/status")) return jr(200, { ...seed.status, active: false });
+  return jr(200, url.endsWith("/attempts") ? seed.attempts : seed.records);
+};
+const pw1 = app.bootPitWall(d1.doc, "?repo=aj604/pit-crew&token=tok-alpha", {
+  live: { fetch: fetch1, timer: t1, doc: d1.doc, search: "?repo=aj604/pit-crew&token=tok-alpha", storage },
+});
+await flush();
+d1.ids["run-pit-stop"].click();
+await flush();
+pw1.livePoller.destroy();
+
+// 2) Subsequent load without ?token= reads token from sessionStorage
+const d2 = fakeDoc(), t2 = makeTimer(), seen2 = [];
+const fetch2 = async (url, init = {}) => {
+  seen2.push({ method: init.method ?? "GET", url, auth: init.headers?.Authorization ?? null });
+  if (url.endsWith("/status")) return jr(200, { ...seed.status, active: false });
+  return jr(200, url.endsWith("/attempts") ? seed.attempts : seed.records);
+};
+const pw2 = app.bootPitWall(d2.doc, "?repo=aj604/pit-crew", {
+  live: { fetch: fetch2, timer: t2, doc: d2.doc, search: "?repo=aj604/pit-crew", storage },
+});
+await flush();
+pw2.livePoller.destroy();
+
+// 3) Broken storage throws safely and omits Authorization when no token is present
+const badStorage = {
+  getItem() { throw new Error("SecurityError"); },
+  setItem() { throw new Error("QuotaExceededError"); },
+};
+const resolvedEmpty = lp.resolveApiToken({ search: "", storage: badStorage });
+const resolvedUrlOnBadStorage = lp.resolveApiToken({ search: "?token=ephemeral-tok", storage: badStorage });
+
+console.log(JSON.stringify({
+  savedKey: mem.get(lp.API_TOKEN_STORAGE_KEY),
+  seen1,
+  seen2,
+  resolvedEmpty,
+  resolvedUrlOnBadStorage,
+}));
+"""
+)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_live_poller_forwards_api_token_bearer_header() -> None:
+    client = TestClient(create_app(_seed_ledger("aj604/pit-crew")))
+    seed = {k: client.get(f"/api/repos/aj604/pit-crew/{k}").json() for k in ("status", "attempts", "records")}
+    out = _node(_LIVE_TOKEN_NODE_SCRIPT, APP_JS.as_uri(), LIVE_JS.as_uri(), json.dumps(seed))
+
+    assert out["savedKey"] == "tok-alpha"
+    assert all(entry["auth"] == "Bearer tok-alpha" for entry in out["seen1"])
+    assert any(entry["method"] == "POST" and entry["url"] == "/triggers/cycle" for entry in out["seen1"])
+    assert len(out["seen2"]) == 3
+    assert all(entry["auth"] == "Bearer tok-alpha" for entry in out["seen2"])
+    assert out["resolvedEmpty"] == ""
+    assert out["resolvedUrlOnBadStorage"] == "ephemeral-tok"
+
+
+def test_server_resolves_brand_dir_from_env_when_repo_dir_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pit_crew.server as server_mod  # noqa: PLC0415
+
+    custom_brand = tmp_path / "packaged_brand"
+    custom_brand.mkdir()
+    (custom_brand / "tokens.css").write_text(":root { --pc-test: 1; }\n")
+    fake_server_file = tmp_path / "a" / "b" / "c" / "server.py"
+    fake_server_file.parent.mkdir(parents=True)
+    fake_server_file.write_text("# stub\n")
+
+    monkeypatch.setattr(server_mod, "__file__", str(fake_server_file))
+    monkeypatch.setenv("PIT_CREW_BRAND_DIR", str(custom_brand))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(InMemoryLedger())
+    resp = TestClient(app).get("/brand/tokens.css")
+    assert resp.status_code == 200
+    assert "--pc-test" in resp.text
