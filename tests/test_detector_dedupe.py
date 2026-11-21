@@ -1,5 +1,6 @@
 import gzip
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.detectors.dedupe import detect_dedupe_jobs
 from pit_crew.lanes.analysis.history import parse_runs
-from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
+from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, Workflow, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PATH = ".github/workflows/ci.yml"
@@ -265,3 +266,31 @@ def test_dedupe_ignores_jobs_whose_step_conditions_differ() -> None:
         {"a": 100, "b": 200},
     )
     assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def _laughs(levels: int) -> str:
+    lines = ["    strategy:", "      matrix:", "        l0: &a0 [x, x, x, x, x, x, x, x, x]"]
+    lines += [f"        l{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 9)}]" for i in range(1, levels)]
+    return "\n".join(lines) + "\n"
+
+
+def test_matrix_billion_laughs_is_cheap_and_bounded() -> None:
+    start = time.perf_counter()
+    wf = parse_workflow(_pair(_laughs(9), ""))
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5
+    definition = wf.jobs["a"].matrix_definition
+    assert definition == MATRIX_TOO_LARGE or len(definition) < 64 * 1024
+
+
+def test_dedupe_skips_jobs_with_oversized_matrices() -> None:
+    big = "    strategy:\n      matrix:\n        v: [" + ", ".join(str(i) for i in range(20_000)) + "]\n"
+    p, wf = profiled(_pair(big, big), {"a": 100, "b": 200})
+    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_matrix_definition_ignores_key_order() -> None:
+    one = parse_workflow(_pair("    strategy:\n      matrix:\n        a: [1]\n        b: [2]\n", ""))
+    two = parse_workflow(_pair("    strategy:\n      matrix:\n        b: [2]\n        a: [1]\n", ""))
+    assert one.jobs["a"].matrix_definition == two.jobs["a"].matrix_definition != ""

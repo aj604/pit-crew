@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from pit_crew.lanes.analysis.critical_path import CIProfile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile
-from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
+from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, JobSpec, Workflow
 
 StepSig = tuple[str, str, tuple[tuple[str, str], ...], str]  # uses, run, with, if
 Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...], str]
@@ -28,7 +28,7 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
     savings: dict[str, float] = {}
     for job_id, job in workflow.jobs.items():
         measured = job_profile(profile, job_id)
-        if job.steps and measured is not None:
+        if job.steps and measured is not None and job.matrix_definition != MATRIX_TOO_LARGE:  # unknown coverage
             groups[_signature(job)].append(job_id)
             savings[job_id] = measured.max_saving_seconds
 

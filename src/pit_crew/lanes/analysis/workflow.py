@@ -5,7 +5,6 @@ to job ids ("test"). Analysis needs both sides joined to build the dependency gr
 """
 
 import itertools
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -204,15 +203,49 @@ def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], .
     return tuple((k, tuple(dict.fromkeys(v))) for k, v in values.items())
 
 
+MATRIX_TOO_LARGE = "<matrix too large>"  # sentinel: coverage unknown, so dedupe never treats such a job as a copy
+_MAX_MATRIX_NODES = 10_000
+_MAX_MATRIX_BYTES = 64 * 1024
+
+
+def _within_node_budget(root: object) -> bool:
+    """Count distinct container and scalar nodes, each shared node once (aliases are shared references)."""
+    seen: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if len(seen) > _MAX_MATRIX_NODES:
+            return False
+        if isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return True
+
+
 def _matrix_definition(body: dict[str, Any]) -> str:
-    """The full `strategy.matrix` as canonical JSON, so exclusions and inclusions tell matrices apart."""
+    """The full `strategy.matrix` as a canonical string, so exclusions and inclusions tell matrices apart.
+
+    Workflow YAML is hostile input: `safe_dump` emits anchors for shared nodes instead of expanding them,
+    and an oversized or unserializable matrix becomes a sentinel rather than being walked further.
+    """
     strategy = body.get("strategy")
     matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
     if isinstance(matrix, str):
         return matrix  # an expression such as fromJSON(...): compared as written
-    if isinstance(matrix, dict):
-        return json.dumps(matrix, sort_keys=True, default=str)
-    return ""
+    if not isinstance(matrix, dict):
+        return ""
+    if not _within_node_budget(matrix):
+        return MATRIX_TOO_LARGE
+    try:
+        text = yaml.safe_dump(matrix, sort_keys=True, default_flow_style=True, width=2**31)
+    except (yaml.YAMLError, TypeError, ValueError, RecursionError):
+        return MATRIX_TOO_LARGE
+    return text if len(text) <= _MAX_MATRIX_BYTES else MATRIX_TOO_LARGE
 
 
 def _is_literal(value: object) -> bool:
