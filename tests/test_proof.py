@@ -264,6 +264,11 @@ def test_a_here_document_ends_at_its_whole_delimiter(opener: str) -> None:
     assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
 
 
+def test_a_quoted_here_document_delimiter_is_not_mutated() -> None:
+    source = "cat <<'A && B'\n(( x < y ))\nA && B\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
 @pytest.mark.parametrize("source", ['cat <<E"O"F\n(( n > 2 ))\nEOF\n', "cat <<EOF\n(( n > 2 ))\n"])
 def test_a_here_document_it_cannot_close_masks_nothing(source: str) -> None:
     # Better a mutant in text than none for the rest of the file.

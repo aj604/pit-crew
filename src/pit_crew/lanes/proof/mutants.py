@@ -155,6 +155,7 @@ def _mask(source: str, *, hash_comments: bool, shell: bool = False) -> str:
         elif shell and (heredoc := _HEREDOC.match(source, i)) and not _in_arithmetic(out, i):
             delimiter = next(word for word in heredoc.group(2, 3, 4) if word is not None)
             heredocs.append((delimiter, heredoc.group(1) == "-"))
+            _blank(out, i, heredoc.end())  # a flip in a quoted delimiter would stop it matching its closing line
             i = heredoc.end()
         elif (end := _literal_end(source, i, hash_comments=hash_comments, shell=shell)) is not None:
             _blank(out, i, end)
