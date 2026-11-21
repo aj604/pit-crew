@@ -13,6 +13,7 @@ from pit_crew.github import (
     DispatchPollConfig,
     GitHubClient,
     HttpxGitHubClient,
+    RepoMetadata,
     WorkflowRunResult,
 )
 
@@ -1025,3 +1026,116 @@ def test_httpx_get_file_content_decodes_base64_plain_and_handles_missing_and_err
                 client.get_file_content("org/repo", bad_path, "abc123")
 
     assert seen[0] == (b"/repos/org/repo/contents/.github/workflows/ci.yml?ref=abc123", {"ref": "abc123"})
+
+
+def test_httpx_get_repo_metadata_and_list_workflow_files() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/org/writable":
+            return httpx.Response(
+                200,
+                json={"full_name": "org/writable", "default_branch": "master", "permissions": {"push": True}},
+            )
+        if request.url.path == "/repos/judge/readonly":
+            return httpx.Response(
+                200,
+                json={"full_name": "judge/readonly", "default_branch": "main", "permissions": {"push": False}},
+            )
+        if request.url.path == "/repos/me/forked":
+            return httpx.Response(
+                200,
+                json={
+                    "full_name": "me/forked",
+                    "default_branch": "main",
+                    "fork": True,
+                    "parent": {"full_name": "judge/upstream"},
+                },
+            )
+        if request.url.path == "/repos/judge/readonly/actions/workflows":
+            return httpx.Response(
+                200,
+                json={
+                    "workflows": [
+                        {"state": "disabled_manually", "path": ".github/workflows/old.yml"},
+                        {"state": "active", "path": ".github/workflows/tests.yml"},
+                        {"state": "active", "path": ".github/workflows/release.yaml"},
+                        {"state": "active", "path": "dynamic/codeql"},
+                        {"state": "active", "path": ".github/workflows/tests.yml"},
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        assert client.get_repo_metadata("org/writable") == RepoMetadata(
+            full_name="org/writable", default_branch="master", can_push=True, parent_full_name=None
+        )
+        assert client.get_repo_metadata("judge/readonly") == RepoMetadata(
+            full_name="judge/readonly", default_branch="main", can_push=False, parent_full_name=None
+        )
+        assert client.get_repo_metadata("me/forked") == RepoMetadata(
+            full_name="me/forked", default_branch="main", can_push=True, parent_full_name="judge/upstream"
+        )
+        assert client.list_workflow_files("judge/readonly") == ["tests.yml", "release.yaml"]
+
+
+def test_httpx_ensure_writable_fork_polls_until_ready_and_enables_actions() -> None:
+    ref_calls = 0
+    actions_enabled: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ref_calls
+        if request.method == "POST" and request.url.path == "/repos/judge/app/forks":
+            return httpx.Response(202, json={"full_name": "me/app", "default_branch": "main"})
+        if request.method == "GET" and request.url.path == "/repos/me/app/git/ref/heads/main":
+            ref_calls += 1
+            if ref_calls == 1:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"object": {"sha": "abc123"}})
+        if request.method == "PUT" and request.url.path == "/repos/me/app/actions/permissions":
+            actions_enabled.append(json.loads(request.content))
+            return httpx.Response(403, json={"message": "Forbidden"})
+        return httpx.Response(404)
+
+    poll = DispatchPollConfig(attempts=3, interval_seconds=0.0, sleep=lambda _s: None)
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler), dispatch_poll=poll) as client:
+        assert client.ensure_writable_fork("judge/app") == "me/app"
+    assert ref_calls == 2
+    assert actions_enabled == [{"enabled": True}]
+
+
+def test_httpx_dispatch_workflow_falls_back_to_empty_commit_push_on_422() -> None:
+    now = datetime(2026, 11, 21, 21, 0, 0, tzinfo=UTC)
+    events: list[str] = []
+    static_responses: dict[tuple[str, str], httpx.Response] = {
+        ("GET", "/repos/org/repo/git/ref/heads/pc/cand"): httpx.Response(200, json={"object": {"sha": "sha-1"}}),
+        ("GET", "/repos/org/repo/git/commits/sha-1"): httpx.Response(200, json={"tree": {"sha": "tree-1"}}),
+        ("PATCH", "/repos/org/repo/git/refs/heads/pc/cand"): httpx.Response(200, json={"object": {"sha": "sha-2"}}),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key = (request.method, request.url.path)
+        if key in static_responses:
+            return static_responses[key]
+        if key == ("POST", "/repos/org/repo/actions/workflows/tests.yml/dispatches"):
+            events.append("dispatch:422")
+            return httpx.Response(422, json={"message": "Workflow does not have 'workflow_dispatch' trigger"})
+        if key == ("POST", "/repos/org/repo/git/commits"):
+            body = json.loads(request.content)
+            assert (body["tree"], body["parents"]) == ("tree-1", ["sha-1"])
+            events.append("commit:empty")
+            return httpx.Response(201, json={"sha": "sha-2"})
+        if key == ("GET", "/repos/org/repo/actions/workflows/tests.yml/runs"):
+            assert (request.url.params["event"], request.url.params["branch"]) == ("push", "pc/cand")
+            events.append("poll:push")
+            return httpx.Response(
+                200,
+                json={"workflow_runs": [{"id": 777, "created_at": now.isoformat().replace("+00:00", "Z")}]},
+            )
+        return httpx.Response(404)
+
+    poll = DispatchPollConfig(attempts=2, interval_seconds=0.0, sleep=lambda _s: None, clock=lambda: now)
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler), dispatch_poll=poll) as client:
+        run_id = client.dispatch_workflow("org/repo", "tests.yml", "pc/cand")
+
+    assert run_id == 777
+    assert events == ["dispatch:422", "commit:empty", "poll:push"]

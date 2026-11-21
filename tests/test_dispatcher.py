@@ -3664,3 +3664,76 @@ def test_dispatcher_falls_back_to_github_pr_when_proof_bridge_has_no_pr_client()
     assert verdict.keep is True
     assert len(github.pull_requests) == 1
     assert ProofBridgeError is not None
+
+
+def test_dispatcher_auto_detects_branch_workflow_and_forks_readonly_repo() -> None:
+    @dataclass(frozen=True)
+    class _Meta:
+        full_name: str
+        default_branch: str
+        can_push: bool
+        parent_full_name: str | None = None
+
+    class _ArbitraryRepoGitHub(_FakeGitHubClient):
+        def __init__(self, default_shas: dict[str, str], run_scripts: dict[int, list[WorkflowRunResult]]) -> None:
+            super().__init__(default_shas, run_scripts=run_scripts)
+            self.forked: list[str] = []
+
+        def get_repo_metadata(self, repo: str) -> _Meta:
+            return _Meta(full_name=repo, default_branch="master", can_push=False)
+
+        def ensure_writable_fork(self, repo: str) -> str:
+            self.forked.append(repo)
+            return "me/target"
+
+        def list_workflow_files(self, _repo: str) -> list[str]:
+            return ["release.yml", "tests.yml"]
+
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        id="h1",
+        repo="judge/target",
+        description="cache",
+        skill="dep-cache",
+        expected_savings_seconds=50.0,
+        workflow_path=".github/workflows/tests.yml",
+    )
+    cand = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        branch="pc/c1",
+        summary="cache",
+        repo="judge/target",
+        files={".github/workflows/tests.yml": "name: Tests\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"},
+    )
+    plan = ReplayPlan(id="p1", candidate_id="c1", bug_shas=("deadbeef",))
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+
+    github = _ArbitraryRepoGitHub({"me/target": "base-sha"}, run_scripts=run_scripts)
+    seen_tasks: list[tuple[str, str, str | None]] = []
+
+    def _run_lane(lane: str, task: str, ledger: Ledger | None = None, *, repo: str | None = None) -> object:
+        seen_tasks.append((lane, task, repo))
+        assert ledger is not None
+        if lane == "analysis":
+            ledger.add(hyp)
+        elif lane == "optimizer":
+            ledger.add(cand)
+        elif lane == "proof":
+            ledger.add(plan)
+        return type("_Done", (), {"status": "completed"})()
+
+    verdict = Dispatcher(ledger, github, lane_runner=_run_lane).run_cycle("judge/target")
+    assert verdict is not None
+    assert verdict.keep is True
+    assert github.forked == ["judge/target"]
+    assert github.pull_requests[0]["repo"] == "me/target"
+    assert github.pull_requests[0]["base"] == "master"
+    assert all(call[0] == "me/target" and call[1] == "tests.yml" for call in github.dispatches)
+    assert seen_tasks[0][2] == "me/target"
+    assert '"workflow_file": "tests.yml"' in seen_tasks[0][1]
+    assert ledger.latest_kept_candidate("judge/target") is not None
