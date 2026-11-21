@@ -51,6 +51,17 @@ _SETUP_COMMAND = re.compile(
 _SETUP_ACTION = re.compile(r"(?:^actions/checkout$|setup|cache|^actions/download-artifact$)", re.IGNORECASE)
 _UPLOAD_ACTION = "actions/upload-artifact"
 _RETRY_ACTION = re.compile(r"retry", re.IGNORECASE)
+_BROWSER_TESTS = re.compile(r"\b(?:playwright|cypress|wdio|webdriverio|puppeteer)\b", re.IGNORECASE)
+# A package script that by its name runs browser tests: `npm run test:e2e`, `pnpm playwright`...
+_BROWSER_SCRIPT = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:.-]*(?:e2e|playwright|cypress|browser|wdio|puppeteer)[\w:.-]*",
+    re.IGNORECASE,
+)
+_RECORDING_PATH = re.compile(
+    r"test-results|playwright-report|cypress/(?:videos|screenshots)|screenshots|videos|traces?\b|\.(?:webm|mp4|zip)\b",
+    re.IGNORECASE,
+)
+_RUNS_ON_FAILURE = re.compile(r"\b(?:failure|always)\(\)|!\s*cancelled\(\)")
 _DISABLED_IF = re.compile(r"^\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*$", re.IGNORECASE)
 _SHELL_SEPARATOR = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _NO_OP_SEGMENTS = frozenset({"", "true", ":", "exit 0", "then", "else", "fi", "do", "done", "esac", "{", "}"})
@@ -58,6 +69,15 @@ _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _SHELL_OPERATOR = re.compile(r"\s*(&&|\|\||;)\s*")
 _MASKING_TAIL = re.compile(r"\s*\|\|\s*(?:true|:|exit\s+0)\s*$")
 _EXTENSION_OPERATOR = re.compile(r"[;&|]")
+# Arguments a check may gain: they split, parallelize or report on the same tests; none runs fewer.
+_SAFE_VALUED_OPTION = re.compile(
+    r"--?(?:shard|splits|group|partition|n|numprocesses|dist|maxWorkers|max-workers|workers|j|jobs|"
+    r"test-threads|reporter|reporters|junitxml|cov|cov-report|durations|maxfail|color|profile)(?:=\S+)?"
+)
+_SAFE_FLAG = re.compile(
+    r"--?(?:ci|q|quiet|v|verbose|silent|no-cache|frozen|locked|offline|bail|x|exitfirst|no-fail-fast|"
+    r"nocapture|show-output|runInBand|forceExit|detectOpenHandles|logHeapUsage)"
+)
 _ALWAYS = re.compile(r"^\s*(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?\s*$")
 _JQ_GATE = re.compile(r'toJSON\(needs\).*\|\s*jq\s+-e\b.*\ball\(.*\.result\s*==\s*"success"')
 _GATE_ACTION = "re-actors/alls-green"
@@ -153,6 +173,7 @@ def _compare_workflow(path: str, before: str, new: Workflow, report: GuardReport
         report.problems.append(f"{path}: {exc}")
         return
     report.warnings.extend(f"{path}: {note}" for note in _setup_changes(old, new))
+    report.warnings.extend(f"{path}: {note}" for note in _missing_recordings(new))
 
 
 def _load(path: str, text: str, report: GuardReport) -> Workflow | None:
@@ -220,7 +241,8 @@ def _text(value: object) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
-def _lines(run: str) -> list[str]:
+def run_lines(run: str) -> list[str]:
+    """The command lines of a run block: backslash continuations joined, blanks and comments dropped."""
     lines = []
     for raw in run.replace("\\\n", " ").splitlines():
         line = " ".join(raw.split())
@@ -231,14 +253,14 @@ def _lines(run: str) -> list[str]:
 
 def _segments(run: str) -> list[str]:
     """Each command of a run block, with `&&`, `||` and `;` chains split apart."""
-    return [seg for line in _lines(run) for seg in _SHELL_SEPARATOR.split(line) if seg not in _NO_OP_SEGMENTS]
+    return [seg for line in run_lines(run) for seg in _SHELL_SEPARATOR.split(line) if seg not in _NO_OP_SEGMENTS]
 
 
 def _command_lines(workflow: Workflow) -> list[str]:
-    return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in _lines(step["run"])]
+    return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in run_lines(step["run"])]
 
 
-def _check_line(line: str) -> str:
+def check_line(line: str) -> str:
     """A run line as a check: install commands become `<install>`, shell operators are kept.
 
     Keeping `&&`, `||` and `;` means rewiring how two checks chain is a change. Returns "" for a
@@ -256,7 +278,7 @@ def _check_line(line: str) -> str:
 def _step_checks(step: Workflow) -> list[str]:
     run, uses = step.get("run"), step.get("uses")
     if isinstance(run, str):
-        return [check for line in _lines(run) if (check := _check_line(line))]
+        return [check for line in run_lines(run) if (check := check_line(line))]
     if isinstance(uses, str):
         name = uses.split("@", 1)[0]
         if not _SETUP_ACTION.search(name) and name != _UPLOAD_ACTION:
@@ -264,15 +286,29 @@ def _step_checks(step: Workflow) -> list[str]:
     return []
 
 
-def _covered(check: str, candidates: Iterable[str]) -> bool:
-    """True when a candidate runs ``check`` exactly, or with plain arguments added (as sharding does).
+def covered(check: str, candidates: Iterable[str]) -> bool:
+    """True when a candidate runs ``check`` exactly, or with safe arguments added (as sharding does).
 
-    Added text may not chain another command: `npm test || npm run coverage` does not cover `npm test`.
+    Added text may not chain another command (`npm test || npm run coverage`), and every added
+    argument must be one that splits, parallelizes or reports on the same tests: `--shard=1/2`,
+    `-n auto` or `--ci` keep `pytest` covered; a path, `-m slow` or `--project chromium` do not.
     """
-    return any(
-        c == check or (c.startswith(check + " ") and not _EXTENSION_OPERATOR.search(c[len(check) :]))
-        for c in candidates
-    )
+    return any(c == check or (c.startswith(check + " ") and safe_extension(c[len(check) :])) for c in candidates)
+
+
+def safe_extension(extra: str) -> bool:
+    """True when every argument added to a command is a known-safe option or its value."""
+    if _EXTENSION_OPERATOR.search(extra):
+        return False
+    expects_value = False
+    for arg in extra.split():
+        if _SAFE_VALUED_OPTION.fullmatch(arg):
+            expects_value = "=" not in arg
+        elif arg == "--" or _SAFE_FLAG.fullmatch(arg) or (expects_value and not arg.startswith("-")):
+            expects_value = False  # `--` separates a wrapper's options from the test runner's
+        else:
+            return False
+    return True
 
 
 def _actions(workflow: Workflow) -> list[str]:
@@ -374,7 +410,7 @@ def _index(units: Iterable[_Unit]) -> dict[Context, list[str]]:
 
 
 def _runs(unit: _Unit, index: dict[Context, list[str]]) -> bool:
-    return _covered(unit.check, index.get(unit.context, ()))
+    return covered(unit.check, index.get(unit.context, ()))
 
 
 def _describe(context: Context) -> str:
@@ -463,7 +499,7 @@ def _asserts_needs(step: Workflow) -> bool:
     run, uses = step.get("run"), step.get("uses")
     if isinstance(run, str):
         masks = WEAKENING_FLAGS[0][1]
-        return any(_JQ_GATE.search(line) and not masks.search(line) for line in _lines(run))
+        return any(_JQ_GATE.search(line) and not masks.search(line) for line in run_lines(run))
     if isinstance(uses, str) and uses.split("@", 1)[0] == _GATE_ACTION:
         inputs = step.get("with")
         return isinstance(inputs, dict) and "toJSON(needs)" in _text(inputs.get("jobs"))
@@ -564,3 +600,35 @@ _COMPARISONS: tuple[Callable[[Workflow, Workflow], list[str]], ...] = (
     _no_new_weakening,
     _timeouts_kept,
 )
+
+
+def _missing_recordings(workflow: Workflow) -> list[str]:
+    """Jobs that run browser tests without an upload that would carry their failure recordings."""
+    notes = []
+    for job_id, job in _jobs(workflow).items():
+        steps = _job_steps(job)
+        runs = [s["run"] for s in steps if isinstance(s.get("run"), str)]
+        if not any(_BROWSER_TESTS.search(run) or _BROWSER_SCRIPT.search(run) for run in runs):
+            continue
+        uploads = [s for s in steps if isinstance(s.get("uses"), str) and s["uses"].startswith(_UPLOAD_ACTION)]
+        if not uploads:
+            notes.append(
+                f"job `{job_id}` runs browser tests but uploads no failure recordings; "
+                "apply the artifact-capture companion playbook"
+            )
+        elif not any(_uploads_recordings_on_failure(step) for step in uploads):
+            notes.append(
+                f"job `{job_id}` runs browser tests, but no upload both runs on failure and includes "
+                "recording paths; check it, and apply the artifact-capture companion playbook if needed"
+            )
+    return notes
+
+
+def _uploads_recordings_on_failure(step: Workflow) -> bool:
+    """An upload that runs after a failed test (`failure()`, `always()`, `!cancelled()`) and carries recordings.
+
+    By default a step runs only on success, so a plain coverage upload proves nothing.
+    """
+    inputs = step.get("with")
+    path = _text(inputs.get("path")) if isinstance(inputs, dict) else ""
+    return bool(_RUNS_ON_FAILURE.search(_text(step.get("if")))) and bool(_RECORDING_PATH.search(path))
