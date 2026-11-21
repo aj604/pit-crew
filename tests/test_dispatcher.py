@@ -1,6 +1,6 @@
 import json
 from collections.abc import Callable
-from dataclasses import FrozenInstanceError, dataclass, fields
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from typing import Any, override
 
 import pytest
@@ -10,15 +10,24 @@ from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verd
 from pit_crew.dispatcher import DISALLOWED_PATH_REASON, Dispatcher, DispatcherConfig, LaneRunner, next_lane
 from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.ledger import InMemoryLedger, Ledger
+from pit_crew.rater import rate
 
 
 class _FakeGitHubClient:
     """Offline fake implementing ``GitHubClient`` for Dispatcher unit tests."""
 
-    def __init__(self, default_shas: dict[str, str]) -> None:
+    def __init__(
+        self,
+        default_shas: dict[str, str],
+        run_scripts: dict[int, list[WorkflowRunResult]] | None = None,
+    ) -> None:
         self._default_shas = dict(default_shas)
+        self._run_scripts: dict[int, list[WorkflowRunResult]] = {
+            run_id: list(results) for run_id, results in (run_scripts or {}).items()
+        }
         self.default_branch_lookups: list[str] = []
         self.dispatches: list[tuple[str, str, str]] = []
+        self.poll_calls: list[tuple[str, int]] = []
         self.branches: dict[tuple[str, str], str] = {}
         self.commits: list[dict[str, object]] = []
         self.pull_requests: list[dict[str, str]] = []
@@ -52,6 +61,12 @@ class _FakeGitHubClient:
         return len(self.dispatches)
 
     def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
+        self.poll_calls.append((repo, run_id))
+        script = self._run_scripts.get(run_id)
+        if script:
+            if len(script) > 1:
+                return script.pop(0)
+            return script[0]
         return WorkflowRunResult(
             run_id=run_id,
             status="completed",
@@ -66,6 +81,41 @@ class _FakeGitHubClient:
         url = f"https://github.com/{repo}/pull/{len(self.pull_requests) + 1}"
         self.pull_requests.append({"repo": repo, "title": title, "body": body, "head": head, "base": base})
         return url
+
+
+class _FakeClock:
+    """Deterministic monotonic clock and sleep hook for polling/timeout tests."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _make_run(
+    run_id: int,
+    *,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    duration_seconds: float = 30.0,
+    html_url: str | None = None,
+) -> WorkflowRunResult:
+    resolved_url = f"https://github.com/org/repo/actions/runs/{run_id}" if html_url is None else html_url
+    return WorkflowRunResult(
+        run_id=run_id,
+        status=status,
+        conclusion=conclusion,
+        duration_seconds=duration_seconds,
+        html_url=resolved_url,
+        head_sha="sha",
+        head_branch="main",
+    )
 
 
 @dataclass(frozen=True)
@@ -350,7 +400,14 @@ def test_run_cycle_selects_highest_impact_unattempted_hypothesis_and_runs_lane_h
     assert verdict.candidate_id == cand.id
     assert len(ledger.all(Evidence)) == 1
     assert github.default_branch_lookups == []
-    assert github.dispatches == []
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "tests.yml", "compounded-sha-1"),
+            ("org/repo", "tests.yml", "pc/shard-tests"),
+        ]
+        * 5
+    )
 
 
 def test_run_cycle_uses_config_workflow_file_when_hypothesis_workflow_path_is_empty() -> None:
@@ -380,6 +437,14 @@ def test_run_cycle_uses_config_workflow_file_when_hypothesis_workflow_path_is_em
 
     assert verdict is not None
     assert dispatcher.evidence_calls == [(cand, plan, "base-sha-0", "custom.yml")]
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "custom.yml", "base-sha-0"),
+            ("org/repo", "custom.yml", "pc/cache"),
+        ]
+        * 5
+    )
 
 
 @pytest.mark.parametrize(
@@ -511,3 +576,404 @@ def test_default_lane_runner_delegates_to_managed_agent_run_lane(monkeypatch: py
     assert recorded[0][0] == "analysis"
     assert recorded[0][2] is ledger
     assert recorded[0][3] == "org/repo"
+
+
+def test_collect_evidence_interleaves_baseline_and_candidate_pairs_including_cold_run() -> None:
+    ledger = InMemoryLedger()
+    # Run IDs 1..10 correspond to B1, C1, B2, C2, ..., B5, C5 (including cold Run #1).
+    baseline_durations = (180.0, 100.0, 102.0, 98.0, 101.0)
+    candidate_durations = (95.0, 50.0, 52.0, 48.0, 51.0)
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        base_run_id = pair_idx * 2 + 1
+        cand_run_id = pair_idx * 2 + 2
+        run_scripts[base_run_id] = [_make_run(base_run_id, duration_seconds=baseline_durations[pair_idx])]
+        run_scripts[cand_run_id] = [_make_run(cand_run_id, duration_seconds=candidate_durations[pair_idx])]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-1"}, run_scripts=run_scripts)
+    clock = _FakeClock()
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    cand = Candidate(
+        hypothesis_id="hyp-1",
+        branch="pc/cache",
+        summary="add cache",
+        repo="org/repo",
+        head_sha="cand-head-1",
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("bug-1",))
+
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha-1", workflow="ci.yml")
+
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "ci.yml", "base-sha-1"),
+            ("org/repo", "ci.yml", "pc/cache"),
+        ]
+        * 5
+    )
+    assert evidence.candidate_id == cand.id
+    assert evidence.baseline_seconds == baseline_durations
+    assert evidence.candidate_seconds == candidate_durations
+    assert evidence.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 11))
+    assert evidence.bugs_total == 0
+    assert evidence.bugs_caught == 0
+    assert clock.sleeps == []
+
+
+def test_collect_evidence_resolves_workflow_repo_and_head_sha_fallbacks() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="cache",
+        skill="dep-cache",
+        expected_savings_seconds=80.0,
+        workflow_path=".github/workflows/bench.yml",
+    )
+    ledger.add(hyp)
+
+    github = _FakeGitHubClient({"org/repo": "base-sha"})
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=2, workflow_file="fallback.yml"),
+    )
+
+    # Candidate omits repo and branch -> resolves repo & workflow from hypothesis, ref from head_sha.
+    cand_from_hyp = Candidate(hypothesis_id=hyp.id, branch="", summary="cache", head_sha="cand-sha-99")
+    plan = ReplayPlan(candidate_id=cand_from_hyp.id, bug_shas=())
+
+    dispatcher.collect_evidence(cand_from_hyp, plan, "base-sha")
+
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "bench.yml", "base-sha"),
+            ("org/repo", "bench.yml", "cand-sha-99"),
+        ]
+        * 2
+    )
+
+    # Candidate without a ledger hypothesis falls back to config.workflow_file; explicit path normalizes to basename.
+    github.dispatches.clear()
+    orphan = Candidate(hypothesis_id="missing-hyp", branch="pc/orphan", summary="orphan", repo="org/repo")
+    dispatcher.collect_evidence(orphan, ReplayPlan(candidate_id=orphan.id), "base-sha")
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "fallback.yml", "base-sha"),
+            ("org/repo", "fallback.yml", "pc/orphan"),
+        ]
+        * 2
+    )
+
+    github.dispatches.clear()
+    dispatcher.collect_evidence(
+        orphan, ReplayPlan(candidate_id=orphan.id), "base-sha", workflow=".github/workflows/custom.yml"
+    )
+    assert (
+        github.dispatches
+        == [
+            ("org/repo", "custom.yml", "base-sha"),
+            ("org/repo", "custom.yml", "pc/orphan"),
+        ]
+        * 2
+    )
+
+    # Missing repo or missing ref raises ValueError.
+    no_repo = Candidate(hypothesis_id="missing-hyp", branch="pc/x", summary="x")
+    with pytest.raises(ValueError, match="Cannot resolve repository"):
+        dispatcher.collect_evidence(no_repo, ReplayPlan(candidate_id=no_repo.id), "base-sha")
+
+    no_ref = Candidate(hypothesis_id=hyp.id, branch="", summary="x", repo="org/repo", head_sha="")
+    with pytest.raises(ValueError, match="neither branch nor head_sha"):
+        dispatcher.collect_evidence(no_ref, ReplayPlan(candidate_id=no_ref.id), "base-sha")
+
+
+def test_poll_workflow_run_sleeps_across_statuses_until_completed() -> None:
+    ledger = InMemoryLedger()
+    final_run = _make_run(1, status="completed", conclusion="success", duration_seconds=42.5)
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={
+            1: [
+                _make_run(1, status="queued", conclusion=None, duration_seconds=0.0),
+                _make_run(1, status="in_progress", conclusion=None, duration_seconds=10.0),
+                _make_run(1, status="in_progress", conclusion=None, duration_seconds=25.0),
+                final_run,
+            ]
+        },
+    )
+    clock = _FakeClock(start=100.0)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(poll_interval_seconds=7.5, run_timeout_seconds=60.0),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    result = dispatcher.poll_workflow_run("org/repo", 1)
+
+    assert result == final_run
+    assert github.poll_calls == [("org/repo", 1)] * 4
+    assert clock.sleeps == [7.5, 7.5, 7.5]
+
+
+def test_poll_workflow_run_raises_timeout_error_when_run_timeout_exceeded() -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={1: [_make_run(1, status="in_progress", conclusion=None, duration_seconds=0.0)]},
+    )
+    clock = _FakeClock(start=10.0)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(poll_interval_seconds=5.0, run_timeout_seconds=15.0),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    with pytest.raises(TimeoutError, match=r"Workflow run 1 in org/repo did not complete within 15\.0s"):
+        dispatcher.poll_workflow_run("org/repo", 1)
+
+    assert github.poll_calls == [("org/repo", 1)] * 4
+    assert clock.sleeps == [5.0, 5.0, 5.0]
+
+
+@pytest.mark.parametrize("bad_conclusion", ["failure", "cancelled", None])
+def test_collect_evidence_aborts_candidate_on_non_success_and_rater_rejects(bad_conclusion: str | None) -> None:
+    ledger = InMemoryLedger()
+    # Pair 1: B1(100s), C1(40s); Pair 2: B2(100s), C2(non-success); Pairs 3-5: B3, B4, B5 only.
+    run_scripts = {
+        1: [_make_run(1, duration_seconds=100.0)],
+        2: [_make_run(2, duration_seconds=40.0)],
+        3: [_make_run(3, duration_seconds=101.0)],
+        4: [_make_run(4, conclusion=bad_conclusion, duration_seconds=12.0)],
+        5: [_make_run(5, duration_seconds=99.0)],
+        6: [_make_run(6, duration_seconds=102.0)],
+        7: [_make_run(7, duration_seconds=98.0)],
+    }
+    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5),
+    )
+    cand = Candidate(hypothesis_id="h1", branch="pc/broken", summary="breaks CI", repo="org/repo")
+    plan = ReplayPlan(candidate_id=cand.id)
+
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.dispatches == [
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "pc/broken"),
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "pc/broken"),
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "base-sha"),
+    ]
+    assert evidence.baseline_seconds == (100.0, 101.0, 99.0, 102.0, 98.0)
+    assert evidence.candidate_seconds == (40.0,)
+    assert evidence.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 8))
+
+    # Even if bug replays pass, insufficient candidate timings force Rater to reject.
+    verdict = rate(replace(evidence, bugs_total=1, bugs_caught=1))
+    assert verdict.keep is False
+    assert verdict.reason == "needs 5 runs per side"
+
+
+def test_collect_evidence_aborts_baseline_on_non_success_and_stops_early_when_both_abort() -> None:
+    ledger = InMemoryLedger()
+    # Baseline fails on pair 2, candidate completes all 5 pairs.
+    run_scripts = {
+        1: [_make_run(1, duration_seconds=100.0)],
+        2: [_make_run(2, duration_seconds=50.0)],
+        3: [_make_run(3, conclusion="failure", duration_seconds=15.0)],
+        4: [_make_run(4, duration_seconds=49.0)],
+        5: [_make_run(5, duration_seconds=51.0)],
+        6: [_make_run(6, duration_seconds=48.0)],
+        7: [_make_run(7, duration_seconds=52.0)],
+    }
+    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5),
+    )
+    cand = Candidate(hypothesis_id="h1", branch="pc/fast", summary="faster", repo="org/repo")
+
+    evidence = dispatcher.collect_evidence(cand, ReplayPlan(candidate_id=cand.id), "base-sha", workflow="ci.yml")
+
+    assert github.dispatches == [
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "pc/fast"),
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "pc/fast"),
+        ("org/repo", "ci.yml", "pc/fast"),
+        ("org/repo", "ci.yml", "pc/fast"),
+        ("org/repo", "ci.yml", "pc/fast"),
+    ]
+    assert evidence.baseline_seconds == (100.0,)
+    assert evidence.candidate_seconds == (50.0, 49.0, 51.0, 48.0, 52.0)
+    assert len(evidence.run_urls) == 7
+    verdict = rate(replace(evidence, bugs_total=1, bugs_caught=1))
+    assert verdict.keep is False
+    assert verdict.reason == "needs 5 runs per side"
+
+    # When both sides abort, remaining pairs are not dispatched; empty html_url is omitted.
+    both_abort_scripts = {
+        1: [_make_run(1, conclusion="cancelled", duration_seconds=5.0, html_url="")],
+        2: [_make_run(2, duration_seconds=40.0)],
+        3: [_make_run(3, conclusion="failure", duration_seconds=8.0)],
+    }
+    github_both = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=both_abort_scripts)
+    dispatcher_both = Dispatcher(
+        ledger,
+        github_both,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5),
+    )
+
+    both_ev = dispatcher_both.collect_evidence(cand, ReplayPlan(candidate_id=cand.id), "base-sha", workflow="ci.yml")
+
+    assert github_both.dispatches == [
+        ("org/repo", "ci.yml", "base-sha"),
+        ("org/repo", "ci.yml", "pc/fast"),
+        ("org/repo", "ci.yml", "pc/fast"),
+    ]
+    assert both_ev.baseline_seconds == ()
+    assert both_ev.candidate_seconds == (40.0,)
+    assert both_ev.run_urls == (
+        "https://github.com/org/repo/actions/runs/2",
+        "https://github.com/org/repo/actions/runs/3",
+    )
+
+
+def test_run_cycle_persists_interleaved_evidence_and_verdict_to_ledger() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="cache uv",
+        skill="dep-cache",
+        expected_savings_seconds=50.0,
+        workflow_path=".github/workflows/ci-fast.yml",
+    )
+    cand = Candidate(
+        hypothesis_id=hyp.id,
+        branch="pc/uv-cache",
+        summary="cache uv venv",
+        repo="org/repo",
+        base_sha="base-sha-0",
+        head_sha="cand-sha-0",
+        changed_files=(".github/workflows/ci-fast.yml",),
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-1",))
+
+    baseline_durations = (100.0, 98.0, 102.0, 99.0, 101.0)
+    candidate_durations = (50.0, 49.0, 51.0, 48.0, 52.0)
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        base_id = pair_idx * 2 + 1
+        cand_id = pair_idx * 2 + 2
+        if base_id == 1:
+            run_scripts[base_id] = [
+                _make_run(base_id, status="queued", conclusion=None, duration_seconds=0.0),
+                _make_run(base_id, status="in_progress", conclusion=None, duration_seconds=10.0),
+                _make_run(base_id, duration_seconds=baseline_durations[pair_idx]),
+            ]
+        else:
+            run_scripts[base_id] = [_make_run(base_id, duration_seconds=baseline_durations[pair_idx])]
+        run_scripts[cand_id] = [_make_run(cand_id, duration_seconds=candidate_durations[pair_idx])]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    clock = _FakeClock()
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=runner,
+        config=DispatcherConfig(timing_pairs=5, poll_interval_seconds=2.0),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert ledger.get(Verdict, verdict.id) == verdict
+    assert ledger.all(Verdict) == [verdict]
+    assert verdict.candidate_id == cand.id
+    assert verdict.keep is False
+    assert verdict.median_seconds == 50.0
+    assert verdict.p95_seconds == pytest.approx(51.8)
+    assert verdict.sla_met is True
+    assert verdict.reason == "no bugs replayed, so safety is unproven"
+
+    stored_evidence = ledger.all(Evidence)
+    assert len(stored_evidence) == 1
+    ev = stored_evidence[0]
+    assert ledger.get(Evidence, ev.id) == ev
+    assert ev.candidate_id == cand.id
+    assert ev.baseline_seconds == baseline_durations
+    assert ev.candidate_seconds == candidate_durations
+    assert ev.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 11))
+    assert clock.sleeps == [2.0, 2.0]
+
+
+def test_run_cycle_rejects_and_persists_evidence_when_candidate_breaks_ci() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="shard", skill="shard-by-timing", expected_savings_seconds=60.0)
+    cand = Candidate(
+        hypothesis_id=hyp.id,
+        branch="pc/bad-ci",
+        summary="broken yaml",
+        repo="org/repo",
+        changed_files=(".github/workflows/ci.yml",),
+    )
+    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("red-1",))
+
+    run_scripts = {
+        1: [_make_run(1, duration_seconds=90.0)],
+        2: [_make_run(2, conclusion="failure", duration_seconds=5.0)],
+    }
+    github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(ledger, github, lane_runner=runner, config=DispatcherConfig(timing_pairs=5))
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert ledger.get(Verdict, verdict.id) == verdict
+    stored_evidence = ledger.all(Evidence)
+    assert len(stored_evidence) == 1
+    assert stored_evidence[0].candidate_seconds == ()
+    assert len(stored_evidence[0].baseline_seconds) == 5
+    assert len(stored_evidence[0].run_urls) == 6
