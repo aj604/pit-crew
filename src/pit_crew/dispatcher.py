@@ -457,3 +457,22 @@ class Dispatcher:
             if plan.id not in existing_ids and plan.candidate_id == candidate.id
         ]
         return new_plans[-1] if new_plans else None
+
+    def run_until_sla(self, repo: str) -> list[Verdict]:
+        """Run compounding optimization cycles for ``repo`` until the CI SLA is met or cycles are exhausted.
+
+        Repeatedly invokes ``run_cycle(repo)`` up to ``config.max_compounding_cycles`` iterations,
+        collecting each non-``None`` ``Verdict``. Each subsequent cycle automatically advances
+        ``base_sha`` to ``ledger.latest_kept_candidate(repo).head_sha`` after a kept candidate,
+        while retaining the previous ``base_sha`` after a rejected candidate. Stops early when
+        ``run_cycle(repo)`` returns ``None`` or a kept verdict satisfies the CI SLA.
+        """
+        verdicts: list[Verdict] = []
+        for _ in range(self.config.max_compounding_cycles):
+            verdict = self.run_cycle(repo)
+            if verdict is None:
+                break
+            verdicts.append(verdict)
+            if verdict.keep and verdict.sla_met:
+                break
+        return verdicts
