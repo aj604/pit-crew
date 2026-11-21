@@ -223,6 +223,16 @@ def test_shell_redirects_and_words_are_not_mutated() -> None:
     assert ops == [(4, "== -> !="), (4, "&& -> ||"), (4, "true -> false")]
 
 
+def test_shell_order_comparisons_flip_only_inside_arithmetic() -> None:
+    source = (
+        "if (( retries < max_retries )); then echo retry > log.txt; fi\n"
+        "echo $(( (a + 1) >= b ))\n"
+        '[[ "$x" < "$y" ]] && sort < in.txt\n'
+    )
+    ops = [(m.line, m.operator) for m in mutants("retry.sh", source)]
+    assert ops == [(1, "< -> >="), (2, ">= -> <"), (3, "&& -> ||")]
+
+
 def test_booleans_flip_only_where_the_language_spells_them_that_way() -> None:
     assert mutants("a.ts", "const t = True;\n") == []
     assert mutants("a.py", "x = true\n") == []
