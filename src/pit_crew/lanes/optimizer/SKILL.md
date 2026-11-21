@@ -38,9 +38,11 @@ push: the host publishes your branch, and GitHub Actions measures it.
   `--exit-zero`, or anything else that hides a failure. The guard rejects these, and so does
   the rater when a replayed bug stops failing.
 - Keep every failure artifact upload (screenshots, videos, traces). The Proof lane inspects them.
-  If a job you change runs browser tests and uploads no failure recordings (the guard warns),
-  also apply the `artifact-capture` companion playbook. It records only on failure, so it does
-  not slow green runs and does not count as a second change.
+  If a job you change runs browser tests and has no upload that carries failure recordings, also
+  apply the `artifact-capture` companion playbook. The guard warns when it can tell, but it only
+  sees the workflow: when a job runs a package script (`npm run test:e2e`), read that script in
+  `package.json` and decide yourself. The companion keeps recording off unless `PIT_CREW_RECORD`
+  is set, so timing runs on both sides are unchanged and it does not count as a second change.
 - Keep existing job ids and names, since branch protection may require them. If you move a
   job's checks into new jobs, the old job becomes a gate: `needs:` them, `if: always()`, and a
   step that fails unless every needed job succeeded.

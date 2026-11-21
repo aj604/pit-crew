@@ -577,3 +577,43 @@ def test_artifact_capture_upload_passes_the_guard() -> None:
     report = check_change(CI, head, head + capture)
     assert report.ok
     assert report.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [
+        # a coverage upload that only runs on success carries no failure recording
+        (
+            (
+                "      - run: npx playwright test\n      - uses: actions/upload-artifact@v4\n"
+                "        with:\n          path: coverage/\n"
+            ),
+            "no upload both runs on failure",
+        ),
+        # browser tests behind a package script
+        ("      - run: pnpm run test:e2e\n", "uploads no failure recordings"),
+        ("      - run: npm run playwright\n", "uploads no failure recordings"),
+        # a proper failure upload of recordings: no warning
+        (
+            (
+                "      - run: npx playwright test\n      - uses: actions/upload-artifact@v4\n"
+                "        if: ${{ !cancelled() }}\n        with:\n          path: playwright-report/\n"
+            ),
+            None,
+        ),
+        ("      - run: npm run lint\n", None),
+    ],
+)
+def test_recording_warning_needs_a_failure_upload_of_recordings(steps: str, expected: str | None) -> None:
+    workflow = "on: push\njobs:\n  e2e:\n    runs-on: x\n    steps:\n" + steps
+    warnings = check_change(CI, workflow, workflow).warnings
+    if expected is None:
+        assert warnings == []
+    else:
+        assert any(expected in w for w in warnings), warnings
+
+
+def test_artifact_capture_keeps_recording_off_in_timing_runs() -> None:
+    playbook = (Path(optimizer.__file__).parent / "playbooks" / "artifact-capture.md").read_text()
+    assert "PIT_CREW_RECORD" in playbook
+    assert "costs nothing" not in playbook
