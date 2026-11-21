@@ -15,7 +15,9 @@ _EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _MAX_EXPANSIONS = 1000
-_NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)")
+_NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)", re.IGNORECASE)  # GitHub expressions are case-insensitive
+_READS_EVERY_NEED = re.compile(r"needs\.\*|needs\[|toJSON\s*\(\s*needs\s*\)", re.IGNORECASE)
+_STATUS_FUNCTION = re.compile(r"\b(success|failure|always|cancelled)\s*\(", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -203,10 +205,15 @@ def _literal_length(name: str) -> int:
 
 
 def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
-    text = yaml.safe_dump(body)
-    if "toJSON(needs)" in text:
+    """The needs a job reads. A gate (status-function `if:`, `needs.*`, `toJSON(needs)`) reads all of them."""
+    if_ = body.get("if")
+    if if_ is not None and _STATUS_FUNCTION.search(str(if_)):
+        return frozenset(needs)  # the job decides on its needs' results, so every edge carries a signal
+    text = yaml.safe_dump(body, width=2**31)  # no line wrapping, so a pattern is never split across lines
+    if _READS_EVERY_NEED.search(text):
         return frozenset(needs)
-    return frozenset(_NEEDS_REF.findall(text)) & frozenset(needs)
+    named = {ref.lower() for ref in _NEEDS_REF.findall(text)}
+    return frozenset(n for n in needs if n.lower() in named)
 
 
 def match_step_name(spec_name: str, measured_name: str) -> bool:

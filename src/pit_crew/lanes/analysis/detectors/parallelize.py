@@ -3,12 +3,25 @@
 from dataclasses import replace
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, critical_path
-from pit_crew.lanes.analysis.detectors.base import Finding
+from pit_crew.lanes.analysis.detectors.base import Finding, keep_worthwhile
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
 _UPLOAD = "actions/upload-artifact"
 _DOWNLOAD = "actions/download-artifact"
 _CONFIDENCE = 0.6
+_TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
+
+
+def _trivial_run(run: str) -> bool:
+    lines = [line.strip() for line in run.splitlines()]
+    return all(line.split(maxsplit=1)[0] in _TRIVIAL_COMMANDS for line in lines if line and not line.startswith("#"))
+
+
+def _only_waits(job: JobSpec) -> bool:
+    """True for a job that does no work of its own (echo, exit, true or nothing): it exists to wait, as a gate."""
+    if job.uses is not None or not job.steps:  # a reusable-workflow call does real work; a step-less job is a stub
+        return False
+    return all(s.uses is None and (s.run is None or _trivial_run(s.run)) for s in job.steps)
 
 
 def _uses(job: JobSpec, action: str) -> bool:
@@ -16,7 +29,9 @@ def _uses(job: JobSpec, action: str) -> bool:
 
 
 def _removable(dep: JobSpec, job: JobSpec) -> bool:
-    """False when the job reads the dependency's outputs or downloads what it uploads."""
+    """False when the job reads the dependency's outputs, downloads what it uploads, or only waits on it."""
+    if _only_waits(job):
+        return False
     if dep.id in job.needs_refs:
         return False
     return not (_uses(dep, _UPLOAD) and _uses(job, _DOWNLOAD))
@@ -65,4 +80,4 @@ def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path
                     risk="medium",
                 )
             )
-    return findings
+    return keep_worthwhile(findings)

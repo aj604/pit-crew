@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from pit_crew.lanes.analysis.critical_path import CIProfile, CriticalPath, profile
 from pit_crew.lanes.analysis.detectors.parallelize import detect_parallelize_dag
 from pit_crew.lanes.analysis.history import parse_runs
@@ -148,7 +150,7 @@ jobs:
 """
     p, wf = profiled(chain, {"a": (0, 100), "b": (100, 110), "c": (110, 120)})
     by_job = {f.job: f for f in detect_parallelize_dag(p, wf, PATH)}
-    # Cutting `b.needs: a` lets b start at 0, so c finishes at 20 instead of 120: 20s from a 10s job.
+    # Cutting `b.needs: a` lets b start at 0, so the critical path drops from 120 to 100: 20s from a 10s job.
     # The ceiling is the critical-path drop, not b's own max_saving (10s).
     assert by_job["b"].expected_savings_seconds == 20.0
     assert by_job["b"].evidence["max_saving_seconds"] == 20.0
@@ -164,3 +166,73 @@ def test_parallelize_fastapi() -> None:
     # Critical path is changes -> test -> coverage-combine -> test-alls-green. test reads changes' outputs,
     # coverage-combine downloads the artifacts test uploads, and test-alls-green is the toJSON(needs) gate.
     assert detect_parallelize_dag(profile(wf, runs), wf, "test.yml") == []
+
+
+def gated(job_body: str, steps: str) -> str:
+    return two_jobs(f"{job_body}\n{steps}" if job_body else steps)
+
+
+GATE_FORMS = {
+    "vite test-passed": ("    if: (!cancelled() && !failure())", '    steps:\n      - run: echo "Build & Test Passed"'),
+    "bare failure": ("    if: '!failure()'", "    steps:\n      - run: pytest"),
+    "always with needs.*": (
+        "    if: \"always() && contains(needs.*.result, 'failure')\"",
+        "    steps:\n      - run: pytest",
+    ),
+    "toJson lowercase": ("", "    steps:\n      - run: echo '${{ toJson(needs) }}'"),
+    "toJSON with spaces": ("", "    steps:\n      - run: echo '${{ toJSON( needs ) }}'"),
+    "needs index": ("", "    steps:\n      - run: echo \"${{ needs['lint'].result }}\""),
+    "uppercase ref": ("", "    steps:\n      - run: echo '${{ NEEDS.Lint.outputs.x }}'"),
+    "status function spacing": ("    if: SUCCESS ()", "    steps:\n      - run: pytest"),
+}
+
+
+@pytest.mark.parametrize("form", GATE_FORMS)
+def test_parallelize_keeps_every_gate_form(form: str) -> None:
+    job_if, steps = GATE_FORMS[form]
+    p, wf = profiled(gated(job_if, steps), SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        "    steps:\n      - run: echo done",
+        "    steps:\n      - run: 'true'",
+        "    steps:\n      - run: exit 0",
+        "    steps:\n      - run: |\n          # wait\n          echo a\n\n          echo b",
+        "    steps:\n      - name: nothing to run",
+    ],
+)
+def test_parallelize_keeps_edges_into_wait_only_jobs(steps: str) -> None:
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_still_flags_jobs_that_do_work_beyond_echo() -> None:
+    p, wf = profiled(two_jobs("    steps:\n      - run: echo hi\n      - run: pytest"), SPANS)
+    assert [f.job for f in detect_parallelize_dag(p, wf, PATH)] == ["test"]
+
+
+VITE_GATE = """
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm test
+  test-passed:
+    if: (!cancelled() && !failure())
+    needs: test
+    runs-on: ubuntu-slim
+    name: Build & Test Passed or Skipped
+    steps:
+      - run: echo "Build & Test Passed or Skipped"
+"""
+
+
+def test_parallelize_vite_test_passed_gate_has_no_finding() -> None:
+    p, wf = profiled(VITE_GATE, {"test": (0, 300), "Build & Test Passed or Skipped": (300, 305)})
+    assert wf.jobs["test-passed"].needs_refs == {"test"}
+    assert detect_parallelize_dag(p, wf, PATH) == []
