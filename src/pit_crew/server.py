@@ -1,17 +1,19 @@
 """FastAPI HTTP server scaffold for Pit Crew."""
 
 import asyncio
+import hashlib
 import hmac
 import inspect
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, get_args
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.demo import DemoEngine, create_demo_router
 from pit_crew.ledger import Ledger, SqliteLedger
+from pit_crew.proof_bridge import MEDIA_URL_PREFIX, is_safe_mp4_filename
 from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
 
@@ -265,8 +268,113 @@ def _resolve_preview_url(repo: str, head_sha: str, raw_path: object) -> str:
     return ""
 
 
+def _resolve_video_url(raw_url: object) -> str:
+    """Resolve a playable replay MP4 URL (deployed ``/media/*.mp4`` or ``http(s)://``)."""
+    if not isinstance(raw_url, str):
+        return ""
+    value = raw_url.strip()
+    if not value:
+        return ""
+    if value.startswith(("https://", "http://")):
+        return value
+    prefix = f"{MEDIA_URL_PREFIX}/"
+    if value.startswith(prefix) and is_safe_mp4_filename(value[len(prefix) :]):
+        return value
+    return ""
+
+
+def _resolve_media_dir(ledger: Ledger, media_dir: Path | None) -> Path | None:
+    """Resolve the persistent MP4 media directory for the server."""
+    if media_dir is not None:
+        return media_dir
+    env_dir = os.environ.get("PIT_CREW_MEDIA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    if isinstance(ledger, SqliteLedger):
+        return ledger.path.resolve().parent / "media"
+    return None
+
+
+def _resolve_media_file(media_dir: Path | None, filename: str) -> Path:
+    """Validate ``filename`` and resolve an existing ``.mp4`` inside ``media_dir``."""
+    if media_dir is None or not is_safe_mp4_filename(filename):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    root = media_dir.resolve()
+    candidate = media_dir / filename
+    if candidate.is_symlink():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Replay video not found")
+    return resolved
+
+
+MEDIA_SESSION_COOKIE = "pit_crew_media_session"
+_MEDIA_SESSION_TTL_SECONDS = 3600
+
+
+def _sign_media_session(api_token: str, expires_at: int) -> str:
+    """Create an HMAC-SHA256 signed media session cookie value without embedding ``api_token``."""
+    digest = hmac.new(
+        api_token.encode("utf-8"),
+        f"media-session:{expires_at}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{expires_at}.{digest}"
+
+
+def _is_valid_media_session(cookie_value: str | None, api_token: str, *, now: float | None = None) -> bool:
+    """Return True when ``cookie_value`` carries a valid, unexpired signature for ``api_token``."""
+    if not cookie_value or "." not in cookie_value:
+        return False
+    exp_str, sep, _sig = cookie_value.partition(".")
+    if not sep or not exp_str.isdigit():
+        return False
+    expires_at = int(exp_str)
+    current = time.time() if now is None else now
+    if expires_at < current:
+        return False
+    expected = _sign_media_session(api_token, expires_at)
+    return hmac.compare_digest(cookie_value, expected)
+
+
+def _is_https_request(request: Request) -> bool:
+    """Return True when ``request`` arrived over HTTPS directly or via a reverse proxy."""
+    if request.url.scheme == "https":
+        return True
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    return forwarded == "https"
+
+
+def _make_media_token_dependency(
+    api_token: str,
+) -> Callable[[HTTPAuthorizationCredentials | None, Request], None]:
+    """Build a FastAPI dependency enforcing Bearer header or signed ``HttpOnly`` media cookie auth."""
+
+    def _require_media_token(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+        request: Request,
+    ) -> None:
+        if (
+            credentials is not None
+            and credentials.scheme.lower() == "bearer"
+            and credentials.credentials
+            and hmac.compare_digest(credentials.credentials, api_token)
+        ):
+            return
+        if _is_valid_media_session(request.cookies.get(MEDIA_SESSION_COOKIE), api_token):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return _require_media_token
+
+
 def _enrich_bug_outcome(repo: str, head_sha: str, outcome: dict[str, Any]) -> dict[str, Any]:
-    """Ensure attempt detail bug_outcomes expose multimodal fields and resolved preview URLs."""
+    """Ensure attempt detail bug_outcomes expose multimodal fields, preview URLs, and MP4 video URLs."""
     enriched = dict(outcome)
     enriched.setdefault("modality", "")
     enriched.setdefault("visual_evidence_seen", False)
@@ -285,6 +393,8 @@ def _enrich_bug_outcome(repo: str, head_sha: str, outcome: dict[str, Any]) -> di
         head_sha,
         enriched.get("candidate_preview_url") or enriched.get("candidate_preview_path"),
     )
+    enriched["baseline_video_url"] = _resolve_video_url(enriched.get("baseline_video_url"))
+    enriched["candidate_video_url"] = _resolve_video_url(enriched.get("candidate_video_url"))
     return enriched
 
 
@@ -329,6 +439,8 @@ def _attempt_detail(ledger: Ledger, repo: str, candidate_id: str) -> dict[str, A
                 "candidate_preview_path": str(row["candidate_preview_path"]),
                 "baseline_preview_url": row["baseline_preview_url"],
                 "candidate_preview_url": row["candidate_preview_url"],
+                "baseline_video_url": row["baseline_video_url"],
+                "candidate_video_url": row["candidate_video_url"],
             }
             for row in enriched_outcomes
         ]
@@ -418,24 +530,28 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
     *,
     brand_dir: Path | None = None,
     web_dir: Path | None = None,
+    media_dir: Path | None = None,
 ) -> FastAPI:
     """Create and configure the Pit Crew FastAPI application.
 
     The Pit Wall shell is served at ``/`` with its assets under ``/web``. Brand assets are mounted at
     ``/brand`` only when ``brand_dir`` exists, so an installed wheel without the repository's
-    ``brand/`` directory still starts cleanly.
+    ``brand/`` directory still starts cleanly. Persisted MP4 replay recordings are served at
+    ``/media/{filename}`` with HTTP Range streaming and optional ``?download=1`` attachment download.
     """
     app = FastAPI(title="pit-crew")
     active_repos: set[str] = set()
     background_tasks: set[asyncio.Task[None]] = set()
     progress_board = CycleProgressBoard()
     tracker = run_tracker if run_tracker is not None else RunTracker()
+    resolved_media_dir = _resolve_media_dir(ledger, media_dir)
     engine = DemoEngine()
     app.state.ledger = ledger
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
     app.state.run_tracker = tracker
     app.state.api_token = api_token
+    app.state.media_dir = resolved_media_dir
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
     app.state.progress_board = progress_board
@@ -523,9 +639,68 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
         """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
+    _register_media_route(
+        app,
+        media_dir=resolved_media_dir,
+        api_token=api_token,
+        api_auth_dependencies=api_auth_dependencies,
+    )
     resolved_brand = brand_dir if brand_dir is not None else _resolve_default_brand_dir()
     _mount_pit_wall(app, brand_dir=resolved_brand, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app
+
+
+def _register_media_route(
+    app: FastAPI,
+    *,
+    media_dir: Path | None,
+    api_token: str | None,
+    api_auth_dependencies: list[Any],
+) -> None:
+    """Register ``POST /api/media/session`` and ``GET /media/{filename}`` for Range-streamed MP4 replays."""
+    media_headers = (
+        {"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"}
+        if api_token is not None
+        else {"Cache-Control": "public, max-age=3600"}
+    )
+    media_auth_deps = [Depends(_make_media_token_dependency(api_token))] if api_token is not None else []
+
+    @app.post(
+        "/api/media/session",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=api_auth_dependencies,
+    )
+    def create_media_session(request: Request) -> Response:
+        """Issue a scoped ``HttpOnly`` media session cookie after verifying Bearer authentication."""
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        if api_token is not None:
+            expires_at = int(time.time()) + _MEDIA_SESSION_TTL_SECONDS
+            response.set_cookie(
+                key=MEDIA_SESSION_COOKIE,
+                value=_sign_media_session(api_token, expires_at),
+                max_age=_MEDIA_SESSION_TTL_SECONDS,
+                path=MEDIA_URL_PREFIX,
+                httponly=True,
+                samesite="strict",
+                secure=_is_https_request(request),
+            )
+        return response
+
+    @app.get(f"{MEDIA_URL_PREFIX}/{{filename}}", dependencies=media_auth_deps)
+    def replay_media(
+        filename: str,
+        *,
+        download: Annotated[bool, Query()] = False,
+    ) -> FileResponse:
+        """Stream or download a persisted MP4 bug-replay video (supports HTTP Range seeking)."""
+        target = _resolve_media_file(media_dir, filename)
+        return FileResponse(
+            target,
+            media_type="video/mp4",
+            filename=filename,
+            content_disposition_type="attachment" if download else "inline",
+            headers=media_headers,
+        )
 
 
 def _mount_pit_wall(app: FastAPI, *, brand_dir: Path, web_dir: Path) -> None:

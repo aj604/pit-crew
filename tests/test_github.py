@@ -1,5 +1,7 @@
 import base64
+import io
 import json
+import zipfile
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
 from typing import override
@@ -1026,6 +1028,437 @@ def test_httpx_get_file_content_decodes_base64_plain_and_handles_missing_and_err
                 client.get_file_content("org/repo", bad_path, "abc123")
 
     assert seen[0] == (b"/repos/org/repo/contents/.github/workflows/ci.yml?ref=abc123", {"ref": "abc123"})
+
+
+def test_httpx_get_run_failure_output_downloads_replay_artifact_and_strips_auth_on_redirect() -> None:
+    blob_requests: list[httpx.Request] = []
+    routes: dict[str, httpx.Response] = {
+        "/repos/org/repo/actions/runs/501/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 10, "name": "coverage-report", "expired": False},
+                    {"id": 11, "name": "pit-crew-replay-test-0", "expired": True},
+                    {"id": 12, "name": "failure-recordings-e2e-0", "expired": False},
+                    {"id": 13, "name": "pit-crew-replay-test-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/13/zip": httpx.Response(
+            302,
+            headers={"Location": "https://blobs.example.test/download/13.zip"},
+        ),
+        "/repos/org/repo/actions/runs/502/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 22, "name": "failure-recordings-e2e-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/22/zip": httpx.Response(200, content=b"direct-zip-bytes"),
+        "/repos/org/repo/actions/runs/503/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 30, "name": "other", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/runs/504/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 40, "name": "pit-crew-replay-test-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/40/zip": httpx.Response(302),
+        "/repos/org/repo/actions/runs/505/artifacts": httpx.Response(200, json={"artifacts": "not-a-list"}),
+        "/repos/org/repo/actions/runs/506/artifacts": httpx.Response(
+            200,
+            json={"artifacts": ["bad", {"id": True, "name": "pit-crew-replay-x", "expired": False}]},
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "blobs.example.test":
+            blob_requests.append(request)
+            assert "authorization" not in {k.lower() for k in request.headers}
+            return httpx.Response(200, content=b"PK\x03\x04zip-payload")
+        _assert_github_headers(request)
+        return routes.get(request.url.path, httpx.Response(404))
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        assert client.get_run_failure_output("org/repo", "501") == b"PK\x03\x04zip-payload"
+        assert len(blob_requests) == 1
+        assert client.get_run_failure_output("org/repo", "502") == b"direct-zip-bytes"
+
+        for missing_run in ("503", "505", "506"):
+            with pytest.raises(FileNotFoundError, match="No replay recording artifact"):
+                client.get_run_failure_output("org/repo", missing_run)
+        with pytest.raises(ValueError, match="missing Location header"):
+            client.get_run_failure_output("org/repo", "504")
+        with pytest.raises(ValueError, match="run_id must not be empty"):
+            client.get_run_failure_output("org/repo", "   ")
+
+
+def _make_artifact_zip(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_httpx_get_run_failure_output_resolves_expected_check_and_rejects_unrelated_or_ambiguous() -> None:
+    node26_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps(
+                {"workflow": "CI", "job_id": "test", "job_name": "Build&Test: node-26, ubuntu-latest"}
+            ).encode(),
+            "step-1.mp4": b"node26-video",
+        }
+    )
+    node20_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps(
+                {"workflow": "CI", "job_id": "test", "job_name": "Build&Test: node-20, ubuntu-latest"}
+            ).encode(),
+            "step-1.mp4": b"node20-video",
+        }
+    )
+    lint_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps(
+                {"workflow": "CI", "job_id": "lint", "job_name": "Lint: node-26, ubuntu-latest"}
+            ).encode(),
+            "step-1.mp4": b"lint-video",
+        }
+    )
+    plain_zip_a = _make_artifact_zip({"step-1.mp4": b"plain-a"})
+    plain_zip_b = _make_artifact_zip({"step-1.mp4": b"plain-b"})
+
+    routes: dict[str, httpx.Response] = {
+        # Run 601: Node 26 failed AND Lint failed -> must select ONLY Node 26's artifact.
+        "/repos/org/repo/actions/runs/601/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 1,
+                        "name": "Build&Test: node-20, ubuntu-latest",
+                        "conclusion": "success",
+                        "workflow_name": "CI",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Build&Test: node-26, ubuntu-latest",
+                        "conclusion": "failure",
+                        "workflow_name": "CI",
+                    },
+                    {"id": 3, "name": "Lint: node-26, ubuntu-latest", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/601/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 6011, "name": "pit-crew-replay-lint-lint-node-26-ubuntu-latest-0", "expired": False},
+                    {"id": 6012, "name": "pit-crew-replay-test-build-test-node-26-ubuntu-latest-3", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/6012/zip": httpx.Response(200, content=node26_zip),
+        # Run 602: Node 26 PASSED while unrelated Lint FAILED -> MUST reject instead of returning Lint's video!
+        "/repos/org/repo/actions/runs/602/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 1,
+                        "name": "Build&Test: node-26, ubuntu-latest",
+                        "conclusion": "success",
+                        "workflow_name": "CI",
+                    },
+                    {"id": 2, "name": "Lint: node-26, ubuntu-latest", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/602/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 6021, "name": "pit-crew-replay-lint-0", "expired": False}]},
+        ),
+        # Run 603: Node 26 failed, but ONLY Lint uploaded a recording -> MUST reject as missing.
+        "/repos/org/repo/actions/runs/603/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 1,
+                        "name": "Build&Test: node-26, ubuntu-latest",
+                        "conclusion": "failure",
+                        "workflow_name": "CI",
+                    },
+                    {"id": 2, "name": "Lint: node-26, ubuntu-latest", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/603/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 6031, "name": "pit-crew-replay-lint-0", "expired": False}]},
+        ),
+        # Run 604: Non-matrix alias (`CI/Unit Tests` <-> job id `test`) selects `pit-crew-replay-test-0`.
+        "/repos/org/repo/actions/runs/604/jobs": httpx.Response(
+            200,
+            json={"jobs": [{"id": 1, "name": "Unit Tests", "conclusion": "failure", "workflow_name": "CI"}]},
+        ),
+        "/repos/org/repo/actions/runs/604/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 6041, "name": "pit-crew-replay-lint-0", "expired": False},
+                    {"id": 6042, "name": "pit-crew-replay-test-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/6042/zip": httpx.Response(200, content=plain_zip_a),
+        # Run 605: Ambiguous legacy matrix artifacts disambiguated by replay-meta.json.
+        "/repos/org/repo/actions/runs/605/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": 1,
+                        "name": "Build&Test: node-20, ubuntu-latest",
+                        "conclusion": "failure",
+                        "workflow_name": "CI",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Build&Test: node-26, ubuntu-latest",
+                        "conclusion": "failure",
+                        "workflow_name": "CI",
+                    },
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/605/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 6051, "name": "pit-crew-replay-test-0", "expired": False},
+                    {"id": 6052, "name": "pit-crew-replay-test-3", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/6051/zip": httpx.Response(200, content=node20_zip),
+        "/repos/org/repo/actions/artifacts/6052/zip": httpx.Response(200, content=node26_zip),
+        # Run 606: Ambiguous artifacts without metadata -> fail closed as ambiguous.
+        "/repos/org/repo/actions/runs/606/jobs": httpx.Response(
+            200,
+            json={"jobs": [{"id": 1, "name": "Unit Tests", "conclusion": "failure", "workflow_name": "CI"}]},
+        ),
+        "/repos/org/repo/actions/runs/606/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 6061, "name": "pit-crew-replay-test-0", "expired": False},
+                    {"id": 6062, "name": "pit-crew-replay-test-1", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/6061/zip": httpx.Response(200, content=plain_zip_a),
+        "/repos/org/repo/actions/artifacts/6062/zip": httpx.Response(200, content=plain_zip_b),
+        # Run 607: Single matched artifact name whose replay-meta.json belongs to a different job -> reject.
+        "/repos/org/repo/actions/runs/607/jobs": httpx.Response(
+            200,
+            json={"jobs": [{"id": 1, "name": "Unit Tests", "conclusion": "failure", "workflow_name": "CI"}]},
+        ),
+        "/repos/org/repo/actions/runs/607/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 6071, "name": "pit-crew-replay-test-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/6071/zip": httpx.Response(200, content=lint_zip),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_github_headers(request)
+        return routes.get(request.url.path, httpx.Response(404))
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        assert (
+            client.get_run_failure_output(
+                "org/repo",
+                "601",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+            == node26_zip
+        )
+
+        with pytest.raises(FileNotFoundError, match="did not fail"):
+            client.get_run_failure_output(
+                "org/repo",
+                "602",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+
+        with pytest.raises(FileNotFoundError, match="No replay recording artifact matching"):
+            client.get_run_failure_output(
+                "org/repo",
+                "603",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+            )
+
+        assert (
+            client.get_run_failure_output(
+                "org/repo",
+                "604",
+                expected_checks=("CI/Unit Tests",),
+                check_aliases=("test", "CI/test"),
+            )
+            == plain_zip_a
+        )
+
+        # Ambiguous legacy names without display slug disambiguated via replay-meta.json when job alias is provided.
+        assert (
+            client.get_run_failure_output(
+                "org/repo",
+                "605",
+                expected_checks=("CI/Build&Test: node-26, ubuntu-latest",),
+                check_aliases=("test",),
+            )
+            == node26_zip
+        )
+
+        # Ambiguous without metadata fails closed.
+        with pytest.raises(FileNotFoundError, match="Ambiguous replay recording artifacts"):
+            client.get_run_failure_output(
+                "org/repo",
+                "606",
+                expected_checks=("CI/Unit Tests",),
+                check_aliases=("test",),
+            )
+
+        # Untargeted call with multiple distinct artifact names also fails closed as ambiguous.
+        with pytest.raises(FileNotFoundError, match="Ambiguous replay recording artifacts"):
+            client.get_run_failure_output("org/repo", "601")
+
+        # Artifact metadata mismatch fails closed.
+        with pytest.raises(FileNotFoundError, match="metadata did not match"):
+            client.get_run_failure_output(
+                "org/repo",
+                "607",
+                expected_checks=("CI/Unit Tests",),
+                check_aliases=("test",),
+            )
+
+        # get_failed_job_logs with non-matching check returns empty bytes rather than another job's logs.
+        assert client.get_failed_job_logs("org/repo", "602", check="CI/Build&Test: node-26, ubuntu-latest") == b""
+
+
+def test_httpx_check_resolution_handles_multi_target_matrices_browser_fallback_and_log_aliases() -> None:
+    test20_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps({"workflow": "CI", "job_id": "test", "job_name": "test (20)"}).encode(),
+            "step-1.mp4": b"test20-mp4",
+        }
+    )
+    ui_browser_zip = _make_artifact_zip({"test-results/cart/video.webm": b"\x1a\x45\xdf\xa3browser-webm"})
+    ui_terminal_zip = _make_artifact_zip({"step-1.mp4": b"ui-terminal-mp4"})
+    lint_zip = _make_artifact_zip(
+        {
+            "replay-meta.json": json.dumps({"workflow": "CI", "job_id": "lint", "job_name": "lint"}).encode(),
+            "step-1.mp4": b"lint-mp4",
+        }
+    )
+    fetched_logs: list[str] = []
+
+    routes: dict[str, httpx.Response] = {
+        # Run 701: `lint` matched exactly and PASSED, while `test (20)` FAILED under target `CI/test`.
+        "/repos/org/repo/actions/runs/701/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 1, "name": "lint", "conclusion": "success", "workflow_name": "CI"},
+                    {"id": 2, "name": "test (20)", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/701/artifacts": httpx.Response(
+            200,
+            json={"artifacts": [{"id": 7011, "name": "pit-crew-replay-test-test-20-0", "expired": False}]},
+        ),
+        "/repos/org/repo/actions/artifacts/7011/zip": httpx.Response(200, content=test20_zip),
+        # Run 702: Windows `ui` uploaded `failure-recordings-ui-0`, while unrelated `lint` uploaded `pit-crew-replay-*`.
+        "/repos/org/repo/actions/runs/702/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 10, "name": "ui", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 11, "name": "lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/runs/702/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 7021, "name": "pit-crew-replay-lint-0", "expired": False},
+                    {"id": 7022, "name": "failure-recordings-ui-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/7021/zip": httpx.Response(200, content=lint_zip),
+        "/repos/org/repo/actions/artifacts/7022/zip": httpx.Response(200, content=ui_browser_zip),
+        # Run 703: Both primary and fallback exist for `ui` -> primary still wins.
+        "/repos/org/repo/actions/runs/703/jobs": httpx.Response(
+            200,
+            json={"jobs": [{"id": 20, "name": "ui", "conclusion": "failure", "workflow_name": "CI"}]},
+        ),
+        "/repos/org/repo/actions/runs/703/artifacts": httpx.Response(
+            200,
+            json={
+                "artifacts": [
+                    {"id": 7031, "name": "failure-recordings-ui-0", "expired": False},
+                    {"id": 7032, "name": "pit-crew-replay-ui-0", "expired": False},
+                ]
+            },
+        ),
+        "/repos/org/repo/actions/artifacts/7031/zip": httpx.Response(200, content=ui_browser_zip),
+        "/repos/org/repo/actions/artifacts/7032/zip": httpx.Response(200, content=ui_terminal_zip),
+        # Run 704: Failed job display name `Unit test` matched via expected_checks / check_aliases; `Lint` excluded.
+        "/repos/org/repo/actions/runs/704/jobs": httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"id": 41, "name": "Unit test", "conclusion": "failure", "workflow_name": "CI"},
+                    {"id": 42, "name": "Lint", "conclusion": "failure", "workflow_name": "CI"},
+                ]
+            },
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_github_headers(request)
+        if request.url.path.startswith("/repos/org/repo/actions/jobs/") and request.url.path.endswith("/logs"):
+            jid = request.url.path.split("/")[-2]
+            fetched_logs.append(jid)
+            return httpx.Response(200, content=f"log-{jid}\n".encode())
+        return routes.get(request.url.path, httpx.Response(404))
+
+    with HttpxGitHubClient(_TEST_TOKEN, transport=httpx.MockTransport(handler)) as client:
+        # Passing exact `CI/lint` must not hide failing matrix leg `test (20)` for `CI/test`.
+        assert client.get_run_failure_output("org/repo", "701", expected_checks=("CI/test", "CI/lint")) == test20_zip
+        # Specific matrix leg that did not fail still fails closed.
+        with pytest.raises(FileNotFoundError, match="did not fail"):
+            client.get_run_failure_output("org/repo", "701", expected_checks=("CI/test (22)", "CI/lint"))
+
+        # Unrelated `pit-crew-replay-lint-0` must not hide `failure-recordings-ui-0` for `CI/ui`.
+        assert client.get_run_failure_output("org/repo", "702", expected_checks=("CI/ui",)) == ui_browser_zip
+        # When both exist for the resolved job, primary `pit-crew-replay-*` wins.
+        assert client.get_run_failure_output("org/repo", "703", expected_checks=("CI/ui",)) == ui_terminal_zip
+
+        # get_failed_job_logs resolves expected_checks/check_aliases while still excluding unrelated failed jobs.
+        logs = client.get_failed_job_logs(
+            "org/repo",
+            "704",
+            check="CI/unit-test",
+            expected_checks=("CI/unit-test", "CI/Unit test"),
+        )
+        assert b"=== Unit test ===" in logs
+        assert b"log-41" in logs
+        assert b"Lint" not in logs
+        assert fetched_logs == ["41"]
 
 
 def test_httpx_get_repo_metadata_and_list_workflow_files() -> None:

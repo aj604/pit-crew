@@ -47,6 +47,7 @@ _TEXT_EXTENSIONS = frozenset({".log", ".txt", ".out", ".md", ".xml", ".json", ".
 _BROWSER_HINTS = ("playwright", "cypress", "test-results", "videos/", "browser", "e2e", "spec", "ui-check", "ui_check")
 _TERMINAL_HINTS = ("terminal", "asciicast", "replay", "record", "pty", "cli-video")
 _PRIORITY_ARTIFACT_HINTS = (
+    "pit-crew-replay",
     "failure-recordings",
     "playwright",
     "cypress",

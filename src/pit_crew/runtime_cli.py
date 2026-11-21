@@ -37,7 +37,7 @@ from pit_crew.github import (
 )
 from pit_crew.lanes.proof.miner import JobRun
 from pit_crew.ledger import Ledger, SqliteLedger
-from pit_crew.proof_bridge import ProofBridge
+from pit_crew.proof_bridge import ProofBridge, default_media_dir
 from pit_crew.run_tracker import RunTracker
 from pit_crew.server import create_app
 
@@ -261,15 +261,26 @@ class _LiveProofGitHubAdapter:
         msg = "Underlying GitHub client does not support download_artifact"
         raise RuntimeError(msg)
 
-    def get_failed_job_logs(
+    def get_failed_job_logs(  # noqa: PLR0913
         self,
         repo: str,
         run_id: int | str,
         *,
         check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
         max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
     ) -> bytes:
         """Forward failed job log retrieval when the underlying client implements ``RunArtifactsClient``."""
+        if isinstance(self._github, HttpxGitHubClient):
+            return self._github.get_failed_job_logs(
+                repo,
+                run_id,
+                check=check,
+                expected_checks=expected_checks,
+                check_aliases=check_aliases,
+                max_bytes=max_bytes,
+            )
         if isinstance(self._github, RunArtifactsClient):
             return self._github.get_failed_job_logs(repo, run_id, check=check, max_bytes=max_bytes)
         return self._download_failed_job_logs(_repo_api_path(repo), str(run_id))
@@ -311,12 +322,22 @@ def add_runtime_subcommands(commands: Any) -> None:  # noqa: ANN401
     cycle.add_argument("--workspace", help="optional local checkout path for analysis tools")
     cycle.add_argument("--no-open-pr", action="store_true", help="do not open pull requests for kept candidates")
     cycle.add_argument("--base-branch", default="main", help="base branch for opened pull requests (default: main)")
+    cycle.add_argument(
+        "--media-dir",
+        default=None,
+        help="directory for persisted replay MP4 videos (default: $PIT_CREW_MEDIA_DIR or <ledger_dir>/media)",
+    )
 
     serve = commands.add_parser("serve", help="start the FastAPI webhook & Pit Wall server")
     serve.add_argument(
         "--ledger",
         default=os.environ.get("PIT_CREW_LEDGER_PATH", DEFAULT_LEDGER_PATH),
         help="path to the SQLite ledger database (default: $PIT_CREW_LEDGER_PATH or .pit_crew/ledger.db)",
+    )
+    serve.add_argument(
+        "--media-dir",
+        default=None,
+        help="directory for persisted replay MP4 videos (default: $PIT_CREW_MEDIA_DIR or <ledger_dir>/media)",
     )
     serve.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
@@ -335,13 +356,21 @@ def add_runtime_subcommands(commands: Any) -> None:  # noqa: ANN401
     )
 
 
-def _build_live_dispatcher(
+def _resolve_cli_media_dir(args: argparse.Namespace) -> Path:
+    raw = getattr(args, "media_dir", None)
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip())
+    return default_media_dir(args.ledger)
+
+
+def _build_live_dispatcher(  # noqa: PLR0913
     ledger: SqliteLedger,
     tracker: RunTracker,
     config: DispatcherConfig,
     *,
     github: GitHubClient | None,
     stack: ExitStack,
+    media_dir: Path | None = None,
 ) -> Dispatcher:
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if github is not None:
@@ -352,7 +381,17 @@ def _build_live_dispatcher(
         gh = live_gh
     adapter = _LiveProofGitHubAdapter(gh, token=token)
     stack.callback(adapter.close)
-    bridge = ProofBridge(adapter, run_lane=_bridge_lane_runner, ask=managed_agent.ask_multimodal)
+    resolved_media_dir = media_dir if media_dir is not None else default_media_dir(ledger.path)
+    public_base_url = os.environ.get("PIT_CREW_PUBLIC_URL", "").strip()
+    media_requires_auth = bool(os.environ.get("PIT_CREW_API_TOKEN", "").strip())
+    bridge = ProofBridge(
+        adapter,
+        run_lane=_bridge_lane_runner,
+        ask=managed_agent.ask_multimodal,
+        media_dir=resolved_media_dir,
+        public_base_url=public_base_url,
+        media_requires_auth=media_requires_auth,
+    )
     return Dispatcher(
         ledger,
         gh,
@@ -404,6 +443,7 @@ def _run_cycle_command(
     }
     try:
         ledger = SqliteLedger(args.ledger)
+        media_dir = _resolve_cli_media_dir(args)
         _ensure_workspace_dir(args.workspace)
         with ExitStack() as stack:
             if dispatcher is not None:
@@ -424,6 +464,7 @@ def _run_cycle_command(
                     config,
                     github=github,
                     stack=stack,
+                    media_dir=media_dir,
                 )
             ws_ctx = host_workspace.use_workspace(args.workspace) if args.workspace is not None else nullcontext()
             with ws_ctx:
@@ -439,6 +480,8 @@ def _run_cycle_command(
         summary["elapsed_seconds"] = round(time.monotonic() - started, 3)
         return summary, False
 
+    summary["media_dir"] = str(media_dir)
+    summary["replay_videos"] = list(getattr(active_dispatcher, "last_replay_videos", ()))
     if verdict is not None:
         summary.update(
             {
@@ -470,6 +513,7 @@ def _run_serve_command(
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ledger = SqliteLedger(args.ledger)
+    media_dir = _resolve_cli_media_dir(args)
     tracker = RunTracker()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     webhook_secret = os.environ.get("PIT_CREW_WEBHOOK_SECRET", "").strip() or None
@@ -486,6 +530,7 @@ def _run_serve_command(
                 config,
                 github=github,
                 stack=stack,
+                media_dir=media_dir,
             )
         else:
             active_dispatcher = None
@@ -496,6 +541,7 @@ def _run_serve_command(
             webhook_secret=webhook_secret,
             run_tracker=tracker,
             api_token=api_token,
+            media_dir=media_dir,
         )
         runner = serve_runner if serve_runner is not None else uvicorn.run
         runner(app, host=args.host, port=args.port)
@@ -505,6 +551,7 @@ def _run_serve_command(
         "host": args.host,
         "port": args.port,
         "ledger": str(args.ledger),
+        "media_dir": str(media_dir),
         "dispatcher_enabled": active_dispatcher is not None,
     }, True
 

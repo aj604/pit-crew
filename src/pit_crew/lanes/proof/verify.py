@@ -145,6 +145,8 @@ class Replay:
     candidate_artifact_urls: tuple[str, ...] = ()
     baseline_preview_path: str = ""
     candidate_preview_path: str = ""
+    baseline_video_url: str = ""
+    candidate_video_url: str = ""
     expected_checks: tuple[str, ...] = ()
     candidate_failed_checks: tuple[str, ...] = ()
 
@@ -183,6 +185,8 @@ class Replay:
             "candidate_artifact_urls": list(self.candidate_artifact_urls),
             "baseline_preview_path": self.baseline_preview_path,
             "candidate_preview_path": self.candidate_preview_path,
+            "baseline_video_url": self.baseline_video_url,
+            "candidate_video_url": self.candidate_video_url,
         }
 
 
@@ -209,18 +213,42 @@ def failure_request(baseline_video: bytes, candidate_video: bytes, check: str) -
 
 
 def expected_checks_matched(expected_checks: Sequence[str], candidate_failed_checks: Sequence[str]) -> bool:
-    """Return True when ``expected_checks`` is empty or at least one expected check failed on candidate."""
+    """Return True when ``expected_checks`` is empty or at least one expected check failed on candidate.
+
+    Unqualified expected checks (e.g. ``CI/UI check``) match matrix/shard legs such as
+    ``UI check (2/4)``; matrix-qualified expected checks (e.g. ``CI/test (node-26)``) require
+    an exact match so a different matrix leg cannot satisfy them.
+    """
     if not expected_checks:
         return True
-    expected_keys = {_normalize_check_key(c) for c in expected_checks if c.strip()}
-    if not expected_keys:
+    cleaned_expected = [c.strip() for c in expected_checks if c.strip()]
+    if not cleaned_expected:
         return True
-    actual_keys = {_normalize_check_key(c) for c in candidate_failed_checks if c.strip()}
-    if expected_keys & actual_keys:
+    cleaned_actual = [c.strip() for c in candidate_failed_checks if c.strip()]
+    return any(_single_check_matches(exp, actual) for exp in cleaned_expected for actual in cleaned_actual)
+
+
+def _single_check_matches(expected: str, actual: str) -> bool:
+    exp_low = expected.lower()
+    act_low = actual.lower()
+    if _exact_or_short_match(exp_low, act_low):
         return True
-    expected_short = {_short_check_name(k) for k in expected_keys}
-    actual_short = {_short_check_name(k) for k in actual_keys}
-    return bool(expected_short & actual_short)
+    if _MATRIX_SUFFIX.search(exp_low):
+        return False
+    return _exact_or_short_match(exp_low, _normalize_check_key(act_low))
+
+
+def _exact_or_short_match(expected_low: str, actual_low: str) -> bool:
+    if expected_low == actual_low:
+        return True
+    return _has_workflow_prefix(expected_low, actual_low) or _has_workflow_prefix(actual_low, expected_low)
+
+
+def _has_workflow_prefix(full: str, bare: str) -> bool:
+    if not bare or not full.endswith(f"/{bare}"):
+        return False
+    prefix = full[: -(len(bare) + 1)]
+    return bool(prefix) and prefix.count("(") == prefix.count(")")
 
 
 def compare_bundles(  # noqa: PLR0913  explicit bundle + optional guard inputs
@@ -380,10 +408,6 @@ def _bundle_parts(side: str, bundle: ArtifactBundle) -> list[Part]:
 
 def _normalize_check_key(check: str) -> str:
     return _MATRIX_SUFFIX.sub("", check.strip()).strip().lower()
-
-
-def _short_check_name(normalized_key: str) -> str:
-    return normalized_key.rsplit("/", maxsplit=1)[-1].strip()
 
 
 def _describe(error: Exception) -> str:

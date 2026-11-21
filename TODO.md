@@ -83,7 +83,7 @@ See [docs/architecture.md](docs/architecture.md) for system design and [docs/lan
 - [x] Add validation to prevent empty `ReplayPlan`s (since `rater.py` automatically rejects `bugs_total == 0`).
 - [x] Refine `SKILL.md` with selection heuristics (prefer high-signal bugs most likely to be masked by the candidate optimization).
 - [x] Visual proof: record each replay as a terminal video, have Gemini 4 Carbon confirm the candidate fails the same way as the baseline, and render a proof card for the PR.
-- [ ] Agree with Dispatcher on recording replays (`record.py`, plus `agg` and `ffmpeg` on the runner) and wiring `verify_replays(..., compare=partial(compare_failures, ask=managed_agent.ask_multimodal))`, `tally()` and `Replay.as_outcome()` into `Evidence`.
+- [x] Agree with Dispatcher on recording replays (`record.py`, plus `agg` and `ffmpeg` on the runner) and wiring `verify_replays(..., compare=partial(compare_failures, ask=managed_agent.ask_multimodal))`, `tally()` and `Replay.as_outcome()` into `Evidence`.
 - [x] Carry the expected failing check per bug in `ReplayPlan` (contract PR), so a replay must fail on the same check.
 
 **Deliverables:**

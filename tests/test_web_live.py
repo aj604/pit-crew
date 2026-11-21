@@ -783,27 +783,53 @@ def _terminate_process_group(proc: subprocess.Popen[bytes], *, timeout: float = 
 
 def _run_cdp_against(app_port: int) -> dict[str, Any]:
     assert CHROME is not None
-    cdp_port = _free_port()
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as user_data:
-        proc = subprocess.Popen(  # noqa: S603
-            [CHROME, "--headless=new", "--no-sandbox", "--disable-gpu",
-             f"--remote-debugging-port={cdp_port}", f"--user-data-dir={user_data}", "about:blank"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        )  # fmt: skip
-        try:
-            ws_url, deadline = "", time.monotonic() + 10
-            while time.monotonic() < deadline and not ws_url:
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=1) as resp:
-                        targets = json.loads(resp.read().decode())
-                    page = next((t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None)
-                    ws_url = str(page["webSocketDebuggerUrl"]) if page else ""
-                except OSError:
-                    time.sleep(0.1)
-            assert ws_url, "Chrome CDP endpoint did not start"
-            return _node(_CDP_VERIFY_SCRIPT, ws_url, f"http://127.0.0.1:{app_port}")
-        finally:
-            _terminate_process_group(proc)
+    last_diag = ""
+    for _attempt in range(2):
+        cdp_port = _free_port()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as user_data:
+            stderr_path = Path(user_data) / "chrome-stderr.log"
+            with stderr_path.open("wb") as err_file:
+                proc = subprocess.Popen(  # noqa: S603
+                    [
+                        CHROME,
+                        "--headless=new",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        f"--remote-debugging-port={cdp_port}",
+                        f"--user-data-dir={user_data}",
+                        "about:blank",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=err_file,
+                    start_new_session=True,
+                )
+            try:
+                ws_url, deadline = "", time.monotonic() + 25
+                while time.monotonic() < deadline and not ws_url:
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=1) as resp:
+                            targets = json.loads(resp.read().decode())
+                        page = next(
+                            (t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")), None
+                        )
+                        ws_url = str(page["webSocketDebuggerUrl"]) if page else ""
+                    except OSError:
+                        pass
+                    if not ws_url:
+                        time.sleep(0.1)
+                if ws_url:
+                    return _node(_CDP_VERIFY_SCRIPT, ws_url, f"http://127.0.0.1:{app_port}")
+                stderr_tail = stderr_path.read_text(errors="replace")[-500:] if stderr_path.exists() else ""
+                last_diag = f"rc={proc.poll()} stderr={stderr_tail!r}"
+            finally:
+                _terminate_process_group(proc)
+    msg = f"Chrome CDP endpoint did not start ({last_diag})"
+    raise AssertionError(msg)
 
 
 def test_terminate_process_group_falls_back_to_sigkill() -> None:

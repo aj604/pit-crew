@@ -21,6 +21,7 @@ import modal
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = "/data"
 LEDGER_PATH = f"{DATA_DIR}/ledger.db"
+MEDIA_DIR = f"{DATA_DIR}/media"
 REMOTE_BRAND_DIR = Path("/root/brand")
 
 app = modal.App("pit-crew")
@@ -40,6 +41,7 @@ image = (
         {
             "PYTHONPATH": "/root/src",
             "PIT_CREW_LEDGER_PATH": LEDGER_PATH,
+            "PIT_CREW_MEDIA_DIR": MEDIA_DIR,
             "PIT_CREW_BRAND_DIR": str(REMOTE_BRAND_DIR),
         }
     )
@@ -80,16 +82,30 @@ def web() -> Any:  # noqa: ANN401
     from pit_crew.server import create_app  # noqa: PLC0415
 
     ledger = SqliteLedger(os.environ.get("PIT_CREW_LEDGER_PATH", LEDGER_PATH))
+    media_dir = Path(os.environ.get("PIT_CREW_MEDIA_DIR", MEDIA_DIR))
+    media_dir.mkdir(parents=True, exist_ok=True)
     tracker = RunTracker()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     webhook_secret = os.environ.get("PIT_CREW_WEBHOOK_SECRET", "").strip() or None
     api_token = os.environ.get("PIT_CREW_API_TOKEN", "").strip() or None
+    public_base_url = os.environ.get("PIT_CREW_PUBLIC_URL", "").strip()
+
+    def _commit_media(_path: Path) -> None:
+        volume.commit()
 
     dispatcher = None
     if github_token:
         gh = HttpxGitHubClient(token=github_token)
         adapter = _LiveProofGitHubAdapter(gh, token=github_token)
-        bridge = ProofBridge(adapter, run_lane=_bridge_lane_runner, ask=managed_agent.ask_multimodal)
+        bridge = ProofBridge(
+            adapter,
+            run_lane=_bridge_lane_runner,
+            ask=managed_agent.ask_multimodal,
+            media_dir=media_dir,
+            on_media_saved=_commit_media,
+            public_base_url=public_base_url,
+            media_requires_auth=bool(api_token),
+        )
         dispatcher = Dispatcher(
             ledger,
             gh,
@@ -106,4 +122,5 @@ def web() -> Any:  # noqa: ANN401
         run_tracker=tracker,
         api_token=api_token,
         brand_dir=REMOTE_BRAND_DIR,
+        media_dir=media_dir,
     )

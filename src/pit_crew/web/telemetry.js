@@ -16,6 +16,7 @@ const MODALITY_LABELS = Object.freeze({
   log: "LOG",
 });
 const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const SAFE_MEDIA_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp4$/;
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const isNonNeg = (v) => isNum(v) && v >= 0;
@@ -66,6 +67,41 @@ export function isSafePreviewUrl(url) {
     return !trimmed.includes("..") && !trimmed.includes("\\");
   }
   return isSafeExternalUrl(trimmed);
+}
+
+/** Pure: allow playable replay MP4 URLs under `/media/*.mp4`, `/web/`, `/brand/`, or `http(s)://`. */
+export function isSafeVideoUrl(url) {
+  if (typeof url !== "string") return false;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.includes("\\")) return false;
+  if (trimmed.startsWith("/media/")) {
+    const pathOnly = trimmed.split(/[?#]/, 1)[0];
+    const filename = pathOnly.slice("/media/".length);
+    return SAFE_MEDIA_FILE_RE.test(filename) && !filename.includes("..");
+  }
+  if (trimmed.startsWith("/web/") || trimmed.startsWith("/brand/")) {
+    return !trimmed.includes("..");
+  }
+  return isSafeExternalUrl(trimmed);
+}
+
+/** Pure: resolve a playable replay MP4 URL without embedding credentials in query parameters. */
+export function resolveVideoUrl(rawUrl) {
+  if (!isSafeVideoUrl(rawUrl)) return null;
+  const trimmed = rawUrl.trim();
+  if (trimmed.startsWith("/media/")) {
+    return trimmed.split(/[?#]/, 1)[0];
+  }
+  return trimmed;
+}
+
+function buildDownloadVideoUrl(videoUrl) {
+  if (!videoUrl) return "";
+  if (videoUrl.startsWith("/media/")) {
+    const pathOnly = videoUrl.split(/[?#]/, 1)[0];
+    return `${pathOnly}?download=1`;
+  }
+  return videoUrl;
 }
 
 /** Pure: resolve a committed preview path or URL to a safe image URL for the Pit Wall UI. */
@@ -152,6 +188,8 @@ export function normalizeBugOutcome(outcome, context = null) {
       : "";
   const baselinePreviewUrl = resolvePreviewUrl(item.baseline_preview_url ?? item.baseline_preview_path ?? "", context);
   const candidatePreviewUrl = resolvePreviewUrl(item.candidate_preview_url ?? item.candidate_preview_path ?? "", context);
+  const baselineVideoUrl = resolveVideoUrl(item.baseline_video_url ?? "");
+  const candidateVideoUrl = resolveVideoUrl(item.candidate_video_url ?? "");
   const baselineArtifactUrls = safeUrlList(item.baseline_artifact_urls);
   const candidateArtifactUrls = safeUrlList(item.candidate_artifact_urls);
   return {
@@ -160,8 +198,10 @@ export function normalizeBugOutcome(outcome, context = null) {
     caught, statusLabel, runUrl: isSafeExternalUrl(rawUrl) ? rawUrl : null,
     modality, modalityLabel, visualEvidenceSeen, visualSummary: rawSummary,
     baselinePreviewUrl, candidatePreviewUrl,
+    baselineVideoUrl, candidateVideoUrl,
     baselineArtifactUrls, candidateArtifactUrls,
     hasVisualPreview: Boolean(baselinePreviewUrl && candidatePreviewUrl),
+    hasVideoReplay: Boolean(baselineVideoUrl || candidateVideoUrl),
   };
 }
 
@@ -240,7 +280,7 @@ export function buildBugMatrixModel(evidence, context = null) {
   );
   const total = isNonNeg(evidence.bugs_total) && evidence.bugs_total >= rows.length ? evidence.bugs_total : rows.length;
   const caught = rows.length > 0 ? rows.filter((r) => r.caught).length : isNonNeg(evidence.bugs_caught) ? evidence.bugs_caught : 0;
-  const visualRows = rows.filter((r) => r.hasVisualPreview || r.visualSummary || r.modality);
+  const visualRows = rows.filter((r) => r.hasVisualPreview || r.hasVideoReplay || r.visualSummary || r.modality);
   return { hasEvidence: true, rows, total, caught, missed: Math.max(0, total - caught), visualRows };
 }
 
@@ -410,6 +450,36 @@ function renderVisualProofPanel(root, model) {
       card.append(makeEl(root, "p", "visual-proof__summary", row.visualSummary));
     }
 
+    if (row.hasVideoReplay) {
+      const videoGrid = makeEl(root, "div", "visual-proof__videos");
+      for (const [side, label, url] of [
+        ["baseline", "Baseline", row.baselineVideoUrl],
+        ["candidate", "Candidate", row.candidateVideoUrl],
+      ]) {
+        if (!url) continue;
+        const fig = makeEl(root, "figure", `visual-proof__frame visual-proof__frame--${side}`);
+        const captionRow = makeEl(root, "figcaption", "visual-proof__caption-row");
+        captionRow.append(
+          makeEl(root, "span", "visual-proof__caption telemetry", `${label} \u00b7 MP4`),
+          makeEl(root, "a", "bug-matrix__link telemetry", "Download MP4", {
+            href: buildDownloadVideoUrl(url),
+            download: "",
+            "aria-label": `Download ${label.toLowerCase()} MP4 recording for ${row.displayRef}`,
+          }),
+        );
+        const video = makeEl(root, "video", "visual-proof__video", "", {
+          src: url,
+          controls: "",
+          playsinline: "",
+          preload: "metadata",
+          "aria-label": `${label} MP4 failure recording for ${row.displayRef}`,
+        });
+        fig.append(captionRow, video);
+        videoGrid.append(fig);
+      }
+      card.append(videoGrid);
+    }
+
     if (row.hasVisualPreview) {
       const grid = makeEl(root, "div", "visual-proof__frames");
       for (const [side, label, url] of [
@@ -499,6 +569,8 @@ export function createTelemetryCenter(root, slot, store) {
   matrixPanel.append(matrixHeader, matrixHost);
   slot.replaceChildren(timingPanel, matrixPanel);
 
+  let lastMatrixSignature = null;
+
   const render = (state) => {
     const { candidateId, evidence, verdict } = resolveAttemptTelemetry(state);
     const candidates = Array.isArray(state?.records?.candidates) ? state.records.candidates : [];
@@ -525,23 +597,36 @@ export function createTelemetryCenter(root, slot, store) {
       chartHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
     }
 
+    const activeCandidateId = evidence?.candidate_id ?? candidateId ?? null;
     if (!matrix.hasEvidence) {
       matrixBadge.textContent = "Awaiting CI";
       matrixBadge.dataset.state = "pending";
       const msg = state?.mode === "demo" ? "Bug replay verification runs in the Fork CI stage." : "No bug replay outcomes recorded for this attempt yet.";
-      matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
+      const signature = JSON.stringify({ kind: "empty", candidateId: activeCandidateId, msg });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", msg));
+      }
     } else if (matrix.rows.length === 0) {
       matrixBadge.textContent = "0 bugs";
       matrixBadge.dataset.state = "pending";
-      matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", "No bug replay outcomes recorded."));
+      const signature = JSON.stringify({ kind: "zero", candidateId: activeCandidateId });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        matrixHost.replaceChildren(makeEl(root, "p", "telemetry-panel__empty", "No bug replay outcomes recorded."));
+      }
     } else {
       matrixBadge.textContent =
         matrix.missed > 0 ? `${matrix.caught}/${matrix.total} CAUGHT \u00b7 ${matrix.missed} MISSED` : `${matrix.caught}/${matrix.total} CAUGHT`;
       matrixBadge.dataset.state = matrix.missed > 0 ? "missed" : "caught";
-      const children = [renderBugTable(root, matrix)];
-      const visualPanel = renderVisualProofPanel(root, matrix);
-      if (visualPanel) children.push(visualPanel);
-      matrixHost.replaceChildren(...children);
+      const signature = JSON.stringify({ kind: "rows", candidateId: activeCandidateId, rows: matrix.rows });
+      if (signature !== lastMatrixSignature) {
+        lastMatrixSignature = signature;
+        const children = [renderBugTable(root, matrix)];
+        const visualPanel = renderVisualProofPanel(root, matrix);
+        if (visualPanel) children.push(visualPanel);
+        matrixHost.replaceChildren(...children);
+      }
     }
   };
 

@@ -1,18 +1,21 @@
 """Host-side GitHub boundary contract and ``httpx`` REST implementation.
 
-Defines ``WorkflowRunResult``, the ``GitHubClient``, ``CandidatePublisherClient``,
-and ``PullRequestClient`` protocols, and the concrete ``HttpxGitHubClient`` backed
-by GitHub's REST and Git Data APIs. Keeping the client and its bearer token
-strictly on the host allows the Dispatcher's orchestration, replay overlays,
-evidence collection, and compounding loop to be developed and tested completely
-offline without network calls or secrets.
+Defines ``WorkflowRunResult``, ``RunArtifact``, ``RunJob``, the ``GitHubClient``,
+``RunArtifactsClient``, ``CandidatePublisherClient``, and ``PullRequestClient`` protocols,
+and the concrete ``HttpxGitHubClient`` backed by GitHub's REST and Git Data APIs. Keeping
+the client and its bearer token strictly on the host allows the Dispatcher's orchestration,
+replay overlays, evidence collection, and compounding loop to be developed and tested
+completely offline without network calls or secrets.
 """
 
 import base64
+import io
+import json
 import os
 import re
 import time
-from collections.abc import Callable, Mapping
+import zipfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
@@ -38,9 +41,15 @@ _HTTP_UNPROCESSABLE = 422
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECT_HOPS = 3
 _ARTIFACTS_PER_PAGE = "100"
+_REPLAY_ARTIFACT_PREFIX = "pit-crew-replay-"
+_FALLBACK_RECORDING_PREFIX = "failure-recordings-"
+_REPLAY_META_FILENAME = "replay-meta.json"
+_MAX_META_BYTES = 64 * 1024
 _WORKFLOWS_PER_PAGE = "100"
 _WORKFLOWS_PREFIX = ".github/workflows/"
 _MATRIX_SUFFIX = re.compile(r"\s*\(.*\)$")
+_SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_TRAILING_INDEX_RE = re.compile(r"-\d+$")
 
 
 def _utc_now() -> datetime:
@@ -99,6 +108,16 @@ class RunArtifact:
     archive_download_url: str
     expired: bool
     created_at: str = ""
+
+
+@dataclass(frozen=True)
+class RunJob:
+    """Outcome metadata for one job inside a GitHub Actions workflow run."""
+
+    id: int
+    name: str
+    conclusion: str | None
+    workflow_name: str = ""
 
 
 @runtime_checkable
@@ -628,26 +647,195 @@ class HttpxGitHubClient:
         url = f"{self._base_url}/repos/{repo_path}/actions/artifacts/{artifact_id}/zip"
         return self._download_with_stripped_redirect(url, max_bytes=max_bytes)
 
-    def get_failed_job_logs(
+    def list_run_jobs(self, repo: str, run_id: int | str) -> list[RunJob]:
+        """Return every job belonging to workflow run ``run_id`` in ``repo``."""
+        repo_path = _repo_path(repo)
+        run_segment = quote(str(run_id).strip(), safe="")
+        data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{run_segment}/jobs",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        raw_jobs = data.get("jobs")
+        if not isinstance(raw_jobs, list):
+            return []
+        jobs: list[RunJob] = []
+        for job in raw_jobs:
+            if not isinstance(job, dict):
+                continue
+            jobs.append(
+                RunJob(
+                    id=_require_int(job, "id"),
+                    name=_require_str(job, "name"),
+                    conclusion=_optional_str(job, "conclusion"),
+                    workflow_name=_optional_str(job, "workflow_name") or "",
+                )
+            )
+        return jobs
+
+    def get_run_failure_output(
+        self,
+        repo: str,
+        run_id: str,
+        *,
+        check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
+    ) -> bytes:
+        """Download the replay recording artifact ZIP for workflow run ``run_id`` in ``repo``.
+
+        When ``check`` or ``expected_checks`` is provided, resolves the expected check against
+        the completed run's jobs (including matrix display names and ``check_aliases``), requires
+        a matching job to have failed, and selects only an unambiguous recording artifact for that
+        job (verifying ``replay-meta.json`` when present). Missing, non-matching, or ambiguous
+        recordings raise ``FileNotFoundError`` so verification fails closed.
+        """
+        repo_path = _repo_path(repo)
+        normalized_run_id = quote(run_id.strip(), safe="")
+        if not normalized_run_id:
+            msg = "Workflow run_id must not be empty."
+            raise ValueError(msg)
+
+        targets = _normalize_target_checks(check, expected_checks)
+        artifacts_data = self._request_json(
+            "GET",
+            f"/repos/{repo_path}/actions/runs/{normalized_run_id}/artifacts",
+            params={"per_page": _ARTIFACTS_PER_PAGE},
+        )
+        primary, fallback = _collect_replay_artifacts(artifacts_data)
+        if not primary and not fallback:
+            msg = f"No replay recording artifact found for {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+
+        if not targets:
+            artifact_id = _select_unambiguous_artifact_id(primary or fallback, repo=repo, run_id=run_id)
+            return self.download_artifact(repo, artifact_id)
+
+        jobs = self.list_run_jobs(repo, normalized_run_id)
+        failed_resolved = _resolve_failed_jobs_for_checks(jobs, targets, check_aliases)
+        if not failed_resolved:
+            msg = f"Expected check(s) {', '.join(targets)!r} did not fail in {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+
+        return self._download_matching_replay_artifact(
+            repo=repo,
+            run_id=run_id,
+            primary=primary,
+            fallback=fallback,
+            resolved_jobs=failed_resolved,
+            targets=targets,
+            check_aliases=check_aliases,
+        )
+
+    def _download_matching_replay_artifact(  # noqa: PLR0913
+        self,
+        *,
+        repo: str,
+        run_id: str,
+        primary: list[tuple[int, str]],
+        fallback: list[tuple[int, str]],
+        resolved_jobs: list[RunJob],
+        targets: list[str],
+        check_aliases: Sequence[str],
+    ) -> bytes:
+        matched_primary = _filter_artifacts_for_jobs(primary, resolved_jobs, targets, check_aliases)
+        matched_fallback = _filter_artifacts_for_jobs(fallback, resolved_jobs, targets, check_aliases)
+        if not matched_primary and not matched_fallback:
+            msg = f"No replay recording artifact matching {', '.join(targets)!r} found for {repo} run {run_id}."
+            raise FileNotFoundError(msg)
+
+        if matched_primary:
+            payload = self._resolve_artifact_pool(
+                repo=repo,
+                run_id=run_id,
+                matched=matched_primary,
+                resolved_jobs=resolved_jobs,
+                targets=targets,
+                check_aliases=check_aliases,
+                allow_mismatch_fallback=bool(matched_fallback),
+            )
+            if payload is not None:
+                return payload
+
+        payload = self._resolve_artifact_pool(
+            repo=repo,
+            run_id=run_id,
+            matched=matched_fallback,
+            resolved_jobs=resolved_jobs,
+            targets=targets,
+            check_aliases=check_aliases,
+            allow_mismatch_fallback=False,
+        )
+        assert payload is not None  # noqa: S101  allow_mismatch_fallback=False always returns or raises
+        return payload
+
+    def _resolve_artifact_pool(  # noqa: PLR0913
+        self,
+        *,
+        repo: str,
+        run_id: str,
+        matched: list[tuple[int, str]],
+        resolved_jobs: list[RunJob],
+        targets: list[str],
+        check_aliases: Sequence[str],
+        allow_mismatch_fallback: bool,
+    ) -> bytes | None:
+        # Deduplicate repeated uploads of the exact same artifact name by keeping the newest ID.
+        by_name = {name: artifact_id for artifact_id, name in matched}
+        if len(by_name) == 1:
+            payload = self.download_artifact(repo, next(iter(by_name.values())))
+            if not _zip_metadata_matches_jobs(payload, resolved_jobs, targets, check_aliases):
+                if allow_mismatch_fallback:
+                    return None
+                msg = f"Replay recording artifact metadata did not match {', '.join(targets)!r} in {repo} run {run_id}."
+                raise FileNotFoundError(msg)
+            return payload
+
+        # Multiple distinct artifact names matched (e.g. legacy matrix slugs without display names):
+        # disambiguate strictly via replay-meta.json, or fail closed as ambiguous.
+        verified_payloads: list[bytes] = []
+        for artifact_id in by_name.values():
+            payload = self.download_artifact(repo, artifact_id)
+            meta = _read_zip_replay_meta(payload)
+            if meta is not None and _meta_matches_resolved_jobs(meta, resolved_jobs):
+                verified_payloads.append(payload)
+        if len(verified_payloads) == 1:
+            return verified_payloads[0]
+        if not verified_payloads and allow_mismatch_fallback:
+            return None
+        msg = (
+            f"Ambiguous replay recording artifacts ({', '.join(sorted(by_name))}) "
+            f"for {', '.join(targets)!r} in {repo} run {run_id}."
+        )
+        raise FileNotFoundError(msg)
+
+    def get_failed_job_logs(  # noqa: PLR0913
         self,
         repo: str,
         run_id: int | str,
         *,
         check: str | None = None,
+        expected_checks: Sequence[str] = (),
+        check_aliases: Sequence[str] = (),
         max_bytes: int = DEFAULT_FAILED_LOG_MAX_BYTES,
     ) -> bytes:
         """Download logs for failed jobs in ``run_id`` (auth-stripped redirects), capped at ``max_bytes``."""
-        failed_jobs = self._list_failed_jobs(repo, run_id)
-        if not failed_jobs:
+        jobs = self.list_run_jobs(repo, run_id)
+        if not any(job.conclusion == "failure" for job in jobs):
             return b""
-        selected = _filter_jobs_for_check(failed_jobs, check)
+        targets = _normalize_target_checks(check, expected_checks)
+        selected = (
+            _resolve_failed_jobs_for_checks(jobs, targets, check_aliases)
+            if targets
+            else [job for job in jobs if job.conclusion == "failure"]
+        )
         repo_path = _repo_path(repo)
         sections: list[bytes] = []
-        for job_id, job_name in selected:
-            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job_id}/logs"
+        for job in selected:
+            url = f"{self._base_url}/repos/{repo_path}/actions/jobs/{job.id}/logs"
             raw_log = self._download_with_stripped_redirect(url, max_bytes=max_bytes, allow_not_found=True)
             if raw_log:
-                sections.append(f"=== {job_name} ===\n".encode() + raw_log)
+                sections.append(f"=== {job.name} ===\n".encode() + raw_log)
         combined = b"\n".join(sections)
         if len(combined) > max_bytes:
             return combined[-max_bytes:]
@@ -658,23 +846,7 @@ class HttpxGitHubClient:
         return [job_name for _, job_name in self._list_failed_jobs(repo, run_id)]
 
     def _list_failed_jobs(self, repo: str, run_id: int | str) -> list[tuple[int, str]]:
-        repo_path = _repo_path(repo)
-        run_segment = quote(str(run_id), safe="")
-        data = self._request_json(
-            "GET",
-            f"/repos/{repo_path}/actions/runs/{run_segment}/jobs",
-            params={"per_page": _ARTIFACTS_PER_PAGE},
-        )
-        raw_jobs = data.get("jobs")
-        if not isinstance(raw_jobs, list):
-            return []
-        failed: list[tuple[int, str]] = []
-        for job in raw_jobs:
-            if not isinstance(job, dict):
-                continue
-            if _optional_str(job, "conclusion") == "failure":
-                failed.append((_require_int(job, "id"), _require_str(job, "name")))
-        return failed
+        return [(job.id, job.name) for job in self.list_run_jobs(repo, run_id) if job.conclusion == "failure"]
 
     def _download_with_stripped_redirect(
         self,
@@ -844,6 +1016,210 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _normalize_target_checks(check: str | None, expected_checks: Sequence[str]) -> list[str]:
+    targets = [item.strip() for item in expected_checks if item.strip()]
+    if targets:
+        return list(dict.fromkeys(targets))
+    if check and check.strip():
+        return [check.strip()]
+    return []
+
+
+def _collect_replay_artifacts(
+    artifacts_data: Mapping[str, object],
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Return non-expired primary (``pit-crew-replay-*``) and fallback (``failure-recordings-*``) artifacts."""
+    raw_artifacts = artifacts_data.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return [], []
+    primary: list[tuple[int, str]] = []
+    fallback: list[tuple[int, str]] = []
+    for item in raw_artifacts:
+        if not isinstance(item, dict) or item.get("expired") is True:
+            continue
+        name = _optional_str(item, "name") or ""
+        artifact_id = item.get("id")
+        if not isinstance(artifact_id, int) or isinstance(artifact_id, bool):
+            continue
+        if name.startswith(_REPLAY_ARTIFACT_PREFIX):
+            primary.append((artifact_id, name))
+        elif name.startswith(_FALLBACK_RECORDING_PREFIX):
+            fallback.append((artifact_id, name))
+    return primary, fallback
+
+
+def _select_unambiguous_artifact_id(candidates: list[tuple[int, str]], *, repo: str, run_id: str) -> int:
+    by_name = {name: artifact_id for artifact_id, name in candidates}
+    if len(by_name) > 1:
+        msg = (
+            f"Ambiguous replay recording artifacts ({', '.join(sorted(by_name))}) "
+            f"for {repo} run {run_id}; specify an expected check."
+        )
+        raise FileNotFoundError(msg)
+    return next(iter(by_name.values()))
+
+
+def _resolve_failed_jobs_for_checks(
+    jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> list[RunJob]:
+    """Resolve each target/alias independently against ``jobs`` and return deduplicated failed matches.
+
+    Exact matches take precedence over folded matrix-parent matches per target so a passing
+    exact check never hides another expected check's failing matrix leg, while a specific
+    matrix leg that passed is never masked by another failing leg.
+    """
+    all_targets = [item.strip() for item in (*targets, *check_aliases) if item.strip()]
+    seen_ids: set[int] = set()
+    failed: list[RunJob] = []
+    for target in all_targets:
+        exact = [job for job in jobs if _job_matches_target(job, target, allow_fold=False)]
+        matched = exact or [job for job in jobs if _job_matches_target(job, target, allow_fold=True)]
+        for job in matched:
+            if job.conclusion == "failure" and job.id not in seen_ids:
+                seen_ids.add(job.id)
+                failed.append(job)
+    return failed
+
+
+def _job_matches_target(job: RunJob, target: str, *, allow_fold: bool) -> bool:
+    target_low = target.strip().lower()
+    job_low = job.name.strip().lower()
+    wf_low = job.workflow_name.strip().lower()
+    if _exact_job_match(target_low, job_low, wf_low):
+        return True
+    if not allow_fold or _MATRIX_SUFFIX.search(target_low):
+        return False
+    return _exact_job_match(target_low, _fold_job_name(job_low), wf_low)
+
+
+def _exact_job_match(target_low: str, job_low: str, wf_low: str) -> bool:
+    if target_low == job_low:
+        return True
+    if wf_low and target_low == f"{wf_low}/{job_low}":
+        return True
+    if target_low.endswith(f"/{job_low}"):
+        prefix = target_low[: -(len(job_low) + 1)].strip()
+        if prefix and prefix.count("(") == prefix.count(")") and (not wf_low or prefix == wf_low):
+            return True
+    return False
+
+
+def _strip_workflow_prefix(name: str) -> str:
+    stripped = name.strip()
+    match = _MATRIX_SUFFIX.search(stripped)
+    if match is None:
+        return stripped.rsplit("/", maxsplit=1)[-1].strip()
+    head = stripped[: match.start()]
+    suffix = stripped[match.start() :]
+    return f"{head.rsplit('/', maxsplit=1)[-1].strip()}{suffix}"
+
+
+def _filter_artifacts_for_jobs(
+    candidates: list[tuple[int, str]],
+    resolved_jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> list[tuple[int, str]]:
+    display_slugs = {_slugify(job.name) for job in resolved_jobs if _slugify(job.name)}
+    exact_matches = [item for item in candidates if _artifact_matches_slugs(item[1], display_slugs, exact_display=True)]
+    if exact_matches:
+        return exact_matches
+
+    alias_slugs = set(display_slugs)
+    for raw in (*targets, *check_aliases):
+        bare = _strip_workflow_prefix(raw)
+        slug = _slugify(bare)
+        if slug:
+            alias_slugs.add(slug)
+        if not _MATRIX_SUFFIX.search(bare):
+            folded_slug = _slugify(_fold_job_name(bare))
+            if folded_slug:
+                alias_slugs.add(folded_slug)
+    for job in resolved_jobs:
+        folded = _slugify(_fold_job_name(job.name))
+        if folded:
+            alias_slugs.add(folded)
+    return [item for item in candidates if _artifact_matches_slugs(item[1], alias_slugs, exact_display=False)]
+
+
+def _artifact_matches_slugs(artifact_name: str, slugs: set[str], *, exact_display: bool) -> bool:
+    body = _strip_artifact_envelope(artifact_name)
+    if not body:
+        return False
+    if body in slugs:
+        return True
+    if exact_display:
+        return any(body.endswith(f"-{slug}") for slug in slugs)
+    return any(body.startswith(f"{slug}-") or body.endswith(f"-{slug}") for slug in slugs)
+
+
+def _strip_artifact_envelope(artifact_name: str) -> str:
+    lower = artifact_name.lower()
+    if lower.startswith(_REPLAY_ARTIFACT_PREFIX):
+        stem = lower.removeprefix(_REPLAY_ARTIFACT_PREFIX)
+    elif lower.startswith(_FALLBACK_RECORDING_PREFIX):
+        stem = lower.removeprefix(_FALLBACK_RECORDING_PREFIX)
+    else:
+        return ""
+    return _TRAILING_INDEX_RE.sub("", stem).strip("-")
+
+
+def _slugify(value: str) -> str:
+    return _SAFE_SLUG_RE.sub("-", value.strip().lower()).strip("-")[:80].strip("-")
+
+
+def _read_zip_replay_meta(payload: bytes) -> dict[str, str] | None:
+    if not payload.startswith(b"PK\x03\x04"):
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.rsplit("/", maxsplit=1)[-1].lower() != _REPLAY_META_FILENAME:
+                    continue
+                if info.file_size > _MAX_META_BYTES:
+                    return None
+                parsed = json.loads(archive.read(info.filename).decode("utf-8"))
+                if isinstance(parsed, dict):
+                    return {str(k): str(v) for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
+    except (zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return None
+    return None
+
+
+def _meta_matches_resolved_jobs(meta: Mapping[str, str], resolved_jobs: Sequence[RunJob]) -> bool:
+    meta_name = meta.get("job_name", "").strip().lower()
+    meta_wf = meta.get("workflow", "").strip().lower()
+    if not meta_name:
+        return False
+    for job in resolved_jobs:
+        if job.name.strip().lower() == meta_name and (
+            not meta_wf or not job.workflow_name or job.workflow_name.strip().lower() == meta_wf
+        ):
+            return True
+    return False
+
+
+def _zip_metadata_matches_jobs(
+    payload: bytes,
+    resolved_jobs: Sequence[RunJob],
+    targets: Sequence[str],
+    check_aliases: Sequence[str],
+) -> bool:
+    meta = _read_zip_replay_meta(payload)
+    if meta is None:
+        return True
+    if _meta_matches_resolved_jobs(meta, resolved_jobs):
+        return True
+    meta_name = meta.get("job_name", "").strip()
+    meta_wf = meta.get("workflow", "").strip()
+    if not meta_name:
+        return True
+    probe = RunJob(id=0, name=meta_name, conclusion="failure", workflow_name=meta_wf)
+    return bool(_resolve_failed_jobs_for_checks([probe], targets, check_aliases))
+
+
 def _require_http_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -851,13 +1227,19 @@ def _require_http_url(url: str) -> None:
         raise ValueError(msg)
 
 
-def _filter_jobs_for_check(failed_jobs: list[tuple[int, str]], check: str | None) -> list[tuple[int, str]]:
-    if not check or not check.strip():
+def _filter_jobs_for_check(
+    failed_jobs: list[tuple[int, str]],
+    check: str | None,
+    *,
+    expected_checks: Sequence[str] = (),
+    check_aliases: Sequence[str] = (),
+) -> list[tuple[int, str]]:
+    targets = _normalize_target_checks(check, expected_checks)
+    if not targets:
         return failed_jobs
-    target = _fold_job_name(check)
-    short_target = target.rsplit("/", maxsplit=1)[-1].strip()
-    matched = [(job_id, name) for job_id, name in failed_jobs if _fold_job_name(name) in {target, short_target}]
-    return matched or failed_jobs
+    run_jobs = [RunJob(id=job_id, name=name, conclusion="failure") for job_id, name in failed_jobs]
+    matched = _resolve_failed_jobs_for_checks(run_jobs, targets, check_aliases)
+    return [(job.id, job.name) for job in matched]
 
 
 def _fold_job_name(name: str) -> str:

@@ -34,6 +34,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src" \
     PYTHONUNBUFFERED=1 \
     PIT_CREW_LEDGER_PATH="/data/ledger.db" \
+    PIT_CREW_MEDIA_DIR="/data/media" \
     PIT_CREW_BRAND_DIR="/app/brand"
 
 USER pitcrew

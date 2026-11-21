@@ -84,6 +84,168 @@ def test_record_keeps_the_checks_exit_code_and_output(tmp_path: Path) -> None:
     assert b"expected 3, got 2" in echo.getvalue()  # still streams to the job log
 
 
+def test_record_scrubs_chunk_split_and_late_add_mask_secrets_from_cast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cast = tmp_path / "secret.cast"
+    echo = io.BytesIO()
+    monkeypatch.setenv("CUSTOM_API_TOKEN", "env-tok-secret-999")
+    monkeypatch.setenv("ALL_SECRETS_JSON", json.dumps({"nested": "json-secret-888"}))
+    monkeypatch.setenv(record.SECRET_ENV_VARS_KEY, "ALL_SECRETS_JSON")
+    script = (
+        "import sys, time\n"
+        "sys.stdout.write('before=late-secret-777 split=env-tok-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-999 json=json-secret-888\\n'); sys.stdout.flush()\n"
+        "sys.stdout.write('::add-mask::late-sec'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('ret-777\\n'); sys.stdout.flush()\n"
+        "raise SystemExit(1)\n"
+    )
+    assert record.record([sys.executable, "-c", script], cast, echo) == 1
+    _, *events = [json.loads(line) for line in cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    for secret in ("env-tok-secret-999", "json-secret-888", "late-secret-777", "ret-777"):
+        assert secret not in recorded
+    assert "before=***" in recorded
+    assert "split=***" in recorded
+    assert "json=***" in recorded
+    assert "::add-mask::***" in recorded
+    # Raw output still echoed to stdout for GitHub Actions runner processing.
+    assert b"::add-mask::late-secret-777" in echo.getvalue()
+
+
+def test_record_persists_masks_file_across_steps_with_private_permissions(tmp_path: Path) -> None:
+    masks_file = tmp_path / "masks" / "job.masks"
+    step1_cast = tmp_path / "step1.cast"
+    step2_cast = tmp_path / "step2.cast"
+    step1 = (
+        "import sys, time\n"
+        "sys.stdout.write('::add-mask::cross-step-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-42\\n'); sys.stdout.flush()\n"
+    )
+    step2 = (
+        "import sys, time\n"
+        "sys.stdout.write('caf\\xe9 leaked=cross-step-'); sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('secret-42\\n'); sys.stdout.flush()\n"
+        "raise SystemExit(2)\n"
+    )
+    assert record.record([sys.executable, "-c", step1], step1_cast, io.BytesIO(), masks_file=masks_file) == 0
+    assert masks_file.is_file()
+    assert (masks_file.stat().st_mode & 0o777) == 0o600
+    assert (masks_file.parent.stat().st_mode & 0o777) == 0o700
+    # Masks file stores only salted HMAC-SHA256 digests, never plaintext secrets.
+    masks_raw = masks_file.read_text(encoding="utf-8")
+    assert "cross-step-secret-42" not in masks_raw
+    assert '"salt"' in masks_raw
+
+    assert (
+        record.main(
+            [
+                "--cast",
+                str(step2_cast),
+                "--masks-file",
+                str(masks_file),
+                "--",
+                sys.executable,
+                "-c",
+                step2,
+            ]
+        )
+        == 2
+    )
+    _, *events = [json.loads(line) for line in step2_cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    assert "cross-step-secret-42" not in recorded
+    assert "caf\xe9 leaked=***" in recorded
+
+
+def test_record_preserves_short_trivial_large_and_many_explicit_masks_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    masks_file = tmp_path / "masks" / "job.masks"
+    large_secret = "PEM-" + ("Z" * 5000) + "-END"
+
+    # 1. Short (<4 chars), trivial ("true"), >4 KiB, and >256 explicit masks all survive into Step 2.
+    monkeypatch.setenv("LARGE_EXPLICIT", large_secret)
+    monkeypatch.setenv(record.SECRET_ENV_VARS_KEY, "LARGE_EXPLICIT")
+    step1_script = (
+        "print('::add-mask::q9')\n"
+        "print('::add-mask::true')\n"
+        "for i in range(270):\n"
+        "    print(f'::add-mask::many-secret-{i:03d}')\n"
+    )
+    assert (
+        record.record([sys.executable, "-c", step1_script], tmp_path / "s1.cast", io.BytesIO(), masks_file=masks_file)
+        == 0
+    )
+    raw_masks = masks_file.read_text(encoding="utf-8")
+    for leaked in ("q9", "many-secret-269", large_secret):
+        assert leaked not in raw_masks
+
+    monkeypatch.delenv("LARGE_EXPLICIT", raising=False)
+    monkeypatch.delenv(record.SECRET_ENV_VARS_KEY, raising=False)
+    step2_cast = tmp_path / "s2.cast"
+    step2_script = f"print('short=q9 flag=true tail=many-secret-269 big={large_secret}')\nraise SystemExit(3)\n"
+    assert record.record([sys.executable, "-c", step2_script], step2_cast, io.BytesIO(), masks_file=masks_file) == 3
+    _, *events = [json.loads(line) for line in step2_cast.read_text(encoding="utf-8").splitlines()]
+    recorded = "".join(text for _, kind, text in events if kind == "o")
+    assert "q9" not in recorded
+    assert "true" not in recorded
+    assert "many-secret-269" not in recorded
+    assert large_secret not in recorded
+    assert "short=*** flag=*** tail=*** big=***" in recorded
+
+    # 2. Verbose output exceeding exact hash scan budget fails closed: deletes .cast and skips video rendering.
+    rendered: list[str] = []
+    monkeypatch.setattr(record, "render_video", lambda c, v: rendered.append(f"{c}->{v}"))
+    monkeypatch.setattr(record, "_MAX_HASH_WINDOW_CHECKS", 50)
+    verbose_cast = tmp_path / "verbose.cast"
+    verbose_video = tmp_path / "verbose.mp4"
+    code = record.main(
+        [
+            "--cast",
+            str(verbose_cast),
+            "--video",
+            str(verbose_video),
+            "--masks-file",
+            str(masks_file),
+            "--",
+            sys.executable,
+            "-c",
+            "print('x' * 200 + 'many-secret-269'); raise SystemExit(4)",
+        ]
+    )
+    assert code == 4
+    assert not verbose_cast.exists()
+    assert rendered == []
+    assert "redaction incomplete" in capsys.readouterr().err
+
+    # 3. Corrupted masks file also fails closed without producing .cast or .mp4.
+    monkeypatch.setattr(record, "_MAX_HASH_WINDOW_CHECKS", 5_000_000)
+    masks_file.write_text("not-valid-json\n", encoding="utf-8")
+    corrupt_cast = tmp_path / "corrupt.cast"
+    corrupt_code = record.main(
+        [
+            "--cast",
+            str(corrupt_cast),
+            "--video",
+            str(tmp_path / "corrupt.mp4"),
+            "--masks-file",
+            str(masks_file),
+            "--",
+            sys.executable,
+            "-c",
+            "print('secret'); raise SystemExit(5)",
+        ]
+    )
+    assert corrupt_code == 5
+    assert not corrupt_cast.exists()
+    assert rendered == []
+
+
 def test_record_reports_death_by_signal_like_a_shell(tmp_path: Path) -> None:
     script = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
     assert record.record([sys.executable, "-c", script], tmp_path / "r.cast", io.BytesIO()) == 128 + 15
@@ -215,6 +377,21 @@ def test_record_cli_renders_the_video_after_the_check(monkeypatch: pytest.Monkey
     monkeypatch.setattr(record, "record", lambda *_: 1)
     monkeypatch.setattr(subprocess, "run", lambda command, **_: ran.append(command))
     assert record.main(["--cast", "r.cast", "--video", "r.mp4", "--", "false"]) == 1
+    assert [command[0] for command in ran] == ["agg", "ffmpeg"]
+
+
+def test_record_cli_video_on_failure_skips_passing_steps_and_renders_failing_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ran: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", lambda command, **_: ran.append(command))
+
+    monkeypatch.setattr(record, "record", lambda *_: 0)
+    assert record.main(["--cast", "r.cast", "--video", "r.mp4", "--video-on-failure", "--", "true"]) == 0
+    assert ran == []
+
+    monkeypatch.setattr(record, "record", lambda *_: 2)
+    assert record.main(["--cast", "r.cast", "--video", "r.mp4", "--video-on-failure", "--", "false"]) == 2
     assert [command[0] for command in ran] == ["agg", "ffmpeg"]
 
 

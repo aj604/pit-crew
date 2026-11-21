@@ -1,6 +1,8 @@
+import io
 import json
 import threading
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from functools import partial
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any, override
 
 import pytest
+import yaml
 
 from pit_crew import managed_agent, tools
 from pit_crew import workspace as host_workspace
@@ -18,6 +21,7 @@ from pit_crew.dispatcher import (
     Dispatcher,
     DispatcherConfig,
     LaneRunner,
+    build_multimodal_verifier,
     format_pr_body,
     format_pr_title,
     next_lane,
@@ -26,7 +30,13 @@ from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.lanes.analysis import history as analysis_history
 from pit_crew.lanes.proof.miner import JobRun
 from pit_crew.ledger import InMemoryLedger, Ledger
-from pit_crew.proof_bridge import ProofBridge, ProofBridgeError
+from pit_crew.proof_bridge import (
+    RECORD_SCRIPT_PATH,
+    REPLAY_ARTIFACT_PREFIX,
+    REPLAY_RECORD_ENV,
+    ProofBridge,
+    ProofBridgeError,
+)
 from pit_crew.rater import rate
 from pit_crew.run_tracker import RunTracker
 from pit_crew.run_tracker import WorkflowRunResult as TrackedRunResult
@@ -3172,6 +3182,621 @@ def test_collect_evidence_rejects_proof_mutation_targeting_disallowed_paths(bad_
     assert github.dispatches == []
 
 
+class _RecordingProofGitHub(_FakeGitHubClient):
+    """Fake GitHub client that also serves recorded replay failure outputs for multimodal verification."""
+
+    def __init__(
+        self,
+        default_shas: dict[str, str],
+        run_scripts: dict[int, list[WorkflowRunResult]] | None = None,
+        *,
+        file_contents: dict[tuple[str, str, str], str] | None = None,
+        run_outputs: dict[tuple[str, str], bytes | Exception] | None = None,
+    ) -> None:
+        super().__init__(default_shas, run_scripts=run_scripts, file_contents=file_contents)
+        self._run_outputs = dict(run_outputs or {})
+        self.failure_output_requests: list[tuple[str, str]] = []
+
+    def get_run_failure_output(self, repo: str, run_id: str) -> bytes:
+        self.failure_output_requests.append((repo, run_id))
+        result = self._run_outputs[(repo, run_id)]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+@dataclass(frozen=True)
+class _FakeMultimodalReply:
+    text: str | None
+
+
+class _QueuedModelsClient:
+    def __init__(self, replies: list[str | Exception]) -> None:
+        self._replies = list(replies)
+        self.calls: list[dict[str, object]] = []
+
+    @property
+    def models(self) -> "_QueuedModelsClient":
+        return self
+
+    def generate_content(self, **kwargs: object) -> _FakeMultimodalReply:
+        self.calls.append(kwargs)
+        reply = self._replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return _FakeMultimodalReply(text=reply)
+
+
+def _replay_zip(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+_BASE_CI_YAML = """\
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pytest
+        run: pytest -q
+"""
+
+_CAND_CI_YAML = """\
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pytest
+        run: pytest -q -n auto
+"""
+
+
+def _assert_recorded_replay_commits(replay_commits: list[dict[str, object]]) -> None:
+    assert [c["branch"] for c in replay_commits] == [
+        "pc/replay-cand-mm-keep-0-base",
+        "pc/replay-cand-mm-keep-0-cand",
+        "pc/replay-cand-mm-keep-1-base",
+        "pc/replay-cand-mm-keep-1-cand",
+    ]
+    for commit in replay_commits:
+        files = commit["files"]
+        assert isinstance(files, dict)
+        assert RECORD_SCRIPT_PATH in files
+        wf = yaml.safe_load(files[".github/workflows/ci.yml"])
+        assert wf["env"][REPLAY_RECORD_ENV] == "1"
+        steps = wf["jobs"]["test"]["steps"]
+        assert any("agg" in str(s.get("run", "")) and "ffmpeg" in str(s.get("run", "")) for s in steps)
+        assert any(RECORD_SCRIPT_PATH in str(s.get("run", "")) for s in steps)
+        assert any(REPLAY_ARTIFACT_PREFIX in str(s.get("with", {}).get("name", "")) for s in steps)
+
+    # Candidate replay branches keep candidate command; baseline branches keep baseline command.
+    assert "pytest -q -n auto" not in replay_commits[0]["files"][".github/workflows/ci.yml"]  # type: ignore[index]
+    assert "pytest -q -n auto" in replay_commits[1]["files"][".github/workflows/ci.yml"]  # type: ignore[index]
+    assert "pytest -q -n auto" not in replay_commits[2]["files"][".github/workflows/ci.yml"]  # type: ignore[index]
+    assert "pytest -q -n auto" in replay_commits[3]["files"][".github/workflows/ci.yml"]  # type: ignore[index]
+
+
+def test_dispatcher_records_replays_and_wires_multimodal_verification_into_evidence_and_verdict() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        repo="org/repo",
+        description="Parallelize pytest with xdist",
+        skill="shard-by-timing",
+        expected_savings_seconds=50.0,
+        workflow_path=".github/workflows/ci.yml",
+    )
+    cand = Candidate(
+        id="cand-mm-keep",
+        hypothesis_id=hyp.id,
+        branch="pc/xdist",
+        summary="Enable pytest-xdist",
+        repo="org/repo",
+        base_sha="base-sha-0",
+        files={".github/workflows/ci.yml": _CAND_CI_YAML},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            BugCase(
+                kind="commit",
+                commit_sha="deadbeef01",
+                reason="regression commit",
+                expected_checks=("CI/Unit Tests",),
+            ),
+            BugCase(
+                kind="mutation",
+                mutated_files={"src/calc.py": "def add(a, b): return a - b\n"},
+                reason="flip plus to minus",
+                expected_checks=("CI/Unit Tests",),
+            ),
+        ),
+    )
+
+    run_scripts = _timing_run_scripts()
+    for rid in (11, 12, 13, 14):
+        run_scripts[rid] = [_make_run(rid, conclusion="failure", duration_seconds=12.0)]
+
+    github = _RecordingProofGitHub(
+        {"org/repo": "base-sha-0"},
+        run_scripts=run_scripts,
+        file_contents={
+            ("org/repo", "base-sha-0", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+            ("org/repo", "deadbeef01", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+        },
+        run_outputs={
+            ("org/repo", "11"): _replay_zip({"step-1.cast": b"{}\n", "step-1.mp4": b"commit-base-mp4"}),
+            ("org/repo", "12"): _replay_zip({"step-1.cast": b"{}\n", "step-1.mp4": b"commit-cand-mp4"}),
+            ("org/repo", "13"): _replay_zip({"step-1.cast": b"{}\n", "step-1.mp4": b"mut-base-mp4"}),
+            ("org/repo", "14"): _replay_zip({"step-1.cast": b"{}\n", "step-1.mp4": b"mut-cand-mp4"}),
+        },
+    )
+    fake_client = _QueuedModelsClient(
+        [
+            json.dumps(
+                {
+                    "same": True,
+                    "baseline_failure": "AssertionError in test_auth",
+                    "candidate_failure": "AssertionError in test_auth",
+                    "reason": "Identical assertion in test_auth.",
+                }
+            ),
+            json.dumps(
+                {
+                    "same": True,
+                    "baseline_failure": "AssertionError: add(1, 2) == -1",
+                    "candidate_failure": "AssertionError: add(1, 2) == -1",
+                    "reason": "Identical mutation assertion failure.",
+                }
+            ),
+        ]
+    )
+    verifier = build_multimodal_verifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=runner,
+        config=DispatcherConfig(timing_pairs=5),
+        replay_verifier=verifier,
+    )
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is True
+    assert len(fake_client.calls) == 2
+    assert all(call["model"] == "gemini-4-carbon" for call in fake_client.calls)
+    assert github.failure_output_requests == [
+        ("org/repo", "11"),
+        ("org/repo", "12"),
+        ("org/repo", "13"),
+        ("org/repo", "14"),
+    ]
+
+    # Candidate branch commit (timing) MUST NOT contain record.py or replay instrumentation.
+    published_files = github.commits[0]["files"]
+    assert github.commits[0]["branch"] == "pc/xdist"
+    assert isinstance(published_files, dict)
+    assert RECORD_SCRIPT_PATH not in published_files
+    assert REPLAY_RECORD_ENV not in published_files[".github/workflows/ci.yml"]
+
+    _assert_recorded_replay_commits(github.commits[1:])
+
+    # Evidence carries tally() counts and Replay.as_outcome() fields alongside Dispatcher metadata.
+    evidence = ledger.all(Evidence)[0]
+    assert (evidence.bugs_total, evidence.bugs_caught) == (2, 2)
+    first, second = evidence.bug_outcomes
+    assert first == {
+        "sha": "deadbeef01",
+        "check": "CI/Unit Tests",
+        "status": "caught",
+        "baseline_failed": True,
+        "candidate_failed": True,
+        "baseline_video": "11",
+        "candidate_video": "12",
+        "same_failure": True,
+        "seen": "Identical assertion in test_auth.",
+        "modality": "",
+        "visual_evidence_seen": False,
+        "visual_summary": "",
+        "baseline_artifact_urls": [],
+        "candidate_artifact_urls": [],
+        "baseline_preview_path": "",
+        "candidate_preview_path": "",
+        "baseline_video_url": "",
+        "candidate_video_url": "",
+        "kind": "commit",
+        "ref": "deadbeef01",
+        "caught": True,
+        "run_url": "https://github.com/org/repo/actions/runs/12",
+    }
+    assert (second["sha"], second["status"], second["same_failure"], second["kind"], second["ref"]) == (
+        "mutation-1",
+        "caught",
+        True,
+        "mutation",
+        "flip plus to minus",
+    )
+    # Ephemeral baseline and replay branches are all deleted; only the published candidate branch remains.
+    assert github.branches == {("org/repo", "pc/xdist"): "commit-1"}
+    assert len(github.pull_requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("cand_zip", "reply", "expected_status"),
+    [
+        (
+            _replay_zip({"step-1.mp4": b"cand-setup-crash-mp4"}),
+            json.dumps(
+                {
+                    "same": False,
+                    "baseline_failure": "AssertionError in test_auth",
+                    "candidate_failure": "ModuleNotFoundError: pytest",
+                    "reason": "Candidate crashed during install instead of catching the bug.",
+                }
+            ),
+            "different failure",
+        ),
+        (
+            # Runner lacked agg/ffmpeg -> only .cast uploaded -> fail closed as unverified.
+            _replay_zip({"step-1.cast": b'{"version":2}\n'}),
+            json.dumps(
+                {
+                    "same": True,
+                    "baseline_failure": "unused",
+                    "candidate_failure": "unused",
+                    "reason": "unused",
+                }
+            ),
+            "unverified",
+        ),
+    ],
+)
+def test_dispatcher_fails_closed_on_different_failure_or_missing_replay_video(
+    cand_zip: bytes,
+    reply: str,
+    expected_status: str,
+) -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(repo="org/repo", description="Cache deps", skill="dep-cache", expected_savings_seconds=50.0)
+    cand = Candidate(
+        id="cand-fail-closed",
+        hypothesis_id=hyp.id,
+        branch="pc/cache",
+        summary="Cache deps",
+        repo="org/repo",
+        base_sha="base-sha",
+        files={".github/workflows/ci.yml": _CAND_CI_YAML},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bad0001", expected_checks=("CI/Unit Tests",)),),
+    )
+    run_scripts = _timing_run_scripts()
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=10.0)]
+    run_scripts[12] = [_make_run(12, conclusion="failure", duration_seconds=10.0)]
+
+    github = _RecordingProofGitHub(
+        {"org/repo": "base-sha"},
+        run_scripts=run_scripts,
+        file_contents={
+            ("org/repo", "base-sha", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+            ("org/repo", "bad0001", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+        },
+        run_outputs={
+            ("org/repo", "11"): _replay_zip({"step-1.mp4": b"base-mp4"}),
+            ("org/repo", "12"): cand_zip,
+        },
+    )
+    fake_client = _QueuedModelsClient([reply])
+    verifier = build_multimodal_verifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    runner = _RecordingLaneRunner(
+        {
+            "analysis": lambda active, _t, _r: active.add(hyp),
+            "optimizer": lambda active, _t, _r: active.add(cand),
+            "proof": lambda active, _t, _r: active.add(plan),
+        }
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=runner,
+        config=DispatcherConfig(timing_pairs=5),
+        replay_verifier=verifier,
+    )
+
+    verdict = dispatcher.run_cycle("org/repo")
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.reason == "caught 0/1 bugs"
+    assert github.pull_requests == []
+    ev = ledger.all(Evidence)[0]
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 0
+    assert ev.bug_outcomes[0]["status"] == expected_status
+    assert ev.bug_outcomes[0]["caught"] is False
+
+
+def test_dispatcher_multimodal_handles_duds_conflicts_and_record_only_mode() -> None:
+    base_cfg = "[tool.pytest]\naddopts = '-q'\n"
+    cand_cfg = "[tool.pytest]\naddopts = '-q -n auto'\n"
+    conflict_cfg = "[tool.pytest]\naddopts = '-v --tb=short'\n"
+
+    cand = Candidate(
+        id="cand-mix",
+        hypothesis_id="h1",
+        branch="pc/mix",
+        summary="Update pytest config",
+        repo="org/repo",
+        base_sha="base-sha",
+        files={"pyproject.toml": cand_cfg},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            # Case 0: dud commit (baseline succeeds -> skipped candidate, status="not a bug").
+            BugCase(kind="commit", commit_sha="dud-commit", expected_checks=("CI/Unit Tests",)),
+            # Case 1: commit with 3-way conflict -> inconclusive, preserved in slot 1.
+            BugCase(kind="commit", commit_sha="conflict-commit", expected_checks=("CI/Unit Tests",)),
+            # Case 2: dud mutation (baseline succeeds -> status="not a bug").
+            BugCase(kind="mutation", mutated_files={"src/noop.py": "x = 1\n"}, reason="dud mut"),
+            # Case 3: real commit caught by both sides & confirmed by Gemini.
+            BugCase(kind="commit", commit_sha="real-bug", expected_checks=("CI/Unit Tests",)),
+        ),
+    )
+
+    run_scripts = {
+        1: [_make_run(1, conclusion="success", duration_seconds=8.0)],  # dud-commit base
+        2: [_make_run(2, conclusion="success", duration_seconds=8.0)],  # dud-mut base
+        3: [_make_run(3, conclusion="failure", duration_seconds=9.0)],  # real-bug base
+        4: [_make_run(4, conclusion="failure", duration_seconds=7.0)],  # real-bug cand
+    }
+    github = _RecordingProofGitHub(
+        {"org/repo": "base-sha"},
+        run_scripts=run_scripts,
+        file_contents={
+            ("org/repo", "base-sha", "pyproject.toml"): base_cfg,
+            ("org/repo", "dud-commit", "pyproject.toml"): base_cfg,
+            ("org/repo", "conflict-commit", "pyproject.toml"): conflict_cfg,
+            ("org/repo", "real-bug", "pyproject.toml"): base_cfg,
+            ("org/repo", "base-sha", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+            ("org/repo", "dud-commit", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+            ("org/repo", "real-bug", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+        },
+        run_outputs={
+            ("org/repo", "3"): _replay_zip({"step-1.mp4": b"b-mp4"}),
+            ("org/repo", "4"): _replay_zip({"step-1.mp4": b"c-mp4"}),
+        },
+    )
+    fake_client = _QueuedModelsClient(
+        [json.dumps({"same": True, "baseline_failure": "err", "candidate_failure": "err", "reason": "same"})]
+    )
+    verifier = build_multimodal_verifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+        replay_verifier=verifier,
+    )
+
+    ev = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert [o.get("status") for o in ev.bug_outcomes] == ["not a bug", None, "not a bug", "caught"]
+    assert ev.bug_outcomes[1]["inconclusive"] is True
+    assert ev.bug_outcomes[3]["same_failure"] is True
+    assert len(fake_client.calls) == 1
+
+    # All-inconclusive plan with verifier returns 0/0 without invoking verifier.
+    only_conflict = ReplayPlan(candidate_id=cand.id, cases=(BugCase(kind="commit", commit_sha="conflict-commit"),))
+    ev_conflict = dispatcher.collect_evidence(cand, only_conflict, "base-sha", workflow="ci.yml")
+    assert ev_conflict.bugs_total == 0
+    assert ev_conflict.bugs_caught == 0
+    assert ev_conflict.bug_outcomes[0]["inconclusive"] is True
+
+    # record_replays=True without replay_verifier still runs paired commit replays and instruments record.py.
+    gh_rec = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={
+            1: [_make_run(1, conclusion="failure", duration_seconds=9.0)],
+            2: [_make_run(2, conclusion="failure", duration_seconds=7.0)],
+        },
+        file_contents={
+            ("org/repo", "base-sha", "pyproject.toml"): base_cfg,
+            ("org/repo", "real-bug", "pyproject.toml"): base_cfg,
+            ("org/repo", "real-bug", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+        },
+    )
+    rec_only = Dispatcher(
+        InMemoryLedger(),
+        gh_rec,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+        record_replays=True,
+    )
+    ev_rec = rec_only.collect_evidence(
+        cand,
+        ReplayPlan(candidate_id=cand.id, cases=(BugCase(kind="commit", commit_sha="real-bug"),)),
+        "base-sha",
+        workflow="ci.yml",
+    )
+    assert ev_rec.bugs_total == 1
+    assert ev_rec.bugs_caught == 1
+    assert all(RECORD_SCRIPT_PATH in c["files"] for c in gh_rec.commits)  # type: ignore[operator]
+
+
+def test_build_multimodal_verifier_lazily_resolves_managed_agent_ask_multimodal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def fake_ask(model: str, parts: list[tuple[str, str | bytes]], schema: dict[str, object]) -> str:
+        del schema
+        calls.append((model, len(parts)))
+        return json.dumps({"same": True, "baseline_failure": "err", "candidate_failure": "err", "reason": "ok"})
+
+    monkeypatch.setattr(managed_agent, "ask_multimodal", fake_ask)
+    github = _RecordingProofGitHub(
+        {"org/repo": "base-sha"},
+        run_scripts={
+            1: [_make_run(1, conclusion="failure", duration_seconds=5.0)],
+            2: [_make_run(2, conclusion="failure", duration_seconds=5.0)],
+        },
+        run_outputs={("org/repo", "1"): b"base-mp4", ("org/repo", "2"): b"cand-mp4"},
+    )
+    verifier = build_multimodal_verifier(github)
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+        replay_verifier=verifier,
+        record_replays=False,
+    )
+    cand = Candidate(id="cand-lazy", hypothesis_id="h1", branch="pc/lazy", summary="lazy", repo="org/repo")
+    ev = dispatcher.collect_evidence(
+        cand,
+        ReplayPlan(candidate_id=cand.id, cases=(BugCase(kind="commit", commit_sha="abc123"),)),
+        "base-sha",
+        workflow="ci.yml",
+    )
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert calls == [("gemini-4-carbon", 7)]
+
+
+def test_format_pr_body_renders_replay_as_outcome_statuses() -> None:
+    hyp = Hypothesis(repo="org/repo", description="Speed up CI", skill="dep-cache", expected_savings_seconds=30.0)
+    cand = Candidate(id="cand-fmt", hypothesis_id=hyp.id, branch="pc/fmt", summary="Cache deps", repo="org/repo")
+    verdict = Verdict(
+        candidate_id=cand.id,
+        keep=False,
+        speedup=1.5,
+        p_value=0.01,
+        reason="caught 1/3 bugs",
+        median_seconds=40.0,
+        p95_seconds=45.0,
+        sla_met=True,
+    )
+    ev = Evidence(
+        candidate_id=cand.id,
+        baseline_seconds=(60.0,) * 5,
+        candidate_seconds=(40.0,) * 5,
+        bugs_total=3,
+        bugs_caught=1,
+        bug_outcomes=(
+            {"sha": "aaa1111", "status": "caught", "baseline_failed": True, "run_url": "https://ex/1"},
+            {"kind": "commit", "ref": "bbb2222", "status": "different failure", "baseline_failed": True},
+            {"kind": "mutation", "ref": "mut-1", "status": "unverified", "baseline_failed": True},
+            {"kind": "commit", "ref": "ccc3333", "status": "not a bug", "baseline_failed": False},
+        ),
+    )
+    body = format_pr_body(hyp, cand, ev, verdict)
+    assert "|  | `aaa1111` | Yes | Yes | [View run](https://ex/1) |" in body
+    assert "| commit | `bbb2222` | Yes | No (different failure) | - |" in body
+    assert "| mutation | `mut-1` | Yes | No (unverified) | - |" in body
+    assert "| commit | `ccc3333` | No | Excluded (dud) | - |" in body
+
+
+def test_dispatcher_propagates_expected_checks_and_aliases_and_rejects_unrelated_job_failure() -> None:
+    class _JobScopedGitHub(_RecordingProofGitHub):
+        def __init__(self) -> None:
+            super().__init__(
+                {"org/repo": "base-sha"},
+                run_scripts={
+                    1: [_make_run(1, conclusion="failure", duration_seconds=6.0)],
+                    2: [_make_run(2, conclusion="failure", duration_seconds=6.0)],
+                },
+                file_contents={
+                    ("org/repo", "base-sha", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+                    ("org/repo", "bug1234", ".github/workflows/ci.yml"): _BASE_CI_YAML,
+                },
+                run_outputs={
+                    ("org/repo", "1"): _replay_zip({"step-1.mp4": b"unit-base"}),
+                    ("org/repo", "2"): _replay_zip({"step-1.mp4": b"lint-cand"}),
+                },
+            )
+            self.received_calls: list[dict[str, object]] = []
+
+        def list_failed_job_names(self, _repo: str, run_id: str) -> list[str]:
+            return ["Unit Tests"] if run_id == "1" else ["Lint"]
+
+        @override
+        def get_run_failure_output(
+            self,
+            repo: str,
+            run_id: str,
+            *,
+            check: str | None = None,
+            expected_checks: tuple[str, ...] = (),
+            check_aliases: tuple[str, ...] = (),
+        ) -> bytes:
+            self.received_calls.append(
+                {
+                    "repo": repo,
+                    "run_id": run_id,
+                    "check": check,
+                    "expected_checks": expected_checks,
+                    "check_aliases": check_aliases,
+                }
+            )
+            return super().get_run_failure_output(repo, run_id)
+
+    github = _JobScopedGitHub()
+    fake_client = _QueuedModelsClient(
+        [json.dumps({"same": True, "baseline_failure": "x", "candidate_failure": "x", "reason": "unused"})]
+    )
+    verifier = build_multimodal_verifier(github, ask=partial(managed_agent.ask_multimodal, client=fake_client))
+    dispatcher = Dispatcher(
+        InMemoryLedger(),
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+        replay_verifier=verifier,
+    )
+    cand = Candidate(
+        id="cand-scoped",
+        hypothesis_id="h1",
+        branch="pc/scoped",
+        summary="scoped",
+        repo="org/repo",
+        base_sha="base-sha",
+        files={".github/workflows/ci.yml": _CAND_CI_YAML},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bug1234", expected_checks=("CI/Unit Tests",)),),
+    )
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+    assert (evidence.bugs_total, evidence.bugs_caught) == (1, 0)
+    assert evidence.bug_outcomes[0]["status"] == "different failure"
+    assert fake_client.calls == []
+    assert rate(evidence).keep is False
+
+
 def test_poll_workflow_run_wakes_immediately_via_run_tracker_and_discards() -> None:
     tracker = RunTracker()
     final = _make_run(77, status="completed", conclusion="success", duration_seconds=18.5)
@@ -3553,14 +4178,34 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
         cases=(BugCase(kind="commit", commit_sha="deadbeef", expected_checks=("CI/test",)),),
     )
 
-    run_scripts: dict[int, list[WorkflowRunResult]] = {}
-    for pair_idx in range(5):
-        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
-        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
-    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
-    run_scripts[12] = [_make_run(12, conclusion="failure", duration_seconds=11.0)]
+    class _ParallelBridgeGitHub(_FakeGitHubClient):
+        @override
+        def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
+            run_id = super().dispatch_workflow(repo, workflow, ref)
+            if ref.startswith("pc/base-"):
+                pair_idx = int(ref.rsplit("-", maxsplit=1)[-1])
+                result = _make_run(run_id, duration_seconds=100.0 + pair_idx)
+            elif ref.startswith("pc/cand-"):
+                pair_idx = int(ref.rsplit("-", maxsplit=1)[-1])
+                result = _make_run(run_id, duration_seconds=45.0 + pair_idx)
+            else:
+                result = _make_run(run_id, conclusion="failure", duration_seconds=12.0)
+            with self._lock:
+                self._run_scripts[run_id] = [result]
+            return run_id
 
-    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts, require_known_branch=True)
+    base_ci = (
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - uses: actions/checkout@v4\n      - run: pytest\n"
+    )
+    github = _ParallelBridgeGitHub(
+        {"org/repo": "base-sha"},
+        file_contents={
+            ("org/repo", "base-sha", ".github/workflows/ci.yml"): base_ci,
+            ("org/repo", "deadbeef", ".github/workflows/ci.yml"): base_ci,
+        },
+        require_known_branch=True,
+    )
     proof_gh = _FakeProofHistoryAndPR()
     ask = partial(managed_agent.ask_multimodal, client=_FakeModelsClient(same=True))
     # Construct ProofBridge without run_lane to also exercise Dispatcher's fallback to self.lane_runner!
@@ -3591,15 +4236,30 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
     assert verdict is not None
     assert verdict.keep is True
     assert "## Required replays\n- deadbeef" in proof_prompts[0]
+    # Live ProofBridge cycles default to replay recording instrumentation on replay branches!
+    replay_commits = [c for c in github.commits if str(c["branch"]).startswith("pc/replay-")]
+    assert len(replay_commits) == 2
+    for commit in replay_commits:
+        committed_files = commit["files"]
+        assert isinstance(committed_files, dict)
+        assert RECORD_SCRIPT_PATH in committed_files
+        assert REPLAY_RECORD_ENV in committed_files[".github/workflows/ci.yml"]
     assert len(proof_gh.committed_cards) == 1
     assert ".github/pit-crew/proof-card.svg" in proof_gh.committed_cards[0][2]
     assert len(proof_gh.opened_prs) == 1
     assert "![Proof card for pc/c1]" in proof_gh.opened_prs[0]["body"]
     assert github.pull_requests == []
 
-    # Now verify fail-closed rejection when Gemini 4 Carbon reports a different failure!
+    # Now verify fail-closed rejection when Gemini 4 Carbon reports a different failure,
+    # and explicit record_replays=False opt-out skips replay instrumentation!
+    run_scripts_seq: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts_seq[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
+        run_scripts_seq[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts_seq[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    run_scripts_seq[12] = [_make_run(12, conclusion="failure", duration_seconds=11.0)]
     ledger_bad = InMemoryLedger()
-    github_bad = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    github_bad = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts_seq)
     bridge_bad = ProofBridge(
         proof_gh,
         run_lane=lambda _lane, _task, *, repo="", ledger=None: ledger.add(plan) if (ledger and repo != "!") else None,
@@ -3611,12 +4271,17 @@ def test_dispatcher_integrates_proof_bridge_prepass_verification_and_svg_pr() ->
             "optimizer": lambda active, _t, _r: active.add(cand),
         }
     )
-    verdict_bad = Dispatcher(ledger_bad, github_bad, lane_runner=runner_bad, proof_bridge=bridge_bad).run_cycle(
-        "org/repo"
-    )
+    verdict_bad = Dispatcher(
+        ledger_bad,
+        github_bad,
+        lane_runner=runner_bad,
+        proof_bridge=bridge_bad,
+        record_replays=False,
+    ).run_cycle("org/repo")
     assert verdict_bad is not None
     assert verdict_bad.keep is False
     assert verdict_bad.reason == "caught 0/1 bugs"
+    assert not any(isinstance(c["files"], dict) and RECORD_SCRIPT_PATH in c["files"] for c in github_bad.commits)
 
 
 def test_dispatcher_falls_back_to_github_pr_when_proof_bridge_has_no_pr_client() -> None:

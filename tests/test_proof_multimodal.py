@@ -356,6 +356,16 @@ def test_visual_downgrade_fails_closed_without_calling_model() -> None:
 def test_expected_checks_guard_rejects_mismatched_check_before_calling_model() -> None:
     assert expected_checks_matched(("CI/UI check",), ("UI check (2/4)",)) is True
     assert expected_checks_matched(("CI/UI check",), ("CI/Lint",)) is False
+    # Matrix-qualified expected checks must not fold across different matrix legs.
+    assert expected_checks_matched(("CI/test (node-26, ubuntu-latest)",), ("test (node-20, ubuntu-latest)",)) is False
+    assert expected_checks_matched(("CI/test (node-26, ubuntu-latest)",), ("test (node-26, ubuntu-latest)",)) is True
+    # Shard fractions like `(1/4)` must never be split on `/` into `"4)"` to match unrelated jobs!
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("Unit tests (1/4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("UI check (2/4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("UI check (1/4)",)) is True
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("4)",)) is False
+    assert expected_checks_matched(("CI/UI check (1/4)",), ("OtherWF/UI check (1/4)",)) is False
+    assert expected_checks_matched(("CI/UI check",), ("UI check (1/4)",)) is True
 
     def must_not_be_called(_m: str, _p: Sequence[tuple[str, str | bytes]], _s: Mapping[str, object]) -> str:
         raise AssertionError
@@ -1434,3 +1444,293 @@ def test_github_redirect_edge_cases_and_historical_errors() -> None:
     ctx = ProofBridge(github).prepare_context(cand, historical_run_ids={"aaaa1111": "500"})
     assert ctx.mounted_artifacts == ()
     assert ctx.extra_sources == ()
+
+
+def test_server_media_endpoint_streams_mp4_enforces_auth_and_blocks_traversal(tmp_path: Path) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41-stream-payload"
+    mp4_file = media_dir / "deadbee-101-baseline-a1b2c3d4e5f6.mp4"
+    mp4_file.write_bytes(mp4_bytes)
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(mp4_bytes)
+    symlink_mp4 = media_dir / "escape.mp4"
+    symlink_mp4.symlink_to(outside)
+
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(id="h1", repo="acme/shop", description="cache", skill="dep-cache", expected_savings_seconds=60.0)
+    cand = Candidate(id="c1", hypothesis_id="h1", branch="pc/1", summary="cache", repo="acme/shop", head_sha="hsha")
+    ev = Evidence(
+        id="e1",
+        candidate_id="c1",
+        baseline_seconds=(120.0,) * 5,
+        candidate_seconds=(50.0,) * 5,
+        bugs_total=1,
+        bugs_caught=1,
+        bug_outcomes=(
+            {
+                "sha": "deadbeef",
+                "check": "CI/test",
+                "status": "caught",
+                "baseline_failed": True,
+                "candidate_failed": True,
+                "modality": "terminal_video",
+                "visual_evidence_seen": True,
+                "visual_summary": "Same pytest failure video.",
+                "baseline_video_url": f"/media/{mp4_file.name}",
+                "candidate_video_url": "javascript:alert(1)",
+            },
+        ),
+    )
+    for rec in (hyp, cand, ev, rater.rate(ev)):
+        ledger.add(rec)
+
+    # Unauthenticated server serves MP4 inline with Range support and ?download=1 attachment.
+    public_client = TestClient(create_app(ledger, media_dir=media_dir))
+    res = public_client.get(f"/media/{mp4_file.name}")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "video/mp4"
+    assert res.headers["content-disposition"].startswith("inline;")
+    assert res.content == mp4_bytes
+
+    ranged = public_client.get(f"/media/{mp4_file.name}", headers={"Range": "bytes=0-11"})
+    assert ranged.status_code == 206
+    assert ranged.content == mp4_bytes[:12]
+
+    dl = public_client.get(f"/media/{mp4_file.name}?download=1")
+    assert dl.status_code == 200
+    assert dl.headers["content-disposition"].startswith("attachment;")
+
+    # Traversal, non-mp4, symlink, and missing files are blocked with 404.
+    assert public_client.get("/media/escape.mp4").status_code == 404
+    assert public_client.get("/media/missing.mp4").status_code == 404
+    assert public_client.get("/media/notes.txt").status_code == 404
+
+    # Attempt detail exposes validated MP4 video URLs and drops unsafe schemes.
+    detail = public_client.get("/api/repos/acme/shop/attempts/c1").json()
+    assert detail["visual_proof"][0]["baseline_video_url"] == f"/media/{mp4_file.name}"
+    assert detail["visual_proof"][0]["candidate_video_url"] == ""
+
+
+def test_server_media_endpoint_enforces_bearer_or_signed_httponly_cookie_auth(tmp_path: Path) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41-stream-payload"
+    mp4_file = media_dir / "deadbee-101-baseline-a1b2c3d4e5f6.mp4"
+    mp4_file.write_bytes(mp4_bytes)
+    ledger = InMemoryLedger()
+
+    # Token-protected server rejects ?token= query auth and requires Bearer header or signed HttpOnly cookie.
+    protected_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    assert protected_client.get(f"/media/{mp4_file.name}").status_code == 401
+    assert protected_client.get(f"/media/{mp4_file.name}?token=tok-xyz").status_code == 401
+    assert protected_client.post("/api/media/session").status_code == 401
+
+    ok_header = protected_client.get(f"/media/{mp4_file.name}", headers={"Authorization": "Bearer tok-xyz"})
+    assert ok_header.status_code == 200
+    assert ok_header.headers["cache-control"] == "private, no-store"
+    assert "Cookie" in ok_header.headers["vary"]
+
+    # POST /api/media/session exchanges Bearer token for a signed HttpOnly SameSite=Strict Path=/media cookie.
+    session_resp = protected_client.post(
+        "/api/media/session",
+        headers={"Authorization": "Bearer tok-xyz", "X-Forwarded-Proto": "https"},
+    )
+    assert session_resp.status_code == 204
+    set_cookie = session_resp.headers["set-cookie"]
+    assert "pit_crew_media_session=" in set_cookie
+    assert "tok-xyz" not in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=strict" in set_cookie or "SameSite=Strict" in set_cookie
+    assert "Path=/media" in set_cookie
+    assert "Secure" in set_cookie
+
+    cookie_val = session_resp.cookies["pit_crew_media_session"]
+    cookie_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    cookie_client.cookies.set("pit_crew_media_session", cookie_val, path="/media")
+    ok_cookie = cookie_client.get(f"/media/{mp4_file.name}")
+    assert ok_cookie.status_code == 200
+    assert ok_cookie.content == mp4_bytes
+    assert cookie_client.get(f"/media/{mp4_file.name}", headers={"Range": "bytes=0-11"}).status_code == 206
+    dl_cookie = cookie_client.get(f"/media/{mp4_file.name}?download=1")
+    assert dl_cookie.status_code == 200
+    assert dl_cookie.headers["content-disposition"].startswith("attachment;")
+
+    # Tampered or expired session cookies are rejected with 401.
+    bad_client = TestClient(create_app(ledger, api_token="tok-xyz", media_dir=media_dir))  # noqa: S106
+    bad_client.cookies.set("pit_crew_media_session", "1.deadbeef", path="/media")
+    assert bad_client.get(f"/media/{mp4_file.name}").status_code == 401
+    bad_client.cookies.set("pit_crew_media_session", f"{cookie_val}tamper", path="/media")
+    assert bad_client.get(f"/media/{mp4_file.name}").status_code == 401
+
+
+_UI_VIDEO_PLAYBACK_SCRIPT = """
+const makeNode = (tag, ns = null) => ({
+  tag, ns, className: "", hidden: false, textContent: "", title: "", value: "", disabled: false,
+  dataset: {}, attrs: {}, kids: [],
+  setAttribute(k, v) { this.attrs[k] = String(v); },
+  addEventListener() {},
+  removeEventListener() {},
+  replaceChildren(...kids) { this.kids = kids; },
+  append(...kids) { this.kids.push(...kids); },
+  querySelectorAll() { return []; },
+});
+const walk = (n, pred, acc = []) => {
+  if (!n) return acc;
+  if (pred(n)) acc.push(n);
+  for (const c of n.kids ?? []) walk(c, pred, acc);
+  return acc;
+};
+const tel = await import(process.argv[1]);
+const storeMod = await import(process.argv[2]);
+const liveMod = await import(process.argv[3]);
+const store = storeMod.createPitWallStore();
+const slot = makeNode("section");
+const root = {
+  createElement: (t) => makeNode(t, null),
+  createElementNS: (ns, t) => makeNode(t, ns),
+  getElementById: () => null,
+  defaultView: { sessionStorage: { getItem: (k) => (k === "pit_crew_api_token" ? "tok-123" : null) } },
+};
+tel.createTelemetryCenter(root, slot, store);
+const payload = {
+  status: { repo: "acme/shop", active: false, base_sha: "head1111" },
+  attempts: [{ candidate_id: "c1", head_sha: "head1111", rated: true }],
+  records: {
+    hypotheses: [],
+    candidates: [{ id: "c1", repo: "acme/shop", head_sha: "head1111" }],
+    replay_plans: [],
+    evidence: [{
+      candidate_id: "c1",
+      baseline_seconds: [100, 95],
+      candidate_seconds: [50, 48],
+      bugs_total: 1,
+      bugs_caught: 1,
+      bug_outcomes: [{
+        sha: "deadbeef",
+        status: "caught",
+        baseline_failed: true,
+        modality: "terminal_video",
+        visual_evidence_seen: true,
+        visual_summary: "Same pytest failure recorded in MP4.",
+        baseline_video_url: "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4",
+        candidate_video_url: "https://cdn.example.test/cand.mp4",
+      }],
+    }],
+    verdicts: [],
+  },
+};
+store.setMode("live");
+store.setRepo("acme/shop");
+store.setLiveData(payload);
+const videoNodes1 = walk(slot, (n) => n.tag === "video");
+const videos = videoNodes1.map((n) => ({
+  src: n.attrs.src, controls: "controls" in n.attrs, preload: n.attrs.preload,
+}));
+const downloads = walk(slot, (n) => n.tag === "a" && n.textContent === "Download MP4").map((n) => n.attrs.href);
+
+// Polling with identical data must NOT replace mounted <video> elements.
+store.setLiveData(JSON.parse(JSON.stringify(payload)));
+const videoNodes2 = walk(slot, (n) => n.tag === "video");
+const preservedVideoNodes =
+  videoNodes1.length === 2 &&
+  videoNodes1[0] === videoNodes2[0] &&
+  videoNodes1[1] === videoNodes2[1];
+
+// Updating the video URL must re-render the video player cleanly.
+const updatedPayload = JSON.parse(JSON.stringify(payload));
+updatedPayload.records.evidence[0].bug_outcomes[0].baseline_video_url = "/media/deadbee-2-baseline-f6e5d4c3b2a1.mp4";
+store.setLiveData(updatedPayload);
+const videoNodes3 = walk(slot, (n) => n.tag === "video");
+const updatedVideoSrc = videoNodes3[0]?.attrs?.src ?? null;
+const replacedOnChange = videoNodes3[0] !== videoNodes1[0];
+
+// Live poller exchanges Bearer token via POST /api/media/session once when records include /media/*.mp4.
+const pollStore = storeMod.createPitWallStore();
+pollStore.setMode("live");
+pollStore.setRepo("acme/shop");
+const sessionCalls = [];
+const fakeFetch = async (url, init = {}) => {
+  if (url === "/api/media/session") {
+    sessionCalls.push({ method: init.method, auth: init.headers?.Authorization, credentials: init.credentials });
+    return { ok: true, status: 204, json: async () => null };
+  }
+  if (url.endsWith("/status")) return { ok: true, status: 200, json: async () => payload.status };
+  if (url.endsWith("/attempts")) return { ok: true, status: 200, json: async () => payload.attempts };
+  return { ok: true, status: 200, json: async () => payload.records };
+};
+const fakeHeader = { setRunning() {}, repoInput: null, runButton: null };
+const fakeTimer = { setTimeout: () => 1, clearTimeout() {} };
+const poller = liveMod.createLivePoller(root, fakeHeader, pollStore, {
+  fetch: fakeFetch,
+  timer: fakeTimer,
+  doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+  search: "?repo=acme/shop&token=tok-123",
+  storage: { getItem: () => null, setItem() {} },
+});
+await new Promise((r) => setTimeout(r, 20));
+await poller.refresh();
+poller.destroy();
+
+console.log(JSON.stringify({
+  videos,
+  downloads,
+  preservedVideoNodes,
+  updatedVideoSrc,
+  replacedOnChange,
+  strippedQuery: tel.resolveVideoUrl("/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?token=leak"),
+  sessionCalls,
+  safeVideoChecks: [
+    tel.isSafeVideoUrl("/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4"),
+    tel.isSafeVideoUrl("/media/../secret.mp4"),
+    tel.isSafeVideoUrl("/media/not-a-video.txt"),
+    tel.isSafeVideoUrl("javascript:alert(1)"),
+    tel.isSafeVideoUrl("https://cdn.example.test/video.mp4"),
+  ],
+}));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_pit_wall_ui_renders_inline_mp4_video_players_and_download_links() -> None:
+    assert NODE is not None
+    result = subprocess.run(  # noqa: S603
+        [
+            NODE,
+            "--input-type=module",
+            "-e",
+            _UI_VIDEO_PLAYBACK_SCRIPT,
+            (WEB_DIR / "telemetry.js").as_uri(),
+            (WEB_DIR / "store.js").as_uri(),
+            (WEB_DIR / "live_poller.js").as_uri(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = json.loads(result.stdout)
+    assert out["safeVideoChecks"] == [True, False, False, False, True]
+    assert out["videos"] == [
+        {
+            "src": "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4",
+            "controls": True,
+            "preload": "metadata",
+        },
+        {
+            "src": "https://cdn.example.test/cand.mp4",
+            "controls": True,
+            "preload": "metadata",
+        },
+    ]
+    assert out["downloads"] == [
+        "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4?download=1",
+        "https://cdn.example.test/cand.mp4",
+    ]
+    assert out["strippedQuery"] == "/media/deadbee-1-baseline-a1b2c3d4e5f6.mp4"
+    assert out["preservedVideoNodes"] is True
+    assert out["replacedOnChange"] is True
+    assert out["updatedVideoSrc"] == "/media/deadbee-2-baseline-f6e5d4c3b2a1.mp4"
+    assert out["sessionCalls"] == [
+        {"method": "POST", "auth": "Bearer tok-123", "credentials": "same-origin"},
+    ]
