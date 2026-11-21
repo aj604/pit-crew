@@ -14,7 +14,10 @@ from pit_crew.publisher import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from pit_crew.github import CandidatePublisherClient, GitHubClient
+    from pit_crew.lanes.proof.miner import JobRun
 
 REPO = "org/fork"
 BASE = "base000"
@@ -41,6 +44,15 @@ class FakeGitHub:
         self.commits[sha] = (parent, dict(files), message)
         self.branches[repo, branch] = sha
         return sha
+
+    def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
+        self.calls.append(("get_file_content", repo, ref, path))
+        commit = self.commits.get(ref)
+        return commit[1].get(path) if commit is not None else None
+
+    def list_workflow_job_runs(self, repo: str) -> "Sequence[JobRun]":
+        self.calls.append(("list_workflow_job_runs", repo))
+        return ()
 
 
 @pytest.fixture

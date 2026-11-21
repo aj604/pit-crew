@@ -4,7 +4,10 @@ A future ``HttpxGitHubClient`` implements this against the REST API (git refs, t
 tests use an in-memory fake. Nothing here talks to the network.
 """
 
+from collections.abc import Sequence
 from typing import Protocol
+
+from pit_crew.lanes.proof.miner import JobRun
 
 
 class CandidatePublisherClient(Protocol):
@@ -19,5 +22,17 @@ class CandidatePublisherClient(Protocol):
         ...
 
 
-class GitHubClient(CandidatePublisherClient, Protocol):
+class ProofHistoryClient(Protocol):
+    """Reads base files and recent workflow job runs for Proof pre-pass mining."""
+
+    def get_file_content(self, repo: str, ref: str, path: str) -> str | None:
+        """Return UTF-8 file content at ``ref`` in ``repo``, or ``None`` if absent."""
+        ...
+
+    def list_workflow_job_runs(self, repo: str) -> Sequence[JobRun]:
+        """Return recent GitHub Actions job run attempts for ``repo``."""
+        ...
+
+
+class GitHubClient(CandidatePublisherClient, ProofHistoryClient, Protocol):
     """Every GitHub operation host code uses. Grows as the Dispatcher needs more (workflow runs, logs)."""
