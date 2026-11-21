@@ -9,8 +9,13 @@ This guide is for teammates owning individual lanes in Pit Crew. Read [architect
 3. **No API key required for tests:** Every lane must be 100% unit-testable offline using `InMemoryLedger` and local fixtures under `tests/fixtures/`. Only `managed_agent.py` talks to the Gemini API.
 4. **Keep CI green on every PR:** Before requesting review, run:
    ```sh
+   uv run ruff format --check
    uv run ruff check
-   uv run pytest -q
+   uv run mypy src tests
+   uv run deptry src
+   uv run lint-imports
+   uv run zizmor .github/workflows
+   uv run pytest
    ```
 5. **Respect the trust boundary:** Agent lanes (`analysis`, `optimizer`, `proof`) must never write `Evidence` or `Verdict` records, and must never modify `rater.py`.
 

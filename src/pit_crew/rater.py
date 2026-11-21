@@ -14,23 +14,29 @@ MAX_P_VALUE = 0.05
 
 
 def rate(evidence: Evidence) -> Verdict:
+    """Evaluate measured timing and bug-replay evidence to produce a keep/reject verdict."""
     base, cand = evidence.baseline_seconds, evidence.candidate_seconds
 
-    def verdict(keep: bool, reason: str, speedup: float = 0.0, p: float | None = None) -> Verdict:
+    def verdict(*, keep: bool, reason: str, speedup: float = 0.0, p: float | None = None) -> Verdict:
         return Verdict(evidence.candidate_id, keep, speedup, p, reason)
 
     if evidence.bugs_total == 0:
-        return verdict(False, "no bugs replayed, so safety is unproven")
+        return verdict(keep=False, reason="no bugs replayed, so safety is unproven")
     if evidence.bugs_caught < evidence.bugs_total:
-        return verdict(False, f"caught {evidence.bugs_caught}/{evidence.bugs_total} bugs")
+        return verdict(keep=False, reason=f"caught {evidence.bugs_caught}/{evidence.bugs_total} bugs")
     if min(len(base), len(cand)) < MIN_RUNS:
-        return verdict(False, f"needs {MIN_RUNS} runs per side")
+        return verdict(keep=False, reason=f"needs {MIN_RUNS} runs per side")
 
     speedup = median(base) / median(cand)
     p = _p_faster(base, cand)
     if speedup <= 1 or p > MAX_P_VALUE:
-        return verdict(False, "speedup is within noise", speedup, p)
-    return verdict(True, f"{speedup:.2f}x faster, caught {evidence.bugs_caught}/{evidence.bugs_total} bugs", speedup, p)
+        return verdict(keep=False, reason="speedup is within noise", speedup=speedup, p=p)
+    return verdict(
+        keep=True,
+        reason=f"{speedup:.2f}x faster, caught {evidence.bugs_caught}/{evidence.bugs_total} bugs",
+        speedup=speedup,
+        p=p,
+    )
 
 
 def _p_faster(base: tuple[float, ...], cand: tuple[float, ...]) -> float:
