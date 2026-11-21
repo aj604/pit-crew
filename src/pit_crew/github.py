@@ -5,7 +5,7 @@ tests use an in-memory fake. Nothing here talks to the network.
 """
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pit_crew.lanes.proof.miner import JobRun
 
@@ -19,6 +19,19 @@ class CandidatePublisherClient(Protocol):
 
     def commit_files(self, repo: str, branch: str, files: dict[str, str], message: str) -> str:
         """Commit ``files`` (path to full content) atop ``branch``'s tip, advance the branch, return the new sha."""
+        ...
+
+
+@runtime_checkable
+class PullRequestClient(Protocol):
+    """Commits proof artifacts onto a candidate branch and opens a pull request."""
+
+    def commit_files(self, repo: str, branch: str, files: dict[str, str], message: str) -> str:
+        """Commit ``files`` (path to full content) atop ``branch``'s tip, advance the branch, return the new sha."""
+        ...
+
+    def open_pull_request(self, repo: str, *, head: str, base: str, title: str, body: str) -> str:
+        """Open a pull request from ``head`` into ``base`` in ``repo`` and return its URL."""
         ...
 
 
@@ -38,5 +51,5 @@ class ProofHistoryClient(Protocol):
         ...
 
 
-class GitHubClient(CandidatePublisherClient, ProofHistoryClient, Protocol):
+class GitHubClient(CandidatePublisherClient, ProofHistoryClient, PullRequestClient, Protocol):
     """Every GitHub operation host code uses. Grows as the Dispatcher needs more (workflow runs, logs)."""

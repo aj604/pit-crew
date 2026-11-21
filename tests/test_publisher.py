@@ -58,6 +58,10 @@ class FakeGitHub:
         self.calls.append(("get_run_failure_output", repo, run_id))
         return b""
 
+    def open_pull_request(self, repo: str, *, head: str, base: str, title: str, body: str) -> str:
+        self.calls.append(("open_pull_request", repo, head, base, title, body))
+        return f"https://github.com/{repo}/pull/1"
+
 
 @pytest.fixture
 def gh() -> FakeGitHub:
