@@ -2,6 +2,7 @@
 // Shared state lives in store.js; live polling and POST /triggers/cycle land in #53.
 
 import { DEMO_SCENARIO_IDS, DEMO_SCENARIOS, DEMO_STAGE_LABELS } from "./demo_scenarios.js";
+import { createSectorPipeline } from "./pipeline.js";
 import { createPitWallStore, resolveInitialBoot } from "./store.js";
 
 export const SLA_MEDIAN_TARGET_SECONDS = 60;
@@ -193,7 +194,9 @@ export function bootPitWall(root, search) {
   const store = createPitWallStore(resolveInitialBoot(search));
   bindHeaderToStore(header, root.getElementById("mode-toggle"), store);
   const switcher = createDemoSwitcher(root, root.getElementById("demo-switcher"), store);
-  return { header, store, switcher };
+  const pipelineSlot = root.getElementById("sector-pipeline");
+  const pipeline = pipelineSlot ? createSectorPipeline(root, pipelineSlot, store) : null;
+  return { header, store, switcher, pipeline };
 }
 
 if (typeof document !== "undefined") {
