@@ -1,11 +1,14 @@
-"""Orchestrates Pit Crew lane handoffs and enforces the candidate path safety guard.
+"""Orchestrates Pit Crew lane handoffs, interleaved timing runs, and safety guards.
 
 Drives a single optimization cycle through ``analysis -> optimizer -> proof`` while
-keeping all ledger state and trust boundaries on the host. Never imports ``google`` or
-any lane module directly; lane execution goes through the injected ``LaneRunner``.
+keeping all ledger state, workflow timing collection, Rater verdicts, and trust
+boundaries on the host. Never imports ``google`` or any lane module directly; lane
+execution goes through the injected ``LaneRunner``.
 """
 
 import json
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from importlib import import_module
 from pathlib import PurePosixPath
@@ -20,7 +23,7 @@ from pit_crew.contracts import (
     Verdict,
     is_allowed_candidate_path,
 )
-from pit_crew.github import GitHubClient
+from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.ledger import Ledger
 from pit_crew.rater import rate
 
@@ -136,21 +139,35 @@ def _build_proof_task(*, repo: str, base_sha: str, candidate: Candidate) -> str:
     )
 
 
-class Dispatcher:
-    """Host-side orchestrator driving lane handoffs and enforcing candidate safety guards."""
+@dataclass
+class _TimingSide:
+    """Mutable per-side state for an interleaved baseline/candidate timing sequence."""
 
-    def __init__(
+    ref: str
+    durations: list[float]
+    active: bool = True
+
+
+class Dispatcher:
+    """Host-side orchestrator driving lane handoffs, timing measurement, and candidate safety guards."""
+
+    def __init__(  # noqa: PLR0913
         self,
         ledger: Ledger,
         github: GitHubClient,
         lane_runner: LaneRunner | None = None,
         config: DispatcherConfig | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Initialize the Dispatcher with a ledger, GitHub client, lane runner, and config."""
+        """Initialize the Dispatcher with a ledger, GitHub client, lane runner, config, and clock hooks."""
         self.ledger = ledger
         self.github = github
         self.lane_runner: LaneRunner = lane_runner if lane_runner is not None else _default_lane_runner
         self.config = config if config is not None else DispatcherConfig()
+        self._sleep = sleep
+        self._monotonic = monotonic
 
     def resolve_base_sha(self, repo: str, base_sha: str | None = None) -> str:
         """Resolve the commit SHA to optimize atop for ``repo``.
@@ -179,25 +196,123 @@ class Dispatcher:
         paths = dict.fromkeys((*candidate.changed_files, *candidate.files))
         return tuple(path for path in paths if not is_allowed_candidate_path(path))
 
+    def poll_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
+        """Poll ``github.get_workflow_run`` until ``run_id`` completes or times out."""
+        start = self._monotonic()
+        while True:
+            run = self.github.get_workflow_run(repo, run_id)
+            if run.status == "completed":
+                return run
+            elapsed = self._monotonic() - start
+            if elapsed >= self.config.run_timeout_seconds:
+                msg = (
+                    f"Workflow run {run_id} in {repo} did not complete within "
+                    f"{self.config.run_timeout_seconds}s (last status: {run.status!r})"
+                )
+                raise TimeoutError(msg)
+            self._sleep(self.config.poll_interval_seconds)
+
     def collect_evidence(
         self,
         candidate: Candidate,
-        replay_plan: ReplayPlan,  # noqa: ARG002  hook populated by interleaved timing & replay lanes
-        base_sha: str,  # noqa: ARG002  hook populated by interleaved timing & replay lanes
+        replay_plan: ReplayPlan,  # noqa: ARG002  hook populated by bug replay lanes
+        base_sha: str,
         *,
-        workflow: str | None = None,  # noqa: ARG002  hook populated by interleaved timing & replay lanes
+        workflow: str | None = None,
     ) -> Evidence:
-        """Collect CI timing and bug-replay evidence for ``candidate``.
+        """Collect interleaved CI timing evidence for ``candidate`` against ``base_sha``.
 
-        TODO(dispatcher owner): wire interleaved timing runs and bug replay execution.
+        Alternates baseline (``base_sha``) and candidate (``candidate.branch`` or
+        ``candidate.head_sha``) workflow dispatches for ``config.timing_pairs`` pairs,
+        including cold Run #1 to cancel runner-load drift. Aborts timing collection for a
+        side if any timing run concludes with a status other than ``"success"``.
+
+        TODO(dispatcher owner): wire historical commit and mutation bug replay execution.
         """
+        repo = self._resolve_repo(candidate)
+        workflow_file = self._resolve_workflow(candidate, workflow)
+        candidate_ref = candidate.branch or candidate.head_sha
+        if not candidate_ref:
+            msg = f"Candidate {candidate.id!r} has neither branch nor head_sha"
+            raise ValueError(msg)
+
+        baseline_seconds, candidate_seconds, run_urls = self._collect_interleaved_timings(
+            repo=repo,
+            workflow=workflow_file,
+            base_sha=base_sha,
+            candidate_ref=candidate_ref,
+        )
         return Evidence(
             candidate_id=candidate.id,
-            baseline_seconds=(),
-            candidate_seconds=(),
+            baseline_seconds=baseline_seconds,
+            candidate_seconds=candidate_seconds,
             bugs_total=0,
             bugs_caught=0,
+            run_urls=run_urls,
         )
+
+    def _find_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
+        try:
+            return self.ledger.get(Hypothesis, hypothesis_id)
+        except KeyError:
+            return None
+
+    def _resolve_repo(self, candidate: Candidate) -> str:
+        if candidate.repo:
+            return candidate.repo
+        hypothesis = self._find_hypothesis(candidate.hypothesis_id)
+        if hypothesis is not None and hypothesis.repo:
+            return hypothesis.repo
+        msg = f"Cannot resolve repository for candidate {candidate.id!r}"
+        raise ValueError(msg)
+
+    def _resolve_workflow(self, candidate: Candidate, workflow: str | None) -> str:
+        if workflow:
+            return PurePosixPath(workflow).name or self.config.workflow_file
+        hypothesis = self._find_hypothesis(candidate.hypothesis_id)
+        if hypothesis is not None:
+            return _workflow_for_hypothesis(hypothesis, self.config.workflow_file)
+        return self.config.workflow_file
+
+    def _dispatch_and_poll(self, repo: str, workflow: str, ref: str) -> WorkflowRunResult:
+        run_id = self.github.dispatch_workflow(repo, workflow, ref)
+        return self.poll_workflow_run(repo, run_id)
+
+    def _collect_interleaved_timings(
+        self,
+        *,
+        repo: str,
+        workflow: str,
+        base_sha: str,
+        candidate_ref: str,
+    ) -> tuple[tuple[float, ...], tuple[float, ...], tuple[str, ...]]:
+        baseline = _TimingSide(ref=base_sha, durations=[])
+        candidate = _TimingSide(ref=candidate_ref, durations=[])
+        run_urls: list[str] = []
+
+        for _ in range(self.config.timing_pairs):
+            for side in (baseline, candidate):
+                if side.active:
+                    self._record_timing_run(repo, workflow, side, run_urls)
+            if not baseline.active and not candidate.active:
+                break
+
+        return tuple(baseline.durations), tuple(candidate.durations), tuple(run_urls)
+
+    def _record_timing_run(
+        self,
+        repo: str,
+        workflow: str,
+        side: _TimingSide,
+        run_urls: list[str],
+    ) -> None:
+        run = self._dispatch_and_poll(repo, workflow, side.ref)
+        if run.html_url:
+            run_urls.append(run.html_url)
+        if run.conclusion == "success":
+            side.durations.append(run.duration_seconds)
+        else:
+            side.active = False
 
     def run_cycle(self, repo: str, base_sha: str | None = None) -> Verdict | None:
         """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any."""
