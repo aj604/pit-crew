@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import inspect
 import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -26,8 +27,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_WEB_DIR = Path(__file__).resolve().parent / "web"
 """Pit Wall shell assets (``index.html``, ``styles.css``, ``app.js``) shipped inside the package."""
 
-DEFAULT_BRAND_DIR = Path(__file__).resolve().parents[2] / "brand"
-"""Repository-root brand assets; absent when running from an installed wheel."""
+
+def _resolve_default_brand_dir() -> Path:
+    """Resolve the default ``brand/`` directory across checkouts, wheels, and containers."""
+    repo_dir = Path(__file__).resolve().parents[2] / "brand"
+    if repo_dir.is_dir():
+        return repo_dir
+    pkg_dir = Path(__file__).resolve().parent / "brand"
+    if pkg_dir.is_dir():
+        return pkg_dir
+    env_dir = os.environ.get("PIT_CREW_BRAND_DIR", "").strip()
+    if env_dir and Path(env_dir).is_dir():
+        return Path(env_dir)
+    cwd_dir = Path.cwd() / "brand"
+    if cwd_dir.is_dir():
+        return cwd_dir
+    return repo_dir
+
+
+DEFAULT_BRAND_DIR = _resolve_default_brand_dir()
+"""Repository-root or packaged brand assets; absent when running from a minimal wheel."""
 
 
 def _normalize_repo(repo: str) -> str:
@@ -504,7 +523,8 @@ def create_app(  # noqa: PLR0913  keyword-only asset dirs keep existing position
         """Return cycle state and live progress, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos, progress_board)
 
-    _mount_pit_wall(app, brand_dir=brand_dir or DEFAULT_BRAND_DIR, web_dir=web_dir or DEFAULT_WEB_DIR)
+    resolved_brand = brand_dir if brand_dir is not None else _resolve_default_brand_dir()
+    _mount_pit_wall(app, brand_dir=resolved_brand, web_dir=web_dir or DEFAULT_WEB_DIR)
     return app
 
 
