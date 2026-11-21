@@ -12,12 +12,15 @@ import re
 import sys
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
 
 API = "https://api.github.com"
+DEFAULT_RUNS = 150  # the architect's audit window
+_JOB_FETCHERS = 8  # parallel job-list requests; well inside GitHub's secondary rate limits
 
 # Fields kept from the API, so fixtures stay small and hold nothing analysis does not use.
 _RUN_FIELDS = (
@@ -99,7 +102,7 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     repo: str,
     workflow: str,
     *,
-    runs: int = 30,
+    runs: int = DEFAULT_RUNS,
     branch: str | None = None,
     event: str | None = None,
     token: str | None = None,
@@ -123,12 +126,10 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
         body, url = get(url)
         found.extend(body["workflow_runs"])
 
-    history = []
-    for run in found[:runs]:
-        trimmed = _pick(run, _RUN_FIELDS)
-        trimmed["jobs"] = _fetch_jobs(get, repo, run["id"])
-        history.append(trimmed)
-    return history
+    selected = found[:runs]
+    with ThreadPoolExecutor(max_workers=_JOB_FETCHERS) as pool:
+        jobs = list(pool.map(lambda run: _fetch_jobs(get, repo, run["id"]), selected))
+    return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
 
 
 def parse_runs(raw: list[dict[str, Any]]) -> list[WorkflowRun]:
@@ -220,5 +221,7 @@ def _span(start: datetime | None, end: datetime | None) -> float:
 
 if __name__ == "__main__":
     repo_arg, workflow_arg, *rest = sys.argv[1:]
-    sys.stdout.write(json.dumps(fetch_history(repo_arg, workflow_arg, runs=int(rest[0]) if rest else 30), indent=1))
+    sys.stdout.write(
+        json.dumps(fetch_history(repo_arg, workflow_arg, runs=int(rest[0]) if rest else DEFAULT_RUNS), indent=1)
+    )
     sys.stdout.write("\n")
