@@ -215,3 +215,10 @@ def test_run_lane_raises_when_exceeding_max_turns(monkeypatch: pytest.MonkeyPatc
     )
     with pytest.raises(MaxTurnsExceededError, match="exceeded 1"):
         run_lane("analysis", "loop forever", client=fake_client)
+
+
+def test_run_lane_forwards_repo_to_the_request() -> None:
+    fake_client = _FakeClient(responses=[_FakeInteraction(id="int-1", status="completed", steps=[])])
+    run_lane("analysis", "analyze", repo="org/fork", client=fake_client)
+    sources = fake_client.interactions.calls[0]["environment"]["sources"]  # type: ignore[index]
+    assert managed_agent.repository_source("org/fork") in sources
