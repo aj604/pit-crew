@@ -6,11 +6,11 @@ them would save, not by their own duration.
 
 A job's time in a run spans from its first matrix instance being queued to its last instance
 finishing. That includes waiting for a runner, which is real wall-clock time (macOS runners
-often queue for minutes) and is reported separately so the cause stays visible.
+often queue for minutes). Every job, and the critical path as a whole, is split into waiting,
+setup and running (see `buckets.py`) so the biggest bucket can be fixed first.
 """
 
 import json
-import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping
@@ -18,7 +18,9 @@ from dataclasses import asdict, dataclass, field
 from statistics import median
 from typing import Any
 
+from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, job_buckets
 from pit_crew.lanes.analysis.history import JobRun, WorkflowRun
+from pit_crew.lanes.analysis.stats import percentile
 from pit_crew.lanes.analysis.workflow import Workflow, topological_order
 
 _SHA = re.compile(r"\b[0-9a-f]{40}\b")
@@ -33,6 +35,8 @@ class JobTiming:
     queued_seconds: float  # longest any instance waited for a runner
     slowest_instance: str  # display name of the instance that finished last
     instances: int
+    buckets: Buckets  # of the instance that finished last, which is what held up later jobs
+    instance_buckets: tuple[Buckets, ...]  # one per matrix instance
 
 
 @dataclass(frozen=True)
@@ -50,8 +54,7 @@ class JobProfile:
     job_id: str
     median_seconds: float  # wall-clock span, queueing included
     p95_seconds: float
-    median_run_seconds: float  # time on the runner: what a change to the job's steps can shrink
-    median_queued_seconds: float  # time waiting for a runner: shrunk by runner choice, not by steps
+    buckets: BucketStats  # waiting / setup / running across every instance in every run
     instances: int
     critical_runs: int  # runs in which this job was on the critical path
     max_saving_seconds: float  # wall-clock saved, on median timings, if this job took no time
@@ -81,6 +84,9 @@ class CIProfile:
     wall_clock_median_seconds: float
     wall_clock_p95_seconds: float
     critical_path: CriticalPath  # on median job timings
+    critical_path_buckets: BucketStats  # waiting / setup / running summed along each run's critical path
+    biggest_bucket: str  # the critical-path bucket with the largest p50: fix it first
+    biggest_bucket_p95: str  # the same at p95, which bursts and queueing usually dominate
     jobs: tuple[JobProfile, ...]  # largest max_saving_seconds first
     steps: tuple[StepProfile, ...]  # slowest median first
     unmatched_jobs: tuple[str, ...] = field(default=())  # API job names not found in the workflow file
@@ -116,6 +122,8 @@ def job_timings(run: WorkflowRun, workflow: Workflow) -> tuple[dict[str, JobTimi
             queued_seconds=max(j.queued_seconds for j in jobs),
             slowest_instance=last.name,
             instances=len(jobs),
+            buckets=job_buckets(last),
+            instance_buckets=tuple(job_buckets(j) for j in jobs),
         )
     return timings, unmatched
 
@@ -157,13 +165,16 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
 
     per_job: dict[str, list[JobTiming]] = defaultdict(list)
     critical_counts: Counter[str] = Counter()
+    critical_buckets: list[Buckets] = []
     unmatched: set[str] = set()
     for run in kept:
         timings, missing = job_timings(run, workflow)
         unmatched.update(missing)
         for job_id, timing in timings.items():
             per_job[job_id].append(timing)
-        critical_counts.update(critical_path(workflow, {j: t.seconds for j, t in timings.items()}).jobs)
+        path = critical_path(workflow, {j: t.seconds for j, t in timings.items()})
+        critical_counts.update(path.jobs)
+        critical_buckets.append(sum((timings[j].buckets for j in path.jobs if j in timings), Buckets(0, 0, 0)))
 
     medians = {job_id: median(t.seconds for t in ts) for job_id, ts in per_job.items()}
     jobs = []
@@ -174,8 +185,7 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
                 job_id=job_id,
                 median_seconds=medians[job_id],
                 p95_seconds=percentile([t.seconds for t in ts], 95),
-                median_run_seconds=median(t.run_seconds for t in ts),
-                median_queued_seconds=median(t.queued_seconds for t in ts),
+                buckets=bucket_stats([b for t in ts for b in t.instance_buckets]),
                 instances=max(t.instances for t in ts),
                 critical_runs=critical_counts[job_id],
                 max_saving_seconds=max_saving(workflow, medians, job_id),
@@ -186,6 +196,7 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
     jobs.sort(key=lambda j: (j.max_saving_seconds, j.median_seconds), reverse=True)
 
     walls = [r.wall_clock_seconds for r in kept]
+    path_stats = bucket_stats(critical_buckets)
     return CIProfile(
         workflow=workflow.name,
         runs_analyzed=len(kept),
@@ -194,6 +205,9 @@ def profile(workflow: Workflow, runs: list[WorkflowRun], include: tuple[str, ...
         wall_clock_median_seconds=median(walls) if walls else 0.0,
         wall_clock_p95_seconds=percentile(walls, 95),
         critical_path=critical_path(workflow, medians),
+        critical_path_buckets=path_stats,
+        biggest_bucket=path_stats.biggest(50),
+        biggest_bucket_p95=path_stats.biggest(95),
         jobs=tuple(jobs),
         steps=tuple(step_profiles(workflow, kept)),
         unmatched_jobs=tuple(sorted(unmatched)),
@@ -220,11 +234,3 @@ def step_profiles(workflow: Workflow, runs: list[WorkflowRun]) -> list[StepProfi
         for (job_id, name), values in samples.items()
     ]
     return sorted(steps, key=lambda s: s.median_seconds, reverse=True)
-
-
-def percentile(values: list[float], pct: float) -> float:
-    """Nearest-rank percentile: always a value that was actually observed. 0 for no values."""
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    return ordered[max(math.ceil(pct / 100 * len(ordered)) - 1, 0)]
