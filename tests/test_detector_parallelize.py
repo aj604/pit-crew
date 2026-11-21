@@ -238,3 +238,51 @@ def test_parallelize_vite_test_passed_gate_has_no_finding() -> None:
     p, wf = profiled(VITE_GATE, {"test": (0, 300), "Build & Test Passed or Skipped": (300, 305)})
     assert wf.jobs["test-passed"].needs_refs == {"test"}
     assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_keeps_fastapi_bracket_needs_reference() -> None:
+    wf_yaml = """
+name: CI
+on: [push]
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - run: echo filter
+  test:
+    needs: [changes]
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+        if: needs['changes'].outputs.src == 'true'
+"""
+    p, wf = profiled(wf_yaml, {"changes": (0, 60), "test": (60, 360)})
+    assert wf.jobs["test"].needs_refs == {"changes"}
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_keeps_spaced_tojson_gate_need() -> None:
+    wf_yaml = """
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+  coverage-combine:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: coverage combine
+  gate:
+    needs: [coverage-combine]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '${{ toJSON( needs ) }}'
+"""
+    p, wf = profiled(wf_yaml, {"test": (0, 100), "coverage-combine": (100, 150), "gate": (150, 160)})
+    assert wf.jobs["gate"].needs_refs == {"coverage-combine"}
+    assert [f for f in detect_parallelize_dag(p, wf, PATH) if f.job == "gate"] == []
