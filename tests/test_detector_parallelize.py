@@ -342,7 +342,36 @@ def test_parallelize_logging_prefix_does_not_hide_real_work() -> None:
         ("echo $(make build)", False),
         ("echo `make build`", False),
         ("echo done;", True),
+        ('echo "All checks passed; merge allowed"', True),
+        ("echo 'tests && lint ok'", True),
+        ('echo "::notice::All jobs passed; ready"', True),
+        ("echo ok >&2", True),
+        ("echo ok 2>&1", True),
+        ("echo ok &> /dev/null", True),
+        ('echo "a\necho done" ; curl x', False),  # a quote spanning lines must not hide the command after it
+        ("echo a # don't\ncurl x", False),  # an apostrophe in a comment opens no quote
+        ("echo ok & curl x", False),
+        ("cat <<EOF\nit's\nEOF\ncurl x", False),
+        ("echo <(curl x)", False),
+        ("echo Starting tests && npm test", False),
     ],
 )
 def test_trivial_run_checks_every_segment(script: str, *, trivial: bool) -> None:
     assert _trivial_run(script) is trivial
+
+
+def test_parallelize_keeps_gate_that_echoes_a_semicolon_message() -> None:
+    steps = '    steps:\n      - run: echo "All checks passed; merge allowed"'
+    wf_yaml = f"""
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  gate:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+{steps}
+"""
+    p, wf = profiled(wf_yaml, {"a": (0, 50), "b": (0, 100), "gate": (100, 125)})
+    assert detect_parallelize_dag(p, wf, PATH) == []

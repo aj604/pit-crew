@@ -1,6 +1,5 @@
 """parallelize-dag: find `needs:` edges that make independent jobs wait for each other."""
 
-import re
 from dataclasses import replace
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, critical_path
@@ -10,22 +9,73 @@ from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 _UPLOAD = "actions/upload-artifact"
 _DOWNLOAD = "actions/download-artifact"
 _CONFIDENCE = 0.6
-_SEGMENT_SEPARATOR = re.compile(r"&&|\|\||[;|&]")  # shell command separators; alternation of fixed tokens, linear
 _TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
+_SPACE = " \t\r\f\v"
+
+
+def _opaque(c: str, nxt: str, *, quoted: bool) -> bool:
+    """True where the script can run something this scan cannot see: substitutions, heredocs, process substitution."""
+    if c == "`" or (c == "$" and nxt == "("):
+        return True
+    return not quoted and ((c in "<>" and nxt == "(") or (c == "<" and nxt == "<"))
+
+
+def _is_separator(run: str, i: int) -> bool:
+    """Whether an unquoted `;`, `|`, `&` or newline at i ends a command (an `&` in a redirect does not)."""
+    if run[i] != "&":
+        return True
+    nxt = run[i + 1 : i + 2]
+    return not (run[i - 1 : i] in {">", "<"} or nxt == ">")  # `>&2`, `2>&1`, `&>file`
+
+
+def _segments(run: str) -> list[str] | None:
+    """The shell command segments of a script, or None when it cannot be told apart from real work.
+
+    One linear pass over the whole script (a quote may span lines). Segments end at `&&`, `||`, `;`, `|`, `&`
+    and a newline, but only outside quotes; a comment is skipped. Substitutions, heredocs and process
+    substitutions return None: they can run anything, and a heredoc body could hold a stray quote.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""  # the open quote character, or ""
+    i = 0
+    while i < len(run):
+        c, nxt = run[i], run[i + 1 : i + 2]
+        if _opaque(c, nxt, quoted=bool(quote)):
+            return None
+        step = 1
+        if c == "\\" and quote != "'":
+            current.append(run[i : i + 2])
+            step = 2
+        elif quote:
+            quote = "" if c == quote else quote
+            current.append(c)
+        elif c in "'\"":
+            quote = c
+            current.append(c)
+        elif c == "#" and (not current or current[-1] in _SPACE):
+            end = run.find("\n", i)
+            step = (len(run) if end == -1 else end) - i
+        elif c in "\n;|&" and _is_separator(run, i):
+            segments.append("".join(current))
+            current = []
+            step = 2 if nxt == c and c in "|&" else 1  # `&&` and `||` are one separator
+        else:
+            current.append(c)
+        i += step
+    segments.append("".join(current))
+    return segments
 
 
 def _trivial_run(run: str) -> bool:
-    """True when every shell segment of every line starts with a trivial command; substitutions are never trivial."""
-    for raw in run.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "$(" in line or "`" in line:
+    """True when every shell segment starts with a trivial command; substitutions and heredocs are never trivial."""
+    segments = _segments(run)
+    if segments is None:
+        return False
+    for segment in segments:
+        words = segment.split(maxsplit=1)
+        if words and words[0].lower() not in _TRIVIAL_COMMANDS:
             return False
-        for segment in _SEGMENT_SEPARATOR.split(line):
-            words = segment.split(maxsplit=1)
-            if words and words[0].lower() not in _TRIVIAL_COMMANDS:
-                return False
     return True
 
 
