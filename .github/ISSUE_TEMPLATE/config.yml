@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture Overview
+    url: https://github.com/aj604/pit-crew/blob/main/docs/architecture.md
+    about: End-to-end lifecycle, trust boundaries, and data contracts.
+  - name: Lane Owner Guide
+    url: https://github.com/aj604/pit-crew/blob/main/docs/lane-guide.md
+    about: Working agreements, @tool conventions, and per-lane starting points.

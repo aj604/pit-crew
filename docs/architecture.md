@@ -1,5 +1,9 @@
 # Pit Crew Architecture
 
+<p align="center">
+  <img src="../brand/circuit-architecture.svg" alt="Pit Crew Circuit Architecture" width="100%" />
+</p>
+
 Pit Crew is an autonomous CI optimization system with one core rule: **the agent proposes, and deterministic code judges.**
 
 The agent inspects a repository, proposes a single targeted CI optimization, pushes a branch on a fork, and selects historical bugs that must still fail. Deterministic code runs the measurements on GitHub Actions and decides whether the change is kept.
