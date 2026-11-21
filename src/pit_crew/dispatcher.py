@@ -8,6 +8,7 @@ execution goes through the injected ``LaneRunner`` or ``ProofBridge``.
 
 import difflib
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -45,6 +46,32 @@ ProgressReporter = Callable[[CycleStage, int, int], None]
 _Hunk = tuple[int, int, list[str]]
 _MISSING_RUNNER_MSG = str(ProofBridgeError.missing_runner())
 _MISSING_PR_CLIENT_MSG = str(ProofBridgeError.missing_pr_client())
+_WORKFLOW_PREFERENCES = ("ci", "test", "tests", "build", "check")
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TargetContext:
+    """Resolved target repository, default branch, workflow file, and upstream history source."""
+
+    ledger_repo: str
+    work_repo: str
+    history_repo: str | None
+    base_branch: str
+    workflow_file: str
+
+
+def _pick_workflow_file(configured: str, workflows: list[str]) -> str:
+    """Choose the best active workflow file, keeping ``configured`` whenever it is present."""
+    if not workflows or configured in workflows:
+        return configured
+    for keyword in _WORKFLOW_PREFERENCES:
+        for name in workflows:
+            stem = PurePosixPath(name).stem.lower()
+            if stem == keyword or keyword in stem:
+                return name
+    return workflows[0]
 
 
 def next_lane(record: Record) -> str | None:
@@ -241,15 +268,24 @@ def _build_analysis_task(
     base_sha: str,
     workflow_file: str,
     prior_attempts: list[dict[str, Any]],
+    history_repo: str | None = None,
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "repo": repo,
         "base_sha": base_sha,
         "workflow_file": workflow_file,
         "prior_attempts": prior_attempts,
     }
+    extra_note = ""
+    if history_repo and normalize_repo(history_repo) != normalize_repo(repo):
+        payload["history_repo"] = history_repo
+        extra_note = (
+            f" If {repo} has no completed CI runs yet, profile CI run history from upstream {history_repo}, "
+            f"and always pass repo={repo!r} when calling record_hypothesis."
+        )
     return (
-        f"Profile CI workflows for {repo} at base commit {base_sha} and record prioritized hypotheses.\n"
+        f"Profile CI workflows for {repo} at base commit {base_sha} and record prioritized hypotheses."
+        f"{extra_note}\n"
         f"Context:\n{json.dumps(payload, indent=2, sort_keys=True)}"
     )
 
@@ -457,7 +493,68 @@ class Dispatcher:
         self._use_host_workspace = use_host_workspace
         self._proof_bridge = proof_bridge
         self._declined_hypothesis_ids: set[str] = set()
+        self._target_cache: dict[str, _TargetContext] = {}
         self._cycle_local = threading.local()
+
+    def _resolve_target_context(self, repo: str) -> _TargetContext:
+        key = normalize_repo(repo)
+        cached = self._target_cache.get(key)
+        if cached is not None:
+            return cached
+
+        work_repo = repo
+        history_repo: str | None = None
+        base_branch = self.config.base_branch
+
+        get_meta = getattr(self.github, "get_repo_metadata", None)
+        if callable(get_meta):
+            meta = get_meta(repo)
+            default_branch = getattr(meta, "default_branch", "")
+            if isinstance(default_branch, str) and default_branch and base_branch == "main":
+                base_branch = default_branch
+            can_push = bool(getattr(meta, "can_push", True))
+            parent_full_name = getattr(meta, "parent_full_name", None)
+            if not can_push:
+                ensure_fork = getattr(self.github, "ensure_writable_fork", None)
+                if callable(ensure_fork):
+                    work_repo = str(ensure_fork(repo))
+                    history_repo = repo
+            elif isinstance(parent_full_name, str) and parent_full_name:
+                history_repo = parent_full_name
+
+        workflow_file = self.config.workflow_file
+        list_workflows = getattr(self.github, "list_workflow_files", None)
+        if callable(list_workflows):
+            workflows = [str(w) for w in list_workflows(history_repo or work_repo)]
+            workflow_file = _pick_workflow_file(workflow_file, workflows)
+
+        ctx = _TargetContext(
+            ledger_repo=repo,
+            work_repo=work_repo,
+            history_repo=history_repo,
+            base_branch=base_branch,
+            workflow_file=workflow_file,
+        )
+        self._target_cache[key] = ctx
+        if work_repo != repo or base_branch != self.config.base_branch or workflow_file != self.config.workflow_file:
+            logger.info(
+                "Resolved target %s -> work_repo=%s history_repo=%s base_branch=%s workflow=%s",
+                repo,
+                work_repo,
+                history_repo,
+                base_branch,
+                workflow_file,
+            )
+        return ctx
+
+    def _work_repo_for(self, repo: str) -> str:
+        return self._resolve_target_context(repo).work_repo
+
+    def _base_branch_for(self, repo: str) -> str:
+        return self._resolve_target_context(repo).base_branch
+
+    def _workflow_default_for(self, repo: str) -> str:
+        return self._resolve_target_context(repo).workflow_file
 
     def _report_progress(self, stage: CycleStage, completed_runs: int = 0, total_runs: int = 0) -> None:
         reporter: ProgressReporter | None = getattr(self._cycle_local, "on_progress", None)
@@ -498,7 +595,7 @@ class Dispatcher:
         latest = self.ledger.latest_kept_candidate(repo)
         if latest is not None and latest.head_sha:
             return latest.head_sha
-        return self.github.get_default_branch_sha(repo)
+        return self.github.get_default_branch_sha(self._work_repo_for(repo))
 
     def select_next_hypothesis(self, repo: str) -> Hypothesis | None:
         """Return the highest-impact unattempted ``Hypothesis`` for ``repo``, or ``None``."""
@@ -519,7 +616,8 @@ class Dispatcher:
         The agent reports `original_files` itself; re-checking against GitHub's copy means a wrong or
         invented "before" text cannot get a weakening change published.
         """
-        fetched = {path: self.github.get_file_content(repo, path, base_sha) for path in candidate.files}
+        work_repo = self._work_repo_for(repo)
+        fetched = {path: self.github.get_file_content(work_repo, path, base_sha) for path in candidate.files}
         base = {path: text for path, text in fetched.items() if text is not None}
         return check_candidate_files(candidate.files, base)
 
@@ -559,18 +657,19 @@ class Dispatcher:
     ) -> Evidence:
         """Collect interleaved CI timing and bug-replay evidence for ``candidate`` against ``base_sha``."""
         repo = self._resolve_repo(candidate)
-        workflow_file = self._resolve_workflow(candidate, workflow)
+        work_repo = self._work_repo_for(repo)
+        workflow_file = self._resolve_workflow(candidate, workflow, repo=repo)
         if not candidate.branch and not candidate.head_sha:
             msg = f"Candidate {candidate.id!r} has neither branch nor head_sha"
             raise ValueError(msg)
 
         baseline_seconds, candidate_seconds, timing_urls = self._collect_interleaved_timings(
-            repo=repo,
+            repo=work_repo,
             workflow=workflow_file,
             base_sha=base_sha,
             candidate=candidate,
         )
-        target = _ReplayTarget(repo=repo, workflow=workflow_file, base_sha=base_sha, candidate=candidate)
+        target = _ReplayTarget(repo=work_repo, workflow=workflow_file, base_sha=base_sha, candidate=candidate)
         bugs_total, bugs_caught, replay_urls, bug_outcomes = self._collect_bug_replays(target, replay_plan)
         return Evidence(
             candidate_id=candidate.id,
@@ -610,39 +709,43 @@ class Dispatcher:
         msg = f"Cannot resolve repository for candidate {candidate.id!r}"
         raise ValueError(msg)
 
-    def _resolve_workflow(self, candidate: Candidate, workflow: str | None) -> str:
+    def _resolve_workflow(self, candidate: Candidate, workflow: str | None, *, repo: str | None = None) -> str:
+        default_wf = self._workflow_default_for(repo) if repo else self.config.workflow_file
         if workflow:
-            return _normalize_workflow_name(workflow, self.config.workflow_file)
+            return _normalize_workflow_name(workflow, default_wf)
         hypothesis = self._find_hypothesis(candidate.hypothesis_id)
         if hypothesis is not None:
-            return _workflow_for_hypothesis(hypothesis, self.config.workflow_file)
-        return self.config.workflow_file
+            return _workflow_for_hypothesis(hypothesis, default_wf)
+        return default_wf
 
     def _verdict_matches_target_workflow(self, verdict: Verdict) -> bool:
-        target_workflow = _normalize_workflow_name(self.config.workflow_file, self.config.workflow_file)
         try:
             cand = self.ledger.get(Candidate, verdict.candidate_id)
         except KeyError:
             return True
-        measured = self._resolve_workflow(cand, workflow=None)
+        repo = cand.repo or (hyp.repo if (hyp := self._find_hypothesis(cand.hypothesis_id)) is not None else "")
+        default_wf = self._workflow_default_for(repo) if repo else self.config.workflow_file
+        target_workflow = _normalize_workflow_name(default_wf, default_wf)
+        measured = self._resolve_workflow(cand, workflow=None, repo=repo or None)
         return measured == target_workflow
 
     def _publish_candidate(self, repo: str, base_sha: str, candidate: Candidate) -> Candidate:
+        work_repo = self._work_repo_for(repo)
         if not candidate.head_sha and candidate.files:
             if not candidate.branch:
                 msg = f"Candidate {candidate.id!r} cannot be published without a branch name"
                 raise ValueError(msg)
-            self.github.create_branch(repo, candidate.branch, base_sha)
+            self.github.create_branch(work_repo, candidate.branch, base_sha)
             try:
                 head_sha = self.github.commit_files(
-                    repo,
+                    work_repo,
                     candidate.branch,
                     base_sha,
                     dict(candidate.files),
                     f"Pit Crew candidate {candidate.id}: {candidate.summary}",
                 )
             except Exception:
-                self.github.delete_branch(repo, candidate.branch)
+                self.github.delete_branch(work_repo, candidate.branch)
                 raise
             published = replace(candidate, repo=repo, base_sha=base_sha, head_sha=head_sha)
             self.ledger.add(published)
@@ -1130,17 +1233,27 @@ class Dispatcher:
                 )
 
             resolved_base_sha = self.resolve_base_sha(repo, base_sha)
+            logger.info("Starting cycle for %s at base_sha=%s", repo, resolved_base_sha[:12])
             self._report_progress("analysis", 0, 0)
             self._run_analysis(repo, resolved_base_sha)
 
             hypothesis = self.select_next_hypothesis(repo)
             if hypothesis is None:
+                logger.info("No unattempted hypotheses remain for %s", repo)
                 return None
 
+            logger.info(
+                "Running optimizer for %s hypothesis=%s (%s, est=%.1fs)",
+                repo,
+                hypothesis.id,
+                hypothesis.skill,
+                hypothesis.expected_savings_seconds,
+            )
             self._report_progress("optimizer", 0, 0)
             candidate, optimizer_completed = self._run_optimizer(repo, resolved_base_sha, hypothesis)
             if candidate is None:
                 if optimizer_completed:
+                    logger.info("Optimizer declined hypothesis %s (%s)", hypothesis.id, hypothesis.skill)
                     self._declined_hypothesis_ids.add(hypothesis.id)
                 return None
 
@@ -1149,20 +1262,22 @@ class Dispatcher:
             self._cycle_local.on_progress = prev_progress
 
     def _run_analysis(self, repo: str, resolved_base_sha: str) -> None:
+        ctx = self._resolve_target_context(repo)
         analysis_task = _build_analysis_task(
             repo=repo,
             base_sha=resolved_base_sha,
-            workflow_file=self.config.workflow_file,
+            workflow_file=ctx.workflow_file,
             prior_attempts=self.ledger.prior_attempts(repo),
+            history_repo=ctx.history_repo,
         )
         if self._use_host_workspace and host_workspace.configured_workspace() is None:
             with (
-                host_workspace.materialize(repo) as checkout,
+                host_workspace.materialize(ctx.work_repo) as checkout,
                 host_workspace.use_workspace(checkout),
             ):
-                self.lane_runner("analysis", analysis_task, self.ledger, repo=repo)
+                self.lane_runner("analysis", analysis_task, self.ledger, repo=ctx.work_repo)
         else:
-            self.lane_runner("analysis", analysis_task, self.ledger, repo=repo)
+            self.lane_runner("analysis", analysis_task, self.ledger, repo=ctx.work_repo)
 
     def _evaluate_candidate(
         self,
@@ -1212,16 +1327,22 @@ class Dispatcher:
                     return verdict
                 return None
 
-        workflow = (
-            _workflow_for_hypothesis(hypothesis, self.config.workflow_file)
-            if hypothesis is not None
-            else self.config.workflow_file
-        )
+        default_wf = self._workflow_default_for(repo)
+        workflow = _workflow_for_hypothesis(hypothesis, default_wf) if hypothesis is not None else default_wf
         evidence = self.collect_evidence(candidate, replay_plan, resolved_base_sha, workflow=workflow)
         self.ledger.add(evidence)
         self._report_progress("rating", 0, 0)
         verdict = rate(evidence)
         self.ledger.add(verdict)
+        logger.info(
+            "Verdict for %s candidate=%s: keep=%s speedup=%.2fx p=%s reason=%s",
+            repo,
+            candidate.id,
+            verdict.keep,
+            verdict.speedup,
+            verdict.p_value,
+            verdict.reason,
+        )
         if verdict.keep and self.config.auto_open_pr:
             self._open_kept_pull_request(repo, hypothesis, candidate, evidence, verdict)
         return verdict
@@ -1234,6 +1355,7 @@ class Dispatcher:
         evidence: Evidence,
         verdict: Verdict,
     ) -> None:
+        ctx = self._resolve_target_context(repo)
         opened = None
         if self._proof_bridge is not None:
             try:
@@ -1244,8 +1366,8 @@ class Dispatcher:
                     self._get_verified_replays(),
                     config=ProofPRConfig(
                         auto_open_pr=True,
-                        base_branch=self.config.base_branch,
-                        repo=repo,
+                        base_branch=ctx.base_branch,
+                        repo=ctx.work_repo,
                     ),
                     preview_files=self._get_preview_files(),
                 )
@@ -1256,14 +1378,15 @@ class Dispatcher:
             self._cycle_local.last_pr_url = getattr(opened, "url", None)
         elif hypothesis is not None:
             self._cycle_local.last_pr_url = self.github.open_pull_request(
-                repo,
+                ctx.work_repo,
                 title=format_pr_title(hypothesis, candidate, verdict),
                 body=format_pr_body(hypothesis, candidate, evidence, verdict),
                 head=candidate.branch,
-                base=self.config.base_branch,
+                base=ctx.base_branch,
             )
 
     def _run_optimizer(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> tuple[Candidate | None, bool]:
+        work_repo = self._work_repo_for(repo)
         existing_ids = {cand.id for cand in self.ledger.all(Candidate)}
         task = _build_optimizer_task(
             repo=repo,
@@ -1271,7 +1394,7 @@ class Dispatcher:
             hypothesis=hypothesis,
             prior_attempts=self.ledger.prior_attempts(repo),
         )
-        result = self.lane_runner("optimizer", task, self.ledger, repo=repo)
+        result = self.lane_runner("optimizer", task, self.ledger, repo=work_repo)
         new_candidates = [
             cand
             for cand in self.ledger.all(Candidate)
@@ -1280,19 +1403,21 @@ class Dispatcher:
         return (new_candidates[-1] if new_candidates else None), _is_completed_lane_result(result)
 
     def _run_proof(self, repo: str, base_sha: str, candidate: Candidate) -> tuple[ReplayPlan | None, bool]:
+        ctx = self._resolve_target_context(repo)
+        proof_repo = ctx.history_repo or repo
         existing_ids = {plan.id for plan in self.ledger.all(ReplayPlan)}
         if self._proof_bridge is not None:
             try:
-                _, result = self._proof_bridge.run(candidate, ledger=self.ledger, repo=repo, base_sha=base_sha)
+                _, result = self._proof_bridge.run(candidate, ledger=self.ledger, repo=proof_repo, base_sha=base_sha)
             except ProofBridgeError as exc:
                 if str(exc) != _MISSING_RUNNER_MSG:
                     raise
-                ctx = self._proof_bridge.prepare_context(candidate, repo=repo, base_sha=base_sha)
-                prompt = self._proof_bridge.build_prompt(ctx)
-                result = self.lane_runner("proof", prompt, self.ledger, repo=repo)
+                ctx_proof = self._proof_bridge.prepare_context(candidate, repo=proof_repo, base_sha=base_sha)
+                prompt = self._proof_bridge.build_prompt(ctx_proof)
+                result = self.lane_runner("proof", prompt, self.ledger, repo=ctx.work_repo)
         else:
-            task = _build_proof_task(repo=repo, base_sha=base_sha, candidate=candidate)
-            result = self.lane_runner("proof", task, self.ledger, repo=repo)
+            task = _build_proof_task(repo=proof_repo, base_sha=base_sha, candidate=candidate)
+            result = self.lane_runner("proof", task, self.ledger, repo=ctx.work_repo)
         new_plans = [
             plan
             for plan in self.ledger.all(ReplayPlan)

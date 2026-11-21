@@ -619,7 +619,7 @@ def test_live_poller_hydration_polling_resilience_and_trigger() -> None:
     assert out["staleDemo"] == {"error": None, "timers": 0}
     assert out["inFlight"] == {"posts": 1, "btn": [True, "true", "Pit Stop Running"]}
     assert out["after202"] == {
-        "body": {"url": "/triggers/cycle", "body": {"repo": "Aj604/Pit-Crew", "until_sla": False}},
+        "body": {"url": "/triggers/cycle", "body": {"repo": "Aj604/Pit-Crew", "until_sla": True}},
         "btn": [True, "true"], "delay": 3000, "pillHidden": True,
     }  # fmt: skip
     assert out["after409"] == {
@@ -866,7 +866,7 @@ def test_live_mode_browser_verification_desktop_and_mobile() -> None:
     assert out["triggered"] == {
         "disabled": True, "busy": "true", "label": "Pit Stop Running", "spinnerAnim": "pc-spin",
     }  # fmt: skip
-    assert dispatcher.calls == [("run_cycle", "aj604/pit-crew")]
+    assert dispatcher.calls == [("run_until_sla", "aj604/pit-crew")]
     mob = out["mobile"]
     assert (mob["pillHidden"], "Upstream telemetry down" in mob["pillText"], mob["overflow"]) == (False, True, False)
     assert (mob["pillColor"], mob["laps"], mob["sha"]) == ("rgb(255, 208, 0)", 1, "e9b17d3")

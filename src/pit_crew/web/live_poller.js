@@ -200,7 +200,7 @@ export function createLivePoller(root, header, store, options = {}) {
       const response = await fetchFn("/triggers/cycle", {
         method: "POST",
         headers: withBearerHeader({ "Content-Type": "application/json", Accept: "application/json" }, currentApiToken()),
-        body: JSON.stringify({ repo, until_sla: false }),
+        body: JSON.stringify({ repo, until_sla: true }),
       });
       if (isStaleTrigger(ctx)) return false;
       const detail = extractErrorDetail(await readJsonSafe(response));
