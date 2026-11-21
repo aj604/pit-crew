@@ -203,6 +203,30 @@ def test_kept_grandchild_keeps_every_ancestor(repo: Path) -> None:
     assert registered(repo) == {repo.resolve(), parent.resolve(), child.resolve(), grandchild.resolve()}
 
 
+def test_failed_nested_removal_keeps_its_parent(repo: Path, tmp_path: Path) -> None:
+    # Git refuses to remove a worktree holding an initialised submodule, though it classifies as finished.
+    source = tmp_path / "subsrc"
+    source.mkdir()
+    git(source, "init", "-q", "-b", "main")
+    commit(source, "f")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), "sm")
+    git(repo, "commit", "-q", "-m", "add sm")
+    parent = add_worktree(repo, "parent")
+    child = add_nested_worktree(repo, parent, "child")
+    git(child, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    lines: list[str] = []
+
+    total = prune(repo, apply=True, open_prs=lambda _: frozenset(), out=lines.append)
+
+    assert child.exists()
+    assert parent.exists()
+    assert total == 0
+    assert registered(repo) == {repo.resolve(), parent.resolve(), child.resolve()}
+    assert any(line.startswith("failed") and f"{child}  " in line for line in lines)
+    assert any(line.startswith("keep") and f"{parent}  " in line and "was not removed" in line for line in lines)
+    assert not any(line.startswith("removed") for line in lines)
+
+
 def test_dry_run_does_not_promise_to_remove_a_parent_of_a_kept_worktree(repo: Path) -> None:
     parent = add_worktree(repo, "parent")
     child = add_nested_worktree(repo, parent, "child")

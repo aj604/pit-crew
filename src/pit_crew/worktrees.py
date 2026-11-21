@@ -270,12 +270,20 @@ def prune(  # noqa: PLR0913  keyword-only seams for tests and the CLI
     total = 0
     # Judge every worktree before removing any: a removal can delete directories nested inside it.
     verdicts = _keep_parents_of_kept([classify(w, main=main, cwd=here, base=base, open_prs=prs) for w in worktrees])
+    paths = [w.path.resolve() for w in worktrees]
     # Remove nested worktrees before the ones that contain them.
     for verdict in sorted(verdicts, key=lambda v: len(v.worktree.path.resolve().parts), reverse=True):
         worktree = verdict.worktree
         if not verdict.removable:
             out(f"keep    {worktree.path}  ({_label(worktree)}): {verdict.reason}\n")
             continue
+        if apply:
+            # A nested worktree whose removal failed is still on disk; removing this one would delete it.
+            path = worktree.path.resolve()
+            inner = next((p for p in paths if p != path and p.is_relative_to(path) and p.is_dir()), None)
+            if inner is not None:
+                out(f"keep    {worktree.path}  ({_label(worktree)}): contains worktree that was not removed: {inner}\n")
+                continue
         size = disk_usage(worktree.path)
         if not apply:
             out(f"remove  {worktree.path}  ({_label(worktree)})  {human_size(size)}  [dry run]\n")
