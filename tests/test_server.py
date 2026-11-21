@@ -752,18 +752,32 @@ def test_api_token_enforces_bearer_auth_on_api_and_triggers() -> None:
 
 
 def test_openapi_declares_http_bearer_security_scheme() -> None:
+    protected_routes = (
+        ("/triggers/cycle", "post"),
+        ("/api/repos/{owner}/{name}/attempts", "get"),
+        ("/api/repos/{owner}/{name}/records", "get"),
+        ("/api/repos/{owner}/{name}/status", "get"),
+    )
+
     app = create_app(ledger=InMemoryLedger(), api_token="secret-api-token")  # noqa: S106
     schema = app.openapi()
 
     security_schemes = schema.get("components", {}).get("securitySchemes", {})
     assert security_schemes.get("HTTPBearer") == {"type": "http", "scheme": "bearer"}
 
-    for path, method in (
-        ("/triggers/cycle", "post"),
-        ("/api/repos/{owner}/{name}/attempts", "get"),
-        ("/api/repos/{owner}/{name}/records", "get"),
-        ("/api/repos/{owner}/{name}/status", "get"),
-    ):
+    for path, method in protected_routes:
         assert {"HTTPBearer": []} in schema["paths"][path][method].get("security", [])
 
     assert "security" not in schema["paths"]["/health"]["get"]
+
+    unauthenticated_app = create_app(ledger=InMemoryLedger())
+    with TestClient(unauthenticated_app) as client:
+        unauth_resp = client.get("/openapi.json")
+    assert unauth_resp.status_code == 200
+    unauth_schema = unauth_resp.json()
+
+    unauth_schemes = unauth_schema.get("components", {}).get("securitySchemes", {})
+    assert "HTTPBearer" not in unauth_schemes
+
+    for path, method in protected_routes:
+        assert "security" not in unauth_schema["paths"][path][method]

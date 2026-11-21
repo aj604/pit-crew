@@ -123,14 +123,12 @@ def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str,
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def _make_api_token_dependency(api_token: str | None) -> Callable[[HTTPAuthorizationCredentials | None], None]:
-    """Build a FastAPI dependency that enforces Bearer token auth when ``api_token`` is set."""
+def _make_api_token_dependency(api_token: str) -> Callable[[HTTPAuthorizationCredentials | None], None]:
+    """Build a FastAPI dependency that enforces Bearer token auth for ``api_token``."""
 
     def _require_api_token(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
     ) -> None:
-        if api_token is None:
-            return
         if (
             credentials is None
             or credentials.scheme.lower() != "bearer"
@@ -166,7 +164,7 @@ def create_app(
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
 
-    require_api_token = _make_api_token_dependency(api_token)
+    api_auth_dependencies = [Depends(_make_api_token_dependency(api_token))] if api_token is not None else []
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -179,7 +177,7 @@ def create_app(
     @app.post(
         "/triggers/cycle",
         status_code=status.HTTP_202_ACCEPTED,
-        dependencies=[Depends(require_api_token)],
+        dependencies=api_auth_dependencies,
     )
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
         """Enqueue a background optimization cycle guarded by a per-repo lock."""
@@ -211,7 +209,7 @@ def create_app(
 
     @app.get(
         "/api/repos/{owner}/{name}/attempts",
-        dependencies=[Depends(require_api_token)],
+        dependencies=api_auth_dependencies,
     )
     def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
         """Return prior optimization attempts for a repository."""
@@ -219,7 +217,7 @@ def create_app(
 
     @app.get(
         "/api/repos/{owner}/{name}/records",
-        dependencies=[Depends(require_api_token)],
+        dependencies=api_auth_dependencies,
     )
     def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
         """Return structured ledger records for a repository."""
@@ -227,7 +225,7 @@ def create_app(
 
     @app.get(
         "/api/repos/{owner}/{name}/status",
-        dependencies=[Depends(require_api_token)],
+        dependencies=api_auth_dependencies,
     )
     def repo_status(owner: str, name: str) -> dict[str, Any]:
         """Return current cycle state, base SHA, latest verdict, and SLA status."""
