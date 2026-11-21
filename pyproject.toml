@@ -172,3 +172,10 @@ source_modules = [
     "pit_crew.lanes",
 ]
 forbidden_modules = ["google"]
+
+[[tool.importlinter.contracts]]
+name = "The CLI reaches google-genai only through managed_agent"
+type = "forbidden"
+source_modules = ["pit_crew.cli"]
+forbidden_modules = ["google"]
+allow_indirect_imports = true
