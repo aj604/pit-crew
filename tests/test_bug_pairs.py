@@ -157,6 +157,19 @@ def test_rerun_on_fully_seeded_repo_writes_nothing() -> None:
     assert not any(p.created for p in second.bug_pairs)
 
 
+def test_rerun_ignores_other_runs_the_api_returns() -> None:
+    gh = FakeGitHubClient(filter_runs=False)  # the seeder must filter push runs on its own
+    first = _seed(gh)
+    c0 = gh.list_commits(REPO, "main")[-1][0]
+    for pair in first.bug_pairs:
+        gh.add_run(REPO, pair.bug_sha, event=bs.DISPATCH_EVENT, conclusion="success")
+        gh.add_run(REPO, pair.bug_sha, branch="feature", event="push", conclusion="success")
+        gh.add_run(REPO, pair.fix_sha, path=".github/workflows/other.yml", event="push", conclusion="failure")
+    gh.add_run(REPO, c0, event="push", conclusion="failure")
+    second = _seed(gh)
+    assert [(p.bug_run, p.fix_run) for p in second.bug_pairs] == [(p.bug_run, p.fix_run) for p in first.bug_pairs]
+
+
 def test_resume_after_some_pairs_seeds_only_the_rest() -> None:
     gh = FakeGitHubClient()
     _seed(gh, bug_pairs=bs.BUG_PAIRS[:2])
