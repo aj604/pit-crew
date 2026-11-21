@@ -233,6 +233,37 @@ def test_shell_order_comparisons_flip_only_inside_arithmetic() -> None:
     assert ops == [(1, "< -> >="), (2, ">= -> <"), (3, "&& -> ||")]
 
 
+@pytest.mark.parametrize("opening", ["echo $(( ", "(( "])
+def test_shell_order_comparisons_skip_commands_nested_in_arithmetic(opening: str) -> None:
+    line = f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x >= y ))) < limit ))"
+    order_mutants = [m.after for m in mutants("retry.sh", line)]
+    assert order_mutants == [
+        f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x < y ))) < limit ))",
+        f"{opening}$(echo 1 > log; [[ a < b ]]; echo $(( x >= y ))) >= limit ))",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("redirect", "indent"),
+    [("<<'EOF'", ""), ('<<"EOF"', ""), ("<<-'EOF'", "\t"), (r"<<E\OF", ""), ("<<$'EOF'", ""), ('<<$"EOF"', "")],
+)
+def test_shell_mutants_skip_quoted_heredoc_bodies(redirect: str, indent: str) -> None:
+    source = f"cat {redirect}\n{indent}(( a < b )) && true\n{indent}EOF\n(( x > y ))\n"
+    assert mutants("retry.sh", source) == [
+        Mutant("retry.sh", 4, "(( x > y ))", "(( x <= y ))", "> -> <="),
+    ]
+
+
+def test_shell_heredocs_are_consumed_in_redirection_order() -> None:
+    source = "cat <<FIRST <<'SECOND'\ntrue\nFIRST\n(( a < b ))\nSECOND\n(( x > y ))\n"
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(2, "true -> false"), (6, "> -> <=")]
+
+
+def test_shell_heredocs_inside_command_substitution_have_their_own_queue() -> None:
+    source = "echo <<'OUTER' $(cat <<'INNER'\n(( a < b ))\nINNER\n(( x > y ))\n)\n(( a > b ))\nOUTER\n(( x < y ))\n"
+    assert [(m.line, m.operator) for m in mutants("retry.sh", source)] == [(4, "> -> <="), (8, "< -> >=")]
+
+
 def test_booleans_flip_only_where_the_language_spells_them_that_way() -> None:
     assert mutants("a.ts", "const t = True;\n") == []
     assert mutants("a.py", "x = true\n") == []
