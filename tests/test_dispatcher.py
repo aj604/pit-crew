@@ -6,7 +6,7 @@ from typing import Any, override
 import pytest
 
 from pit_crew import managed_agent
-from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
+from pit_crew.contracts import BugCase, Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.dispatcher import DISALLOWED_PATH_REASON, Dispatcher, DispatcherConfig, LaneRunner, next_lane
 from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.ledger import InMemoryLedger, Ledger
@@ -20,15 +20,21 @@ class _FakeGitHubClient:
         self,
         default_shas: dict[str, str],
         run_scripts: dict[int, list[WorkflowRunResult]] | None = None,
+        *,
+        fail_on: dict[str, Exception] | None = None,
     ) -> None:
         self._default_shas = dict(default_shas)
         self._run_scripts: dict[int, list[WorkflowRunResult]] = {
             run_id: list(results) for run_id, results in (run_scripts or {}).items()
         }
+        self._fail_on: dict[str, Exception] = dict(fail_on or {})
         self.default_branch_lookups: list[str] = []
         self.dispatches: list[tuple[str, str, str]] = []
         self.poll_calls: list[tuple[str, int]] = []
         self.branches: dict[tuple[str, str], str] = {}
+        self.created_branches: list[tuple[str, str, str]] = []
+        self.deleted_branches: list[tuple[str, str]] = []
+        self.events: list[tuple[str, ...]] = []
         self.commits: list[dict[str, object]] = []
         self.pull_requests: list[dict[str, str]] = []
 
@@ -37,10 +43,16 @@ class _FakeGitHubClient:
         return self._default_shas[repo]
 
     def create_branch(self, repo: str, branch: str, base_sha: str) -> str:
+        self.events.append(("create_branch", repo, branch, base_sha))
+        if "create_branch" in self._fail_on:
+            raise self._fail_on["create_branch"]
+        self.created_branches.append((repo, branch, base_sha))
         self.branches[(repo, branch)] = base_sha
         return base_sha
 
     def delete_branch(self, repo: str, branch: str) -> None:
+        self.events.append(("delete_branch", repo, branch))
+        self.deleted_branches.append((repo, branch))
         del self.branches[(repo, branch)]
 
     def commit_files(
@@ -51,16 +63,25 @@ class _FakeGitHubClient:
         files: dict[str, str],
         message: str,
     ) -> str:
+        self.events.append(("commit_files", repo, branch, base_sha))
+        if "commit_files" in self._fail_on:
+            raise self._fail_on["commit_files"]
         head_sha = f"commit-{len(self.commits) + 1}"
         self.branches[(repo, branch)] = head_sha
         self.commits.append({"repo": repo, "branch": branch, "base_sha": base_sha, "files": files, "message": message})
         return head_sha
 
     def dispatch_workflow(self, repo: str, workflow: str, ref: str) -> int:
+        self.events.append(("dispatch_workflow", repo, workflow, ref))
+        if "dispatch_workflow" in self._fail_on:
+            raise self._fail_on["dispatch_workflow"]
         self.dispatches.append((repo, workflow, ref))
         return len(self.dispatches)
 
     def get_workflow_run(self, repo: str, run_id: int) -> WorkflowRunResult:
+        self.events.append(("get_workflow_run", repo, str(run_id)))
+        if "get_workflow_run" in self._fail_on:
+            raise self._fail_on["get_workflow_run"]
         self.poll_calls.append((repo, run_id))
         script = self._run_scripts.get(run_id)
         if script:
@@ -400,14 +421,16 @@ def test_run_cycle_selects_highest_impact_unattempted_hypothesis_and_runs_lane_h
     assert verdict.candidate_id == cand.id
     assert len(ledger.all(Evidence)) == 1
     assert github.default_branch_lookups == []
-    assert (
-        github.dispatches
-        == [
+    assert github.dispatches == [
+        *[
             ("org/repo", "tests.yml", "compounded-sha-1"),
             ("org/repo", "tests.yml", "pc/shard-tests"),
         ]
-        * 5
-    )
+        * 5,
+        ("org/repo", "tests.yml", f"pc/replay-{cand.id}-0"),
+        ("org/repo", "tests.yml", f"pc/replay-{cand.id}-1"),
+    ]
+    assert github.branches == {}
 
 
 def test_run_cycle_uses_config_workflow_file_when_hypothesis_workflow_path_is_empty() -> None:
@@ -437,14 +460,15 @@ def test_run_cycle_uses_config_workflow_file_when_hypothesis_workflow_path_is_em
 
     assert verdict is not None
     assert dispatcher.evidence_calls == [(cand, plan, "base-sha-0", "custom.yml")]
-    assert (
-        github.dispatches
-        == [
+    assert github.dispatches == [
+        *[
             ("org/repo", "custom.yml", "base-sha-0"),
             ("org/repo", "custom.yml", "pc/cache"),
         ]
-        * 5
-    )
+        * 5,
+        ("org/repo", "custom.yml", f"pc/replay-{cand.id}-0"),
+    ]
+    assert github.branches == {}
 
 
 @pytest.mark.parametrize(
@@ -607,7 +631,7 @@ def test_collect_evidence_interleaves_baseline_and_candidate_pairs_including_col
         repo="org/repo",
         head_sha="cand-head-1",
     )
-    plan = ReplayPlan(candidate_id=cand.id, bug_shas=("bug-1",))
+    plan = ReplayPlan(candidate_id=cand.id)
 
     evidence = dispatcher.collect_evidence(cand, plan, "base-sha-1", workflow="ci.yml")
 
@@ -899,6 +923,7 @@ def test_run_cycle_persists_interleaved_evidence_and_verdict_to_ledger() -> None
         else:
             run_scripts[base_id] = [_make_run(base_id, duration_seconds=baseline_durations[pair_idx])]
         run_scripts[cand_id] = [_make_run(cand_id, duration_seconds=candidate_durations[pair_idx])]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=20.0)]
 
     github = _FakeGitHubClient({"org/repo": "base-sha-0"}, run_scripts=run_scripts)
     clock = _FakeClock()
@@ -924,11 +949,11 @@ def test_run_cycle_persists_interleaved_evidence_and_verdict_to_ledger() -> None
     assert ledger.get(Verdict, verdict.id) == verdict
     assert ledger.all(Verdict) == [verdict]
     assert verdict.candidate_id == cand.id
-    assert verdict.keep is False
+    assert verdict.keep is True
     assert verdict.median_seconds == 50.0
     assert verdict.p95_seconds == pytest.approx(51.8)
     assert verdict.sla_met is True
-    assert verdict.reason == "no bugs replayed, so safety is unproven"
+    assert verdict.reason == "2.00x faster, caught 1/1 bugs (SLA met)"
 
     stored_evidence = ledger.all(Evidence)
     assert len(stored_evidence) == 1
@@ -937,8 +962,20 @@ def test_run_cycle_persists_interleaved_evidence_and_verdict_to_ledger() -> None
     assert ev.candidate_id == cand.id
     assert ev.baseline_seconds == baseline_durations
     assert ev.candidate_seconds == candidate_durations
-    assert ev.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 11))
+    assert ev.bugs_total == 1
+    assert ev.bugs_caught == 1
+    assert ev.bug_outcomes == (
+        {
+            "kind": "commit",
+            "ref": "red-1",
+            "caught": True,
+            "baseline_failed": True,
+            "run_url": "https://github.com/org/repo/actions/runs/11",
+        },
+    )
+    assert ev.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 12))
     assert clock.sleeps == [2.0, 2.0]
+    assert github.branches == {}
 
 
 def test_run_cycle_rejects_and_persists_evidence_when_candidate_breaks_ci() -> None:
@@ -976,4 +1013,352 @@ def test_run_cycle_rejects_and_persists_evidence_when_candidate_breaks_ci() -> N
     assert len(stored_evidence) == 1
     assert stored_evidence[0].candidate_seconds == ()
     assert len(stored_evidence[0].baseline_seconds) == 5
-    assert len(stored_evidence[0].run_urls) == 6
+    assert stored_evidence[0].bugs_total == 1
+    assert len(stored_evidence[0].run_urls) == 7
+    assert github.branches == {}
+
+
+def test_collect_evidence_replays_single_commit_case_with_overlay_and_rater_keeps() -> None:
+    ledger = InMemoryLedger()
+    baseline_durations = (120.0, 100.0, 102.0, 99.0, 101.0)
+    candidate_durations = (60.0, 48.0, 50.0, 49.0, 51.0)
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=baseline_durations[pair_idx])]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=candidate_durations[pair_idx])]
+    run_scripts[11] = [
+        _make_run(11, status="queued", conclusion=None, duration_seconds=0.0),
+        _make_run(11, status="in_progress", conclusion=None, duration_seconds=8.0),
+        _make_run(11, status="completed", conclusion="failure", duration_seconds=18.0),
+    ]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha-1"}, run_scripts=run_scripts)
+    clock = _FakeClock()
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5, poll_interval_seconds=3.0),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    cand_files = {
+        ".github/workflows/ci.yml": "name: Fast CI\non: [push, workflow_dispatch]\n",
+        "pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-n auto'\n",
+    }
+    cand = Candidate(
+        id="cand123",
+        hypothesis_id="hyp-1",
+        branch="pc/fast-ci",
+        summary="enable xdist",
+        repo="org/repo",
+        head_sha="cand-head-1",
+        files=cand_files,
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="deadbeef01", reason="historical red commit"),),
+    )
+
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha-1", workflow="ci.yml")
+
+    expected_branch = "pc/replay-cand123-0"
+    assert github.created_branches == [("org/repo", expected_branch, "deadbeef01")]
+    assert github.deleted_branches == [("org/repo", expected_branch)]
+    assert github.branches == {}
+    assert len(github.commits) == 1
+    assert github.commits[0]["repo"] == "org/repo"
+    assert github.commits[0]["branch"] == expected_branch
+    assert github.commits[0]["base_sha"] == "deadbeef01"
+    assert github.commits[0]["files"] == cand_files
+    assert github.commits[0]["files"] is not cand.files
+
+    replay_events = github.events[-7:]
+    assert replay_events == [
+        ("create_branch", "org/repo", expected_branch, "deadbeef01"),
+        ("commit_files", "org/repo", expected_branch, "deadbeef01"),
+        ("dispatch_workflow", "org/repo", "ci.yml", expected_branch),
+        ("get_workflow_run", "org/repo", "11"),
+        ("get_workflow_run", "org/repo", "11"),
+        ("get_workflow_run", "org/repo", "11"),
+        ("delete_branch", "org/repo", expected_branch),
+    ]
+    assert clock.sleeps == [3.0, 3.0]
+
+    assert evidence.bugs_total == 1
+    assert evidence.bugs_caught == 1
+    assert evidence.bug_outcomes == (
+        {
+            "kind": "commit",
+            "ref": "deadbeef01",
+            "caught": True,
+            "baseline_failed": True,
+            "run_url": "https://github.com/org/repo/actions/runs/11",
+        },
+    )
+    assert evidence.run_urls == tuple(f"https://github.com/org/repo/actions/runs/{i}" for i in range(1, 12))
+
+    verdict = rate(evidence)
+    assert verdict.keep is True
+    assert verdict.reason == "2.02x faster, caught 1/1 bugs (SLA met)"
+
+
+def test_collect_evidence_replays_multiple_commit_cases_and_skips_mutation_cases() -> None:
+    ledger = InMemoryLedger()
+    run_scripts = {
+        1: [_make_run(1, conclusion="failure", duration_seconds=15.0)],
+        2: [_make_run(2, conclusion="failure", duration_seconds=17.0, html_url="")],
+    }
+    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand_files = {".github/workflows/ci.yml": "name: Optimized\n"}
+    cand = Candidate(
+        id="cand-multi",
+        hypothesis_id="h1",
+        branch="pc/opt",
+        summary="optimize",
+        repo="org/repo",
+        files=cand_files,
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            BugCase(kind="commit", commit_sha="red-sha-a", reason="bug A"),
+            BugCase(kind="mutation", mutated_files={"src/app.py": "raise RuntimeError('bug')\n"}, reason="mutant"),
+            BugCase(kind="commit", commit_sha="red-sha-b", reason="bug B"),
+        ),
+    )
+
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == [
+        ("org/repo", "pc/replay-cand-multi-0", "red-sha-a"),
+        ("org/repo", "pc/replay-cand-multi-2", "red-sha-b"),
+    ]
+    assert github.deleted_branches == [
+        ("org/repo", "pc/replay-cand-multi-0"),
+        ("org/repo", "pc/replay-cand-multi-2"),
+    ]
+    assert github.branches == {}
+    assert [(c["branch"], c["base_sha"], c["files"]) for c in github.commits] == [
+        ("pc/replay-cand-multi-0", "red-sha-a", cand_files),
+        ("pc/replay-cand-multi-2", "red-sha-b", cand_files),
+    ]
+    assert github.dispatches == [
+        ("org/repo", "ci.yml", "pc/replay-cand-multi-0"),
+        ("org/repo", "ci.yml", "pc/replay-cand-multi-2"),
+    ]
+    assert evidence.bugs_total == 2
+    assert evidence.bugs_caught == 2
+    assert evidence.run_urls == ("https://github.com/org/repo/actions/runs/1",)
+    assert evidence.bug_outcomes == (
+        {
+            "kind": "commit",
+            "ref": "red-sha-a",
+            "caught": True,
+            "baseline_failed": True,
+            "run_url": "https://github.com/org/repo/actions/runs/1",
+        },
+        {
+            "kind": "commit",
+            "ref": "red-sha-b",
+            "caught": True,
+            "baseline_failed": True,
+            "run_url": "",
+        },
+    )
+
+
+@pytest.mark.parametrize("uncaught_conclusion", ["success", "cancelled", "timed_out", "skipped", None])
+def test_collect_evidence_non_failure_replay_is_uncaught_and_rater_rejects(
+    uncaught_conclusion: str | None,
+) -> None:
+    ledger = InMemoryLedger()
+    run_scripts: dict[int, list[WorkflowRunResult]] = {}
+    for pair_idx in range(5):
+        run_scripts[pair_idx * 2 + 1] = [_make_run(pair_idx * 2 + 1, duration_seconds=100.0 + pair_idx)]
+        run_scripts[pair_idx * 2 + 2] = [_make_run(pair_idx * 2 + 2, duration_seconds=45.0 + pair_idx)]
+    run_scripts[11] = [_make_run(11, conclusion="failure", duration_seconds=12.0)]
+    run_scripts[12] = [_make_run(12, conclusion=uncaught_conclusion, duration_seconds=14.0)]
+
+    github = _FakeGitHubClient({"org/repo": "base-sha"}, run_scripts=run_scripts)
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=5),
+    )
+    cand = Candidate(
+        id="cand-miss",
+        hypothesis_id="h1",
+        branch="pc/miss",
+        summary="skips broken test",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: Shallow CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(
+            BugCase(kind="commit", commit_sha="caught-sha", reason="caught"),
+            BugCase(kind="commit", commit_sha="missed-sha", reason="missed"),
+        ),
+    )
+
+    evidence = dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert evidence.bugs_total == 2
+    assert evidence.bugs_caught == 1
+    assert evidence.bug_outcomes == (
+        {
+            "kind": "commit",
+            "ref": "caught-sha",
+            "caught": True,
+            "baseline_failed": True,
+            "run_url": "https://github.com/org/repo/actions/runs/11",
+        },
+        {
+            "kind": "commit",
+            "ref": "missed-sha",
+            "caught": False,
+            "baseline_failed": True,
+            "run_url": "https://github.com/org/repo/actions/runs/12",
+        },
+    )
+    assert evidence.run_urls[-2:] == (
+        "https://github.com/org/repo/actions/runs/11",
+        "https://github.com/org/repo/actions/runs/12",
+    )
+    assert github.branches == {}
+
+    verdict = rate(evidence)
+    assert verdict.keep is False
+    assert verdict.reason == "caught 1/2 bugs"
+
+
+@pytest.mark.parametrize("failing_stage", ["commit_files", "dispatch_workflow", "get_workflow_run"])
+def test_collect_evidence_deletes_replay_branch_when_replay_stage_raises(failing_stage: str) -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        fail_on={failing_stage: RuntimeError(f"injected {failing_stage} error")},
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand = Candidate(
+        id="cand-err",
+        hypothesis_id="h1",
+        branch="pc/err",
+        summary="err test",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bug-err-sha"),),
+    )
+
+    with pytest.raises(RuntimeError, match=f"injected {failing_stage} error"):
+        dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == [("org/repo", "pc/replay-cand-err-0", "bug-err-sha")]
+    assert github.deleted_branches == [("org/repo", "pc/replay-cand-err-0")]
+    assert github.branches == {}
+
+
+def test_collect_evidence_deletes_replay_branch_on_poll_timeout() -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        run_scripts={1: [_make_run(1, status="in_progress", conclusion=None, duration_seconds=0.0)]},
+    )
+    clock = _FakeClock()
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0, poll_interval_seconds=5.0, run_timeout_seconds=10.0),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    cand = Candidate(
+        id="cand-timeout",
+        hypothesis_id="h1",
+        branch="pc/timeout",
+        summary="timeout test",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bug-timeout-sha"),),
+    )
+
+    with pytest.raises(TimeoutError, match=r"Workflow run 1 in org/repo did not complete within 10\.0s"):
+        dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == [("org/repo", "pc/replay-cand-timeout-0", "bug-timeout-sha")]
+    assert github.deleted_branches == [("org/repo", "pc/replay-cand-timeout-0")]
+    assert github.branches == {}
+
+
+def test_collect_evidence_does_not_delete_branch_when_create_branch_fails() -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient(
+        {"org/repo": "base-sha"},
+        fail_on={"create_branch": RuntimeError("branch create failed")},
+    )
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand = Candidate(
+        id="cand-create-err",
+        hypothesis_id="h1",
+        branch="pc/create-err",
+        summary="create err",
+        repo="org/repo",
+        files={".github/workflows/ci.yml": "name: CI\n"},
+    )
+    plan = ReplayPlan(
+        candidate_id=cand.id,
+        cases=(BugCase(kind="commit", commit_sha="bug-sha"),),
+    )
+
+    with pytest.raises(RuntimeError, match="branch create failed"):
+        dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == []
+    assert github.deleted_branches == []
+    assert github.branches == {}
+
+
+def test_collect_evidence_raises_value_error_for_commit_case_missing_sha() -> None:
+    ledger = InMemoryLedger()
+    github = _FakeGitHubClient({"org/repo": "base-sha"})
+    dispatcher = Dispatcher(
+        ledger,
+        github,
+        lane_runner=_RecordingLaneRunner(),
+        config=DispatcherConfig(timing_pairs=0),
+    )
+    cand = Candidate(id="cand-nosha", hypothesis_id="h1", branch="pc/nosha", summary="nosha", repo="org/repo")
+    malformed_case = BugCase(kind="commit", commit_sha="valid-sha")
+    object.__setattr__(malformed_case, "commit_sha", None)
+    plan = ReplayPlan(candidate_id=cand.id, cases=(malformed_case,))
+
+    with pytest.raises(ValueError, match="missing commit_sha"):
+        dispatcher.collect_evidence(cand, plan, "base-sha", workflow="ci.yml")
+
+    assert github.created_branches == []
+    assert github.deleted_branches == []

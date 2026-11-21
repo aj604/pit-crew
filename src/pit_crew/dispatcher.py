@@ -15,6 +15,7 @@ from pathlib import PurePosixPath
 from typing import Any, Protocol, cast, runtime_checkable
 
 from pit_crew.contracts import (
+    BugCase,
     Candidate,
     Evidence,
     Hypothesis,
@@ -148,6 +149,15 @@ class _TimingSide:
     active: bool = True
 
 
+@dataclass(frozen=True)
+class _ReplayTarget:
+    """Shared target metadata for executing bug replays against a candidate."""
+
+    repo: str
+    workflow: str
+    candidate: Candidate
+
+
 class Dispatcher:
     """Host-side orchestrator driving lane handoffs, timing measurement, and candidate safety guards."""
 
@@ -215,19 +225,22 @@ class Dispatcher:
     def collect_evidence(
         self,
         candidate: Candidate,
-        replay_plan: ReplayPlan,  # noqa: ARG002  hook populated by bug replay lanes
+        replay_plan: ReplayPlan,
         base_sha: str,
         *,
         workflow: str | None = None,
     ) -> Evidence:
-        """Collect interleaved CI timing evidence for ``candidate`` against ``base_sha``.
+        """Collect interleaved CI timing and bug-replay evidence for ``candidate`` against ``base_sha``.
 
         Alternates baseline (``base_sha``) and candidate (``candidate.branch`` or
         ``candidate.head_sha``) workflow dispatches for ``config.timing_pairs`` pairs,
         including cold Run #1 to cancel runner-load drift. Aborts timing collection for a
         side if any timing run concludes with a status other than ``"success"``.
 
-        TODO(dispatcher owner): wire historical commit and mutation bug replay execution.
+        Then replays each ``kind == "commit"`` ``BugCase`` in ``replay_plan.cases`` by
+        overlaying ``candidate.files`` onto ``bug_case.commit_sha`` on a temporary
+        ``pc/replay-<candidate_id>-<idx>`` branch and recording whether CI catches the
+        bug (concludes ``"failure"``).
         """
         repo = self._resolve_repo(candidate)
         workflow_file = self._resolve_workflow(candidate, workflow)
@@ -236,19 +249,22 @@ class Dispatcher:
             msg = f"Candidate {candidate.id!r} has neither branch nor head_sha"
             raise ValueError(msg)
 
-        baseline_seconds, candidate_seconds, run_urls = self._collect_interleaved_timings(
+        baseline_seconds, candidate_seconds, timing_urls = self._collect_interleaved_timings(
             repo=repo,
             workflow=workflow_file,
             base_sha=base_sha,
             candidate_ref=candidate_ref,
         )
+        target = _ReplayTarget(repo=repo, workflow=workflow_file, candidate=candidate)
+        bugs_total, bugs_caught, replay_urls, bug_outcomes = self._collect_bug_replays(target, replay_plan)
         return Evidence(
             candidate_id=candidate.id,
             baseline_seconds=baseline_seconds,
             candidate_seconds=candidate_seconds,
-            bugs_total=0,
-            bugs_caught=0,
-            run_urls=run_urls,
+            bugs_total=bugs_total,
+            bugs_caught=bugs_caught,
+            run_urls=(*timing_urls, *replay_urls),
+            bug_outcomes=bug_outcomes,
         )
 
     def _find_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
@@ -313,6 +329,65 @@ class Dispatcher:
             side.durations.append(run.duration_seconds)
         else:
             side.active = False
+
+    def _collect_bug_replays(
+        self,
+        target: _ReplayTarget,
+        replay_plan: ReplayPlan,
+    ) -> tuple[int, int, tuple[str, ...], tuple[dict[str, Any], ...]]:
+        bugs_total = 0
+        bugs_caught = 0
+        run_urls: list[str] = []
+        bug_outcomes: list[dict[str, Any]] = []
+
+        for idx, bug_case in enumerate(replay_plan.cases):
+            # TODO(dispatcher owner): wire mutation bug replay execution alongside commit replays.
+            if bug_case.kind != "commit":
+                continue
+            caught, outcome, run_url = self._replay_commit_case(target, bug_case, idx)
+            bugs_total += 1
+            if caught:
+                bugs_caught += 1
+            if run_url:
+                run_urls.append(run_url)
+            bug_outcomes.append(outcome)
+
+        return bugs_total, bugs_caught, tuple(run_urls), tuple(bug_outcomes)
+
+    def _replay_commit_case(
+        self,
+        target: _ReplayTarget,
+        bug_case: BugCase,
+        idx: int,
+    ) -> tuple[bool, dict[str, Any], str]:
+        commit_sha = bug_case.commit_sha
+        if not commit_sha:
+            msg = f"Commit bug case at index {idx} is missing commit_sha"
+            raise ValueError(msg)
+
+        replay_branch = f"pc/replay-{target.candidate.id}-{idx}"
+        self.github.create_branch(target.repo, replay_branch, commit_sha)
+        try:
+            self.github.commit_files(
+                target.repo,
+                replay_branch,
+                commit_sha,
+                dict(target.candidate.files),
+                f"Pit Crew replay: overlay candidate {target.candidate.id} onto {commit_sha}",
+            )
+            run = self._dispatch_and_poll(target.repo, target.workflow, replay_branch)
+        finally:
+            self.github.delete_branch(target.repo, replay_branch)
+
+        caught = run.conclusion == "failure"
+        outcome: dict[str, Any] = {
+            "kind": "commit",
+            "ref": commit_sha,
+            "caught": caught,
+            "baseline_failed": True,
+            "run_url": run.html_url,
+        }
+        return caught, outcome, run.html_url
 
     def run_cycle(self, repo: str, base_sha: str | None = None) -> Verdict | None:
         """Run one optimization cycle for ``repo`` and return the resulting ``Verdict``, if any."""
