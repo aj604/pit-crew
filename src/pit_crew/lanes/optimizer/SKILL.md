@@ -36,6 +36,10 @@ push: the host publishes your branch, and GitHub Actions measures it.
   upload. Never add `continue-on-error`, `if: false`, retries, wider timeouts, `|| true`, `-k`,
   `--exit-zero`, or anything else that hides a failure. The guard rejects these, and so does
   the rater when a replayed bug stops failing.
+- The same holds in config files. Do not add `--passWithNoTests`, `-k`, `--ignore` or retries to
+  scripts or `addopts`, ignore patterns to test configs, or a leading `-` to Makefile recipes;
+  do not lower coverage thresholds or turn off type checks, Rust runtime checks, or failure
+  videos, screenshots and traces.
 - Keep every failure artifact upload (screenshots, videos, traces). The Proof lane inspects them.
 - Keep existing job ids and names, since branch protection may require them. If you move a
   job's checks into new jobs, the old job becomes a gate: `needs:` them, `if: always()`, and a

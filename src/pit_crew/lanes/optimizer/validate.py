@@ -220,7 +220,8 @@ def _text(value: object) -> str:
     return json.dumps(value, sort_keys=True, default=str)
 
 
-def _lines(run: str) -> list[str]:
+def run_lines(run: str) -> list[str]:
+    """The command lines of a run block: backslash continuations joined, blanks and comments dropped."""
     lines = []
     for raw in run.replace("\\\n", " ").splitlines():
         line = " ".join(raw.split())
@@ -231,14 +232,14 @@ def _lines(run: str) -> list[str]:
 
 def _segments(run: str) -> list[str]:
     """Each command of a run block, with `&&`, `||` and `;` chains split apart."""
-    return [seg for line in _lines(run) for seg in _SHELL_SEPARATOR.split(line) if seg not in _NO_OP_SEGMENTS]
+    return [seg for line in run_lines(run) for seg in _SHELL_SEPARATOR.split(line) if seg not in _NO_OP_SEGMENTS]
 
 
 def _command_lines(workflow: Workflow) -> list[str]:
-    return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in _lines(step["run"])]
+    return [line for step in _steps(workflow) if isinstance(step.get("run"), str) for line in run_lines(step["run"])]
 
 
-def _check_line(line: str) -> str:
+def check_line(line: str) -> str:
     """A run line as a check: install commands become `<install>`, shell operators are kept.
 
     Keeping `&&`, `||` and `;` means rewiring how two checks chain is a change. Returns "" for a
@@ -256,7 +257,7 @@ def _check_line(line: str) -> str:
 def _step_checks(step: Workflow) -> list[str]:
     run, uses = step.get("run"), step.get("uses")
     if isinstance(run, str):
-        return [check for line in _lines(run) if (check := _check_line(line))]
+        return [check for line in run_lines(run) if (check := check_line(line))]
     if isinstance(uses, str):
         name = uses.split("@", 1)[0]
         if not _SETUP_ACTION.search(name) and name != _UPLOAD_ACTION:
@@ -264,7 +265,7 @@ def _step_checks(step: Workflow) -> list[str]:
     return []
 
 
-def _covered(check: str, candidates: Iterable[str]) -> bool:
+def covered(check: str, candidates: Iterable[str]) -> bool:
     """True when a candidate runs ``check`` exactly, or with plain arguments added (as sharding does).
 
     Added text may not chain another command: `npm test || npm run coverage` does not cover `npm test`.
@@ -374,7 +375,7 @@ def _index(units: Iterable[_Unit]) -> dict[Context, list[str]]:
 
 
 def _runs(unit: _Unit, index: dict[Context, list[str]]) -> bool:
-    return _covered(unit.check, index.get(unit.context, ()))
+    return covered(unit.check, index.get(unit.context, ()))
 
 
 def _describe(context: Context) -> str:
@@ -463,7 +464,7 @@ def _asserts_needs(step: Workflow) -> bool:
     run, uses = step.get("run"), step.get("uses")
     if isinstance(run, str):
         masks = WEAKENING_FLAGS[0][1]
-        return any(_JQ_GATE.search(line) and not masks.search(line) for line in _lines(run))
+        return any(_JQ_GATE.search(line) and not masks.search(line) for line in run_lines(run))
     if isinstance(uses, str) and uses.split("@", 1)[0] == _GATE_ACTION:
         inputs = step.get("with")
         return isinstance(inputs, dict) and "toJSON(needs)" in _text(inputs.get("jobs"))
