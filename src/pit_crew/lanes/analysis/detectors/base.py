@@ -22,7 +22,7 @@ class InvalidFindingError(ValueError):
     @classmethod
     def unknown_bucket(cls, bucket: str) -> "InvalidFindingError":
         """Build error for a bucket outside BUCKETS."""
-        return cls(f"Finding.bucket must be one of {BUCKETS}, got {bucket!r}")
+        return cls(f"Finding.bucket must be one of {BUCKETS} or empty, got {bucket!r}")
 
     @classmethod
     def unknown_risk(cls, risk: str) -> "InvalidFindingError":
@@ -49,7 +49,7 @@ class Finding:
         """Reject values outside the shared vocabularies."""
         if self.skill not in PLAYBOOK_SKILLS:
             raise InvalidFindingError.unknown_skill(self.skill)
-        if self.bucket not in BUCKETS:
+        if self.bucket and self.bucket not in BUCKETS:
             raise InvalidFindingError.unknown_bucket(self.bucket)
         if self.risk not in RISKS:
             raise InvalidFindingError.unknown_risk(self.risk)

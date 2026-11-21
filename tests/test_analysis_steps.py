@@ -123,6 +123,12 @@ def test_finding_rejects_unknown_bucket_and_risk() -> None:
         make_finding(risk="extreme")
 
 
+def test_finding_accepts_empty_bucket_but_not_queue() -> None:
+    assert make_finding(bucket="").bucket == ""
+    with pytest.raises(ValueError, match="bucket"):
+        make_finding(bucket="queue")
+
+
 def test_finding_key_and_to_dict() -> None:
     f = make_finding(evidence={"median_seconds": 12.0})
     assert f.key == ("dep-cache", ".github/workflows/ci.yml", "test", "Install")
