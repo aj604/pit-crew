@@ -148,11 +148,12 @@ def build_request(
     }
 
 
-def run_lane(
+def run_lane(  # noqa: PLR0913  keyword-only request and client options mirror build_request
     lane: str,
     task: str,
     ledger: Ledger | None = None,
     *,
+    repo: str | None = None,
     extra_sources: list[dict[str, Any]] | None = None,
     client: InteractionsClientLike | None = None,
 ) -> InteractionLike:
@@ -167,7 +168,7 @@ def run_lane(
         )
     )
 
-    request = build_request(lane, task, extra_sources=extra_sources)
+    request = build_request(lane, task, repo=repo, extra_sources=extra_sources)
     allowed_tool_names = {t["name"] for t in request["tools"]}
 
     interaction = active_client.interactions.create(**request)
