@@ -13,13 +13,22 @@ This module sits above the lanes so it may import both; the lanes never import e
 
 import importlib
 import os
+import urllib.error
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
-from pit_crew.benchmark_seeder import DEFAULT_TEMPLATE, DISPATCH_EVENT, MAIN, WORKFLOW_FILE, WORKFLOW_PATH
+from pit_crew.benchmark_seeder import (
+    DEFAULT_TEMPLATE,
+    DISPATCH_EVENT,
+    MAIN,
+    WORKFLOW_FILE,
+    WORKFLOW_PATH,
+    git_blob_sha,
+)
 from pit_crew.contracts import PLAYBOOK_SKILLS
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.stats import percentile
@@ -139,7 +148,26 @@ def to_proof_job_runs(raw_runs: Sequence[Mapping[str, Any]]) -> list[miner.JobRu
     ]
 
 
-def _baseline(raw_runs: Sequence[Mapping[str, Any]]) -> tuple[str | None, list[float]]:
+def _workflow_blob_sha(get: Getter, repo: str, sha: str) -> str | None:
+    """Git blob SHA of ``WORKFLOW_PATH`` at ``sha``, or ``None`` when missing."""
+    query = urlencode({"ref": sha})
+    url = f"{history.API}/repos/{repo}/contents/{quote(WORKFLOW_PATH)}?{query}"
+    try:
+        body, _ = get(url)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 422):
+            return None
+        raise
+    if isinstance(body, Mapping) and body.get("sha"):
+        return str(body["sha"])
+    return None
+
+
+def _baseline(
+    raw_runs: Sequence[Mapping[str, Any]],
+    *,
+    is_frozen: Callable[[str], bool],
+) -> tuple[str | None, list[float]]:
     """Newest green baseline run's head SHA, and every green baseline run's wall-clock seconds.
 
     A baseline run is a successful ``workflow_dispatch`` run on main of the frozen workflow file,
@@ -152,6 +180,8 @@ def _baseline(raw_runs: Sequence[Mapping[str, Any]]) -> tuple[str | None, list[f
         and r.get("head_branch") == MAIN
         and r.get("conclusion") == "success"
         and str(r.get("path") or WORKFLOW_PATH).split("@", 1)[0] == WORKFLOW_PATH
+        and (sha := str(r.get("head_sha") or ""))
+        and is_frozen(sha)
     ]
     walls = [run.wall_clock_seconds for run in history.parse_runs([dict(r) for r in green])]
     return (str(green[0].get("head_sha")) if green else None), walls
@@ -196,8 +226,18 @@ def check_target(  # noqa: PLR0913  keyword-only seams for offline tests
     Analysis tool (default: ``default_find_bottlenecks()``); ``workflow_text`` replaces the frozen
     ``ci.yml`` from the benchmark template, which names the required checks.
     """
-    raw = history.fetch_history(repo, workflow, runs=runs, get=get)
-    base_sha, walls = _baseline(raw)
+    getter = get if get is not None else history._http_getter(os.environ.get("GITHUB_TOKEN"))  # noqa: SLF001
+    text = workflow_text if workflow_text is not None else (DEFAULT_TEMPLATE / WORKFLOW_PATH).read_text()
+    expected_blob = git_blob_sha(text.encode())
+    blob_cache: dict[str, bool] = {}
+
+    def is_frozen(sha: str) -> bool:
+        if sha not in blob_cache:
+            blob_cache[sha] = _workflow_blob_sha(getter, repo, sha) == expected_blob
+        return blob_cache[sha]
+
+    raw = history.fetch_history(repo, workflow, runs=runs, get=getter)
+    base_sha, walls = _baseline(raw, is_frozen=is_frozen)
     problems: list[str] = []
     if not walls:
         problems.append(f"no green {DISPATCH_EVENT} baseline runs of {WORKFLOW_PATH} on {MAIN}")
@@ -210,7 +250,6 @@ def check_target(  # noqa: PLR0913  keyword-only seams for offline tests
             f"need at least {MIN_FINDINGS}"
         )
 
-    text = workflow_text if workflow_text is not None else (DEFAULT_TEMPLATE / WORKFLOW_PATH).read_text()
     required, missing = _required_checks(text)
     problems.extend(missing)
     fixed = [c for c in miner.red_commits(to_proof_job_runs(raw)) if c.fixed]

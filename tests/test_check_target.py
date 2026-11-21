@@ -9,24 +9,26 @@ import io
 import json
 import os
 import threading
+import urllib.error
 from collections.abc import Mapping
 from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import yaml
 
 from pit_crew import check_target as ct
 from pit_crew import cli
-from pit_crew.benchmark_seeder import DEFAULT_TEMPLATE, WORKFLOW_PATH
+from pit_crew.benchmark_seeder import DEFAULT_TEMPLATE, WORKFLOW_PATH, git_blob_sha
 from pit_crew.lanes import analysis
 from pit_crew.lanes.analysis import tools as analysis_tools
 
 REPO = "octo/pit-crew-bench"
 TEMPLATE_CI = (DEFAULT_TEMPLATE / WORKFLOW_PATH).read_text()
+TEMPLATE_BLOB = git_blob_sha(TEMPLATE_CI.encode())
 JOB_NAMES: dict[str, str] = {job_id: body["name"] for job_id, body in yaml.safe_load(TEMPLATE_CI)["jobs"].items()}
 T0 = datetime(2026, 11, 1, tzinfo=UTC)
 
@@ -38,8 +40,11 @@ def _iso(at: datetime) -> str:
 class FakeHistory:
     """GitHub Actions run history for one workflow, served the way ``fetch_history`` asks for it."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, workflow_name: str = "CI", default_blob: str = TEMPLATE_BLOB) -> None:
         self.runs: list[dict[str, Any]] = []  # oldest first
+        self.workflow_name = workflow_name
+        self.default_blob = default_blob
+        self.blobs: dict[str, str | int | None] = {}
         self._lock = threading.Lock()
         self.urls: list[str] = []
 
@@ -52,8 +57,11 @@ class FakeHistory:
         failing: Mapping[str, list[str]] | None = None,
         seconds: float = 60.0,
         path: str = WORKFLOW_PATH,
+        blob: str | int | None = None,
     ) -> None:
         """Add a completed run of every template job; ``failing`` maps job id -> conclusion per attempt."""
+        if blob is not None:
+            self.blobs[sha] = blob
         failing = failing or {}
         attempts = max((len(v) for v in failing.values()), default=1)
         start = T0 + timedelta(hours=len(self.runs))
@@ -82,7 +90,7 @@ class FakeHistory:
         self.runs.append(
             {
                 "id": run_id,
-                "name": "CI",
+                "name": self.workflow_name,
                 "path": path,
                 "event": event,
                 "head_branch": branch,
@@ -107,9 +115,16 @@ class FakeHistory:
     def get(self, url: str) -> tuple[Any, str | None]:
         with self._lock:
             self.urls.append(url)
-        path = urlparse(url).path
+        parsed = urlparse(url)
+        path = parsed.path
         if path == f"/repos/{REPO}/actions/workflows/ci.yml/runs":
             return {"workflow_runs": [{k: v for k, v in r.items() if k != "jobs"} for r in reversed(self.runs)]}, None
+        if path == f"/repos/{REPO}/contents/{WORKFLOW_PATH}":
+            ref = parse_qs(parsed.query)["ref"][0]
+            blob = self.blobs.get(ref, self.default_blob)
+            if isinstance(blob, int):
+                raise urllib.error.HTTPError(url, blob, "error", {}, None)  # type: ignore[arg-type]
+            return ({"sha": blob} if blob is not None else []), None
         prefix = f"/repos/{REPO}/actions/runs/"
         assert path.startswith(prefix), url
         run_id = int(path.removeprefix(prefix).split("/", 1)[0])
@@ -274,15 +289,48 @@ def test_flaky_failure_is_not_a_deterministic_red_commit() -> None:
     assert report.problems == ["Proof has no fixed deterministic red commit for required check 'lint'"]
 
 
+def test_baseline_ignores_pre_reset_runs_and_caches_blob_lookups() -> None:
+    history = FakeHistory()
+    for i in range(5):
+        history.add(f"old-{i}", seconds=30.0, blob="stale-blob-sha")
+    history.add("gone-404", seconds=20.0, blob=404)
+    history.add("gone-422", seconds=20.0, blob=422)
+    for _ in range(3):
+        history.add("current-sha", seconds=120.0)
+    for job_id in ct.REQUIRED_CHECKS:
+        history.bug(job_id)
+
+    report = _check(history)
+
+    assert report.ready
+    assert report.green_runs == 3
+    assert report.base_sha == "current-sha"
+    assert (report.baseline_p50_seconds, report.baseline_p95_seconds) == (120.0, 120.0)
+    contents_calls = [u for u in history.urls if f"/contents/{WORKFLOW_PATH}" in u and "ref=current-sha" in u]
+    assert len(contents_calls) == 1
+
+
+def test_baseline_propagates_unexpected_contents_http_errors() -> None:
+    history = FakeHistory()
+    history.add("boom", seconds=60.0, blob=500)
+
+    with pytest.raises(urllib.error.HTTPError):
+        _check(history)
+
+
 def test_required_check_missing_from_workflow_is_not_ready() -> None:
     doc = yaml.safe_load(TEMPLATE_CI)
     del doc["jobs"]["ui-check"]
+    custom_ci = yaml.safe_dump(doc)
 
-    report = _check(_ready_history(), workflow_text=yaml.safe_dump(doc))
+    report = _check(_ready_history(), workflow_text=custom_ci)
 
     assert not report.ready
     assert "ui-check" not in report.red_commits_by_check
-    assert report.problems == [f"required check 'ui-check' is not a job in {WORKFLOW_PATH}"]
+    assert report.problems == [
+        f"no green workflow_dispatch baseline runs of {WORKFLOW_PATH} on main",
+        f"required check 'ui-check' is not a job in {WORKFLOW_PATH}",
+    ]
 
 
 def test_unparseable_workflow_is_not_ready() -> None:
@@ -290,7 +338,10 @@ def test_unparseable_workflow_is_not_ready() -> None:
 
     assert not report.ready
     assert report.red_commits_by_check == {}
-    assert report.problems == [f"{WORKFLOW_PATH} is not a parseable workflow"]
+    assert report.problems == [
+        f"no green workflow_dispatch baseline runs of {WORKFLOW_PATH} on main",
+        f"{WORKFLOW_PATH} is not a parseable workflow",
+    ]
 
 
 def test_empty_history_is_not_ready_without_crashing() -> None:
@@ -382,6 +433,9 @@ def test_default_find_bottlenecks_calls_the_analysis_tool_in_the_workspace(
 ) -> None:
     _without_find_bottlenecks(monkeypatch)
     monkeypatch.delenv(ct.WORKSPACE_ENV, raising=False)
+    workflow_file = tmp_path / WORKFLOW_PATH
+    workflow_file.parent.mkdir(parents=True)
+    workflow_file.write_text(TEMPLATE_CI)
     calls: list[tuple[Any, ...]] = []
 
     def find_bottlenecks(ledger: object, repo: str, workflow: str) -> dict[str, Any]:
@@ -395,6 +449,28 @@ def test_default_find_bottlenecks_calls_the_analysis_tool_in_the_workspace(
     assert code == 0, report
     assert calls == [("InMemoryLedger", REPO, "ci.yml", str(tmp_path))]
     assert ct.WORKSPACE_ENV not in os.environ
+
+
+def test_cli_uses_custom_workspace_workflow_for_proof_and_baseline(tmp_path: Path) -> None:
+    custom_ci = TEMPLATE_CI.replace("name: CI", "name: Benchmark CI", 1)
+    workflow_file = tmp_path / WORKFLOW_PATH
+    workflow_file.parent.mkdir(parents=True)
+    workflow_file.write_text(custom_ci)
+    history = FakeHistory(workflow_name="Benchmark CI", default_blob=git_blob_sha(custom_ci.encode()))
+    for i in range(3):
+        history.add(f"base{i}", seconds=100.0 + 10 * i)
+    for job_id in ct.REQUIRED_CHECKS:
+        history.bug(job_id)
+
+    code, report = _main(
+        ["check-target", "--repo", REPO, "--workspace", str(tmp_path)],
+        get=history.get,
+        find_bottlenecks=_finder(),
+    )
+
+    assert code == 0, report
+    assert report["ready"] is True
+    assert report["red_commits_by_check"] == {job_id: [f"{job_id}-red"] for job_id in ct.REQUIRED_CHECKS}
 
 
 def test_default_find_bottlenecks_restores_a_previous_workspace(monkeypatch: pytest.MonkeyPatch) -> None:

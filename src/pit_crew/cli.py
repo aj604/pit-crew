@@ -204,10 +204,14 @@ def run_check_target(
     """Run ``check-target`` from parsed flags and return its JSON readiness report and whether it is ready."""
     summary: dict[str, Any] = {"command": "check-target", "repo": args.repo, "ready": False}
     try:
+        workspace = Path(args.workspace)
         finder = find_bottlenecks
         if finder is None:
-            finder = check_target.default_find_bottlenecks(Path(args.workspace))
-        readiness = check_target.check_target(args.repo, runs=args.runs, get=get, find_bottlenecks=finder)
+            finder = check_target.default_find_bottlenecks(workspace)
+        workflow_text = (workspace / benchmark_seeder.WORKFLOW_PATH).read_text()
+        readiness = check_target.check_target(
+            args.repo, runs=args.runs, get=get, find_bottlenecks=finder, workflow_text=workflow_text
+        )
     except Exception as exc:  # noqa: BLE001  report every failure as JSON instead of a traceback
         summary["error"] = f"{type(exc).__name__}: {exc}"
         return summary, False
