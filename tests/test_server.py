@@ -528,3 +528,212 @@ def test_repo_status_post_verdict_and_base_sha_progression(backend: str, tmp_pat
         },
         "sla_met": True,
     }
+
+
+def test_repo_status_rejected_candidate_does_not_skew_sla() -> None:
+    ledger = InMemoryLedger()
+    hyp1 = Hypothesis(
+        id="h1",
+        repo="acme/widget",
+        description="Aggressive shortcut",
+        skill="affected-tests",
+        expected_savings_seconds=40.0,
+        base_sha="sha-base-1",
+    )
+    cand1 = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/shortcut",
+        base_sha="sha-base-1",
+        head_sha="sha-bad",
+        summary="Skipped tests",
+    )
+    verdict1 = Verdict(
+        id="v1",
+        candidate_id="c1",
+        keep=False,
+        speedup=2.0,
+        p_value=0.001,
+        median_seconds=45.0,
+        p95_seconds=50.0,
+        sla_met=True,
+        reason="missed replayed bug",
+    )
+    for rec in (hyp1, cand1, verdict1):
+        ledger.add(rec)
+
+    app = create_app(ledger=ledger)
+    with TestClient(app) as client:
+        resp = client.get("/api/repos/acme/widget/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sla_met"] is False
+    assert body["latest_verdict"]["id"] == "v1"
+    assert body["latest_verdict"]["sla_met"] is True
+
+    # Now add a kept candidate meeting SLA, followed by a rejected candidate not meeting SLA.
+    cand2 = Candidate(
+        id="c2",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/good",
+        base_sha="sha-base-1",
+        head_sha="sha-good",
+        summary="Good optimization",
+    )
+    verdict2 = Verdict(
+        id="v2",
+        candidate_id="c2",
+        keep=True,
+        speedup=2.0,
+        p_value=0.001,
+        median_seconds=45.0,
+        p95_seconds=55.0,
+        sla_met=True,
+        reason="fast and safe",
+    )
+    cand3 = Candidate(
+        id="c3",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/slow",
+        base_sha="sha-good",
+        head_sha="sha-slow",
+        summary="Slower experiment",
+    )
+    verdict3 = Verdict(
+        id="v3",
+        candidate_id="c3",
+        keep=False,
+        speedup=0.9,
+        p_value=0.5,
+        median_seconds=90.0,
+        p95_seconds=130.0,
+        sla_met=False,
+        reason="slower",
+    )
+    for rec in (cand2, verdict2, cand3, verdict3):
+        ledger.add(rec)
+
+    with TestClient(app) as client:
+        resp2 = client.get("/api/repos/acme/widget/status")
+
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["base_sha"] == "sha-good"
+    assert body2["sla_met"] is True
+    assert body2["latest_verdict"]["id"] == "v3"
+    assert body2["latest_verdict"]["keep"] is False
+
+
+def test_repo_status_preserves_base_sha_when_kept_candidate_lacks_shas() -> None:
+    ledger = InMemoryLedger()
+    hyp = Hypothesis(
+        id="h1",
+        repo="acme/widget",
+        description="Cache deps",
+        skill="dep-cache",
+        expected_savings_seconds=20.0,
+        base_sha="abc123",
+    )
+    cand = Candidate(
+        id="c1",
+        hypothesis_id="h1",
+        repo="acme/widget",
+        branch="pit-crew/dep-cache",
+        summary="Added cache without recording SHAs",
+    )
+    verdict = Verdict(
+        id="v1",
+        candidate_id="c1",
+        keep=True,
+        speedup=1.5,
+        p_value=0.01,
+        sla_met=True,
+        reason="faster",
+    )
+    for rec in (hyp, cand, verdict):
+        ledger.add(rec)
+
+    app = create_app(ledger=ledger)
+    with TestClient(app) as client:
+        resp = client.get("/api/repos/acme/widget/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["base_sha"] == "abc123"
+
+
+def test_repo_casing_normalized_for_locks_and_telemetry() -> None:
+    ledger = InMemoryLedger()
+    ledger.add(
+        Hypothesis(
+            id="h1",
+            repo="acme/widget",
+            description="Cache deps",
+            skill="dep-cache",
+            expected_savings_seconds=20.0,
+            base_sha="abc123",
+        )
+    )
+    dispatcher = _StubDispatcher()
+    app = create_app(ledger=ledger, dispatcher=dispatcher)
+
+    with TestClient(app) as client:
+        first = client.post("/triggers/cycle", json={"repo": "Acme/Widget"})
+        assert first.status_code == 202
+        assert dispatcher.started.wait(timeout=5)
+
+        conflict = client.post("/triggers/cycle", json={"repo": "acme/widget"})
+        assert conflict.status_code == 409
+
+        status_resp = client.get("/api/repos/ACME/WIDGET/status")
+        assert status_resp.status_code == 200
+        assert status_resp.json()["active"] is True
+        assert status_resp.json()["base_sha"] == "abc123"
+
+        attempts_resp = client.get("/api/repos/Acme/Widget/attempts")
+        assert attempts_resp.status_code == 200
+        assert len(attempts_resp.json()) == 1
+
+        records_resp = client.get("/api/repos/Acme/Widget/records")
+        assert records_resp.status_code == 200
+        assert len(records_resp.json()["hypotheses"]) == 1
+
+        dispatcher.release.set()
+        assert dispatcher.finished.wait(timeout=5)
+        while "acme/widget" in app.state.active_repos:
+            client.get("/health")
+
+
+def test_api_token_enforces_bearer_auth_on_api_and_triggers() -> None:
+    dispatcher = _AsyncStubDispatcher()
+    app = create_app(ledger=InMemoryLedger(), dispatcher=dispatcher, api_token="secret-api-token")  # noqa: S106
+    auth_headers = {"Authorization": "Bearer secret-api-token"}
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+        for method, path in (
+            ("GET", "/api/repos/acme/widget/attempts"),
+            ("GET", "/api/repos/acme/widget/records"),
+            ("GET", "/api/repos/acme/widget/status"),
+        ):
+            assert client.request(method, path).status_code == 401
+            assert client.request(method, path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+            assert client.request(method, path, headers={"Authorization": "Basic secret-api-token"}).status_code == 401
+            assert client.request(method, path, headers=auth_headers).status_code == 200
+
+        assert client.post("/triggers/cycle", json={"repo": "acme/widget"}).status_code == 401
+        assert (
+            client.post(
+                "/triggers/cycle",
+                json={"repo": "acme/widget"},
+                headers={"Authorization": "Bearer wrong"},
+            ).status_code
+            == 401
+        )
+        ok = client.post("/triggers/cycle", json={"repo": "acme/widget"}, headers=auth_headers)
+        assert ok.status_code == 202
+        assert dispatcher.done.wait(timeout=5)

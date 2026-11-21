@@ -1,12 +1,14 @@
 """FastAPI HTTP server scaffold for Pit Crew."""
 
 import asyncio
+import hmac
 import inspect
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from pit_crew.contracts import Candidate, Hypothesis, Verdict
 from pit_crew.ledger import Ledger, SqliteLedger
@@ -14,6 +16,11 @@ from pit_crew.run_tracker import RunTracker
 from pit_crew.webhooks import create_github_webhook_router
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_repo(repo: str) -> str:
+    """Normalize a repository identifier for case-insensitive lock and telemetry matching."""
+    return repo.strip().lower()
 
 
 class DispatcherProtocol(Protocol):
@@ -40,6 +47,7 @@ async def _run_cycle_task(
     dispatcher: DispatcherProtocol,
     repo: str,
     *,
+    repo_key: str,
     until_sla: bool,
     active_repos: set[str],
 ) -> None:
@@ -55,7 +63,7 @@ async def _run_cycle_task(
     except Exception:
         logger.exception("Cycle failed for %s", repo)
     finally:
-        active_repos.discard(repo)
+        active_repos.discard(repo_key)
 
 
 def _current_base_sha(
@@ -65,7 +73,14 @@ def _current_base_sha(
 ) -> str | None:
     """Resolve the current base SHA for a repository from its ledger records."""
     if latest_kept is not None:
-        return latest_kept.head_sha or latest_kept.base_sha or None
+        if latest_kept.head_sha:
+            return latest_kept.head_sha
+        if latest_kept.base_sha:
+            return latest_kept.base_sha
+        hypotheses_by_id = {h.id: h for h in hypotheses}
+        linked_hyp = hypotheses_by_id.get(latest_kept.hypothesis_id)
+        if linked_hyp is not None and linked_hyp.base_sha:
+            return linked_hyp.base_sha
     for cand in reversed(candidates):
         if cand.base_sha:
             return cand.base_sha
@@ -77,24 +92,52 @@ def _current_base_sha(
 
 def _repo_status(ledger: Ledger, repo: str, active_repos: set[str]) -> dict[str, Any]:
     """Build the Pit Wall status payload for ``repo``."""
+    repo_key = _normalize_repo(repo)
     hypotheses = ledger.hypotheses_for_repo(repo)
     hypothesis_ids = {h.id for h in hypotheses}
-    repo_candidates = [c for c in ledger.all(Candidate) if c.hypothesis_id in hypothesis_ids or c.repo == repo]
+    repo_candidates = [
+        c for c in ledger.all(Candidate) if c.hypothesis_id in hypothesis_ids or _normalize_repo(c.repo) == repo_key
+    ]
     candidate_ids = {c.id for c in repo_candidates}
 
+    latest_kept = ledger.latest_kept_candidate(repo)
     latest_verdict: Verdict | None = None
+    latest_kept_verdict: Verdict | None = None
     for verdict in ledger.all(Verdict):
         if verdict.candidate_id in candidate_ids:
             latest_verdict = verdict
+        if latest_kept is not None and verdict.candidate_id == latest_kept.id:
+            latest_kept_verdict = verdict
 
-    base_sha = _current_base_sha(ledger.latest_kept_candidate(repo), repo_candidates, hypotheses)
+    base_sha = _current_base_sha(latest_kept, repo_candidates, hypotheses)
     return {
         "repo": repo,
-        "active": repo in active_repos,
+        "active": repo_key in active_repos,
         "base_sha": base_sha,
         "latest_verdict": asdict(latest_verdict) if latest_verdict is not None else None,
-        "sla_met": latest_verdict.sla_met if latest_verdict is not None else False,
+        "sla_met": latest_kept_verdict.sla_met if latest_kept_verdict is not None else False,
     }
+
+
+def _make_api_token_dependency(api_token: str | None) -> Callable[[str | None], None]:
+    """Build a FastAPI dependency that enforces Bearer token auth when ``api_token`` is set."""
+
+    def _require_api_token(authorization: str | None = Header(default=None)) -> None:
+        if api_token is None:
+            return
+        if not authorization:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid bearer token",
+            )
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token or not hmac.compare_digest(token, api_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid bearer token",
+            )
+
+    return _require_api_token
 
 
 def create_app(
@@ -102,6 +145,7 @@ def create_app(
     dispatcher: DispatcherProtocol | None = None,
     webhook_secret: str | None = None,
     run_tracker: RunTracker | None = None,
+    api_token: str | None = None,
 ) -> FastAPI:
     """Create and configure the Pit Crew FastAPI application."""
     app = FastAPI(title="pit-crew")
@@ -112,8 +156,11 @@ def create_app(
     app.state.dispatcher = dispatcher
     app.state.webhook_secret = webhook_secret
     app.state.run_tracker = tracker
+    app.state.api_token = api_token
     app.state.active_repos = active_repos
     app.state.background_tasks = background_tasks
+
+    require_api_token = _make_api_token_dependency(api_token)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -123,7 +170,11 @@ def create_app(
 
     app.include_router(create_github_webhook_router(webhook_secret=webhook_secret, run_tracker=tracker))
 
-    @app.post("/triggers/cycle", status_code=status.HTTP_202_ACCEPTED)
+    @app.post(
+        "/triggers/cycle",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_api_token)],
+    )
     async def trigger_cycle(payload: CycleTriggerRequest) -> dict[str, str]:
         """Enqueue a background optimization cycle guarded by a per-repo lock."""
         if dispatcher is None:
@@ -131,17 +182,19 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Dispatcher is not configured",
             )
-        if payload.repo in active_repos:
+        repo_key = _normalize_repo(payload.repo)
+        if repo_key in active_repos:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Cycle already active for {payload.repo}",
             )
 
-        active_repos.add(payload.repo)
+        active_repos.add(repo_key)
         task = asyncio.create_task(
             _run_cycle_task(
                 dispatcher,
                 payload.repo,
+                repo_key=repo_key,
                 until_sla=payload.until_sla,
                 active_repos=active_repos,
             )
@@ -150,17 +203,26 @@ def create_app(
         task.add_done_callback(background_tasks.discard)
         return {"status": "started", "repo": payload.repo}
 
-    @app.get("/api/repos/{owner}/{name}/attempts")
+    @app.get(
+        "/api/repos/{owner}/{name}/attempts",
+        dependencies=[Depends(require_api_token)],
+    )
     def repo_attempts(owner: str, name: str) -> list[dict[str, Any]]:
         """Return prior optimization attempts for a repository."""
         return ledger.prior_attempts(f"{owner}/{name}")
 
-    @app.get("/api/repos/{owner}/{name}/records")
+    @app.get(
+        "/api/repos/{owner}/{name}/records",
+        dependencies=[Depends(require_api_token)],
+    )
     def repo_records(owner: str, name: str) -> dict[str, list[dict[str, Any]]]:
         """Return structured ledger records for a repository."""
         return ledger.records_for_repo(f"{owner}/{name}")
 
-    @app.get("/api/repos/{owner}/{name}/status")
+    @app.get(
+        "/api/repos/{owner}/{name}/status",
+        dependencies=[Depends(require_api_token)],
+    )
     def repo_status(owner: str, name: str) -> dict[str, Any]:
         """Return current cycle state, base SHA, latest verdict, and SLA status."""
         return _repo_status(ledger, f"{owner}/{name}", active_repos)

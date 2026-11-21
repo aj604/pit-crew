@@ -3,6 +3,9 @@
 import hashlib
 import hmac
 import json
+import time
+from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -11,6 +14,72 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from pit_crew.run_tracker import RunTracker, WorkflowRunResult
 
 _SIGNATURE_PREFIX = "sha256="
+_DEFAULT_MAX_DELIVERIES = 10_000
+_DEFAULT_DELIVERY_TTL_SECONDS = 3600.0
+_DEFAULT_MAX_BODY_BYTES = 1024 * 1024  # 1 MiB
+
+
+class DeliveryCache:
+    """Bounded TTL + LRU cache for GitHub webhook delivery IDs."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = _DEFAULT_MAX_DELIVERIES,
+        ttl_seconds: float = _DEFAULT_DELIVERY_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Initialize the bounded delivery deduplication cache."""
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: OrderedDict[str, float] = OrderedDict()
+
+    def _evict_expired(self, now: float) -> None:
+        while self._entries:
+            _, recorded_at = next(iter(self._entries.items()))
+            if now - recorded_at >= self._ttl_seconds:
+                self._entries.popitem(last=False)
+            else:
+                break
+
+    def check_and_record(self, delivery_id: str) -> bool:
+        """Return True if ``delivery_id`` is a live duplicate; otherwise record it and return False."""
+        now = self._clock()
+        self._evict_expired(now)
+        if delivery_id in self._entries:
+            self._entries.move_to_end(delivery_id)
+            self._entries[delivery_id] = now
+            return True
+        if self._max_entries > 0:
+            self._entries[delivery_id] = now
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return False
+
+
+async def _read_limited_body(request: Request, max_bytes: int) -> bytes:
+    """Stream the request body up to ``max_bytes``, raising HTTP 413 if exceeded."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail="Webhook payload exceeds maximum allowed size",
+                )
+        except ValueError:
+            pass
+
+    buf = bytearray()
+    async for chunk in request.stream():
+        if len(buf) + len(chunk) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Webhook payload exceeds maximum allowed size",
+            )
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def _verify_github_signature(payload: bytes, signature: str | None, secret: str | None) -> bool:
@@ -81,16 +150,25 @@ def _parse_json_object(raw_body: bytes) -> dict[str, Any]:
 def create_github_webhook_router(
     webhook_secret: str | None = None,
     run_tracker: RunTracker | None = None,
+    *,
+    delivery_cache: DeliveryCache | None = None,
+    max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
 ) -> APIRouter:
     """Create a FastAPI router exposing ``POST /webhooks/github``."""
     router = APIRouter()
-    seen_deliveries: set[str] = set()
+    seen_deliveries = delivery_cache if delivery_cache is not None else DeliveryCache()
 
     @router.post("/webhooks/github")
     async def github_webhook(request: Request, response: Response) -> dict[str, str]:
         """Verify GitHub webhook signatures, deduplicate deliveries, and resolve tracked runs."""
-        raw_body = await request.body()
         signature = request.headers.get("X-Hub-Signature-256")
+        if not webhook_secret or not signature:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing X-Hub-Signature-256 header",
+            )
+
+        raw_body = await _read_limited_body(request, max_body_bytes)
         if not _verify_github_signature(raw_body, signature, webhook_secret):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -98,10 +176,8 @@ def create_github_webhook_router(
             )
 
         delivery_id = request.headers.get("X-GitHub-Delivery")
-        if delivery_id:
-            if delivery_id in seen_deliveries:
-                return {"status": "duplicate"}
-            seen_deliveries.add(delivery_id)
+        if delivery_id and seen_deliveries.check_and_record(delivery_id):
+            return {"status": "duplicate"}
 
         event_type = request.headers.get("X-GitHub-Event", "")
         if event_type != "workflow_run":
