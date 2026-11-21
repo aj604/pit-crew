@@ -1,0 +1,48 @@
+/* Pit Crew — Formula 1 Las Vegas Night Race Design Tokens (v2.0) */
+:root {
+  /* F1 Master Foundation (Floodlit Asphalt & Carbon) */
+  --pc-bg-void: #0B0B11;
+  --pc-bg-carbon: #15151E;      /* Official F1 Carbon Black */
+  --pc-bg-paddock: #1C1C28;
+  --pc-bg-pitwall: #242435;
+  --pc-border-grid: #2D2D44;
+  --pc-border-bright: #434361;
+
+  /* High-Vis Neutrals */
+  --pc-ink-highvis: #F4F4F7;
+  --pc-ink-secondary: #C6C6D6;
+  --pc-ink-muted: #8E8EA6;
+
+  /* F1 Master Brand + Las Vegas Strip Neon Accents */
+  --pc-f1-red: #FF1E00;         /* F1 Warm Red — primary accent, trust wall, red flag */
+  --pc-f1-red-deep: #D90429;
+  --pc-vegas-magenta: #FF008C;  /* Vegas Strip Neon Magenta — Dispatcher / Fork CI */
+  --pc-sector-purple: #B84DFF;  /* Fastest Lap / Purple Sector — Optimizer speedup */
+  --pc-sphere-cyan: #00F0FF;    /* Vegas Sphere LED Cyan — Analysis live stream */
+  --pc-vegas-gold: #FFD000;     /* Caution / Safety Car — Proof bug replays */
+  --pc-drs-green: #00E676;      /* Green Flag / DRS — Rater Verdict KEEP */
+
+  /* Gradients */
+  --pc-grad-strip: linear-gradient(90deg, #FF1E00 0%, #FF008C 52%, #B84DFF 100%);
+  --pc-grad-telemetry: linear-gradient(90deg, #00F0FF 0%, #B84DFF 50%, #00E676 100%);
+  --pc-grad-night: linear-gradient(135deg, #0B0B11 0%, #15151E 55%, #21102D 100%);
+
+  /* Compound Ring Colors (Optimizer Playbooks) */
+  --pc-compound-soft: #FF1E00;       /* dep-cache */
+  --pc-compound-medium: #FFD000;     /* shard-by-timing */
+  --pc-compound-hard: #F4F4F7;       /* affected-tests */
+  --pc-compound-inter: #00E676;      /* fail-fast-order */
+  --pc-compound-wet: #00B0FF;        /* flake-quarantine */
+  --pc-compound-hypersoft: #FF008C;  /* dedupe-jobs */
+
+  /* Typography */
+  --pc-font-display: 'Chakra Petch', 'Titillium Web', 'Space Grotesk', sans-serif;
+  --pc-font-sans: 'Titillium Web', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Radii & Grid */
+  --pc-grid-unit: 8px;
+  --pc-radius-sm: 6px;
+  --pc-radius-md: 10px;
+  --pc-radius-lg: 14px;
+}

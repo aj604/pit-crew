@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 440" fill="none">
+  <defs>
+    <linearGradient id="ca-bg" x1="0" y1="0" x2="1040" y2="440" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0D0D14"/>
+      <stop offset="100%" stop-color="#171322"/>
+    </linearGradient>
+    <pattern id="ca-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0L0 0 0 32" fill="none" stroke="#222234" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1040" height="440" rx="16" fill="url(#ca-bg)"/>
+  <rect width="1040" height="440" rx="16" fill="url(#ca-grid)" opacity="0.5"/>
+  <rect x="0.75" y="0.75" width="1038.5" height="438.5" rx="15.25" stroke="#2D2D44" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="32" y="38" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="18" font-weight="700" letter-spacing="0.1em">LAS VEGAS NIGHT CIRCUIT // PIT CREW PIPELINE</text>
+  <text x="1008" y="38" text-anchor="end" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="11" letter-spacing="0.12em">THE AGENT PROPOSES • CODE JUDGES</text>
+
+  <!-- Left Zone: Managed Agent Sandbox -->
+  <rect x="28" y="62" width="532" height="346" rx="14" fill="#15151E" fill-opacity="0.75" stroke="#303048"/>
+  <text x="48" y="88" fill="#00F0FF" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700" letter-spacing="0.14em">GOOGLE MANAGED AGENT SANDBOX // PROPOSAL SECTORS</text>
+
+  <!-- Trust Boundary Wall -->
+  <line x1="584" y1="62" x2="584" y2="408" stroke="#FF1E00" stroke-width="3" stroke-dasharray="8 6"/>
+  <rect x="542" y="196" width="84" height="50" rx="8" fill="#2A0C12" stroke="#FF1E00" stroke-width="1.5"/>
+  <text x="584" y="218" text-anchor="middle" fill="#FF1E00" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">TRUST</text>
+  <text x="584" y="234" text-anchor="middle" fill="#F4F4F7" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">WALL</text>
+
+  <!-- Right Zone: Deterministic Code -->
+  <rect x="608" y="62" width="404" height="346" rx="14" fill="#13181D" fill-opacity="0.82" stroke="#25483A"/>
+  <text x="628" y="88" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700" letter-spacing="0.14em">DETERMINISTIC CODE // MEASUREMENT &amp; VERDICT</text>
+
+  <!-- Stylized Las Vegas Circuit Track Loop -->
+  <!-- Base asphalt track -->
+  <path d="M110 295 L110 170 C110 138 134 126 170 126 L465 126 C508 126 520 155 520 185 L520 265 C520 300 546 314 584 314 L915 314 C954 314 968 290 968 250 L968 175 C968 138 942 126 898 126 L700 126 C666 126 654 148 654 176 L654 220 C654 248 630 265 590 265 L520 265" stroke="#242438" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Sector 1: Analysis (Cyan) -->
+  <path d="M110 295 L110 170 C110 138 134 126 170 126 L285 126" stroke="#00F0FF" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <!-- Sector 2: Optimizer (Purple) -->
+  <path d="M285 126 L465 126 C508 126 520 155 520 185 L520 220" stroke="#B84DFF" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <!-- Sector 3: Proof (Vegas Gold) -->
+  <path d="M520 220 L520 265 C520 300 546 314 584 314" stroke="#FFD000" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <!-- Pit Straight: Fork CI Measurement (Neon Magenta) -->
+  <path d="M584 314 L915 314 C954 314 968 290 968 250 L968 205" stroke="#FF008C" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <!-- Finish Gantry: Rater Verdict (DRS Green) -->
+  <path d="M968 205 L968 175 C968 138 942 126 898 126 L710 126" stroke="#00E676" stroke-width="5" stroke-linecap="round" fill="none"/>
+
+  <!-- Sector Nodes -->
+  <!-- S1 Node -->
+  <g transform="translate(54, 152)">
+    <rect width="166" height="74" rx="10" fill="#0D0D14" stroke="#00F0FF" stroke-width="1.5"/>
+    <text x="14" y="24" fill="#00F0FF" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">S1 // ANALYSIS</text>
+    <text x="14" y="45" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="15" font-weight="700">Hypothesis</text>
+    <text x="14" y="62" fill="#8C8CA3" font-family="'JetBrains Mono', monospace" font-size="10">critical path DAG</text>
+  </g>
+
+  <!-- S2 Node -->
+  <g transform="translate(262, 108)">
+    <rect width="174" height="74" rx="10" fill="#0D0D14" stroke="#B84DFF" stroke-width="1.5"/>
+    <text x="14" y="24" fill="#B84DFF" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">S2 // OPTIMIZER</text>
+    <text x="14" y="45" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="15" font-weight="700">Candidate Branch</text>
+    <text x="14" y="62" fill="#8C8CA3" font-family="'JetBrains Mono', monospace" font-size="10">1 isolated change</text>
+  </g>
+
+  <!-- S3 Node -->
+  <g transform="translate(348, 224)">
+    <rect width="174" height="74" rx="10" fill="#0D0D14" stroke="#FFD000" stroke-width="1.5"/>
+    <text x="14" y="24" fill="#FFD000" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">S3 // PROOF</text>
+    <text x="14" y="45" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="15" font-weight="700">ReplayPlan</text>
+    <text x="14" y="62" fill="#8C8CA3" font-family="'JetBrains Mono', monospace" font-size="10">historical red SHAs</text>
+  </g>
+
+  <!-- Ledger Box (Bottom Left) -->
+  <g transform="translate(54, 326)">
+    <rect width="468" height="58" rx="10" fill="#1C1C2B" stroke="#454566" stroke-width="1.5"/>
+    <text x="18" y="24" fill="#F4F4F7" font-family="'JetBrains Mono', monospace" font-size="11" font-weight="700">IMMUTABLE LEDGER (contracts.py)</text>
+    <text x="18" y="44" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="10">Lanes never call each other — all handoffs pass through frozen records.</text>
+  </g>
+
+  <!-- Pit Straight: Fork CI Node -->
+  <g transform="translate(650, 274)">
+    <rect width="268" height="74" rx="10" fill="#0D0D14" stroke="#FF008C" stroke-width="1.5"/>
+    <text x="14" y="24" fill="#FF008C" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">PIT STRAIGHT // DISPATCHER + FORK CI</text>
+    <text x="14" y="45" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="15" font-weight="700">Evidence (Timings + Replays)</text>
+    <text x="14" y="62" fill="#8C8CA3" font-family="'JetBrains Mono', monospace" font-size="10">N&gt;=5 paired runs • agent never writes</text>
+  </g>
+
+  <!-- Finish Gantry: Rater Node -->
+  <g transform="translate(650, 108)">
+    <rect width="268" height="78" rx="10" fill="#0D1F18" stroke="#00E676" stroke-width="2"/>
+    <text x="14" y="24" fill="#00E676" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="700">FINISH GANTRY // RATER (rater.py)</text>
+    <text x="14" y="46" fill="#F4F4F7" font-family="'Chakra Petch', sans-serif" font-size="16" font-weight="700">Verdict: KEEP or REJECT</text>
+    <text x="14" y="65" fill="#8CE6B8" font-family="'JetBrains Mono', monospace" font-size="10">bugs_caught == total • exact p &lt;= 0.05</text>
+  </g>
+</svg>

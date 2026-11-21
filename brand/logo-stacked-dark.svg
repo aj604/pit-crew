@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" fill="none">
+  <defs>
+    <linearGradient id="st-bg" x1="0" y1="0" x2="240" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0D0D14"/>
+      <stop offset="100%" stop-color="#191124"/>
+    </linearGradient>
+    <linearGradient id="st-r" x1="6" y1="10" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF1E00"/>
+      <stop offset="100%" stop-color="#D90429"/>
+    </linearGradient>
+    <linearGradient id="st-n" x1="12" y1="54" x2="58" y2="26" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#B84DFF"/>
+      <stop offset="55%" stop-color="#FF008C"/>
+      <stop offset="100%" stop-color="#FF1E00"/>
+    </linearGradient>
+  </defs>
+  <rect width="240" height="240" rx="28" fill="url(#st-bg)"/>
+  <rect x="1.5" y="1.5" width="237" height="237" rx="26.5" stroke="#2D2D42" stroke-width="3"/>
+  <!-- 5 starting gantry lights -->
+  <g transform="translate(65, 26)">
+    <circle cx="10" cy="6" r="4.5" fill="#FF1E00"/>
+    <circle cx="32" cy="6" r="4.5" fill="#FF1E00"/>
+    <circle cx="54" cy="6" r="4.5" fill="#FF1E00"/>
+    <circle cx="76" cy="6" r="4.5" fill="#FF1E00"/>
+    <circle cx="98" cy="6" r="4.5" fill="#00E676"/>
+  </g>
+  <g transform="translate(72, 54) scale(1.5)">
+    <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="url(#st-r)"/>
+    <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+    <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="url(#st-n)"/>
+  </g>
+  <text x="120" y="182" text-anchor="middle" fill="#F4F4F7" font-family="'Chakra Petch', 'Titillium Web', sans-serif" font-size="28" font-weight="700" font-style="italic" letter-spacing="0.1em">PIT CREW</text>
+  <text x="120" y="204" text-anchor="middle" fill="#9494A8" font-family="'JetBrains Mono', monospace" font-size="9.5" font-weight="600" letter-spacing="0.2em">LAS VEGAS NIGHT SPEC</text>
+</svg>

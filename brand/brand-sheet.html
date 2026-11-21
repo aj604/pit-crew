@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pit Crew — F1 Las Vegas Night Race Brand Sheet (v2.0)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans, 'Titillium Web', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif);
+    color: var(--foreground, #F4F4F7);
+    line-height: 1.4;
+  }
+  .sheet {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  /* HERO */
+  .hero {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius, 12px);
+    background:
+      radial-gradient(circle at 86% 36%, rgba(255, 0, 140, 0.28) 0%, rgba(184, 77, 255, 0.12) 34%, transparent 62%),
+      radial-gradient(circle at 12% 18%, rgba(255, 30, 0, 0.22) 0%, transparent 48%),
+      linear-gradient(135deg, #0B0B11 0%, #15151E 58%, #21102D 100%);
+    border: 1px solid #2D2D44;
+    padding: 20px 20px 26px;
+    color: #F4F4F7;
+  }
+  .hero::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0; height: 4px;
+    background: linear-gradient(90deg, #FF1E00 0%, #FF008C 52%, #B84DFF 100%);
+  }
+  .hero::after {
+    content: "";
+    position: absolute;
+    bottom: 0; left: 0; right: 0; height: 6px;
+    background: repeating-linear-gradient(90deg, #FF1E00 0 22px, #F4F4F7 22px 44px);
+    opacity: 0.9;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.35fr 0.85fr;
+    gap: 16px;
+    align-items: center;
+  }
+  .gantry-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: rgba(11, 11, 17, 0.88);
+    border: 1px solid #2D2D44;
+    margin-bottom: 12px;
+  }
+  .g-light {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #FF1E00;
+    box-shadow: 0 0 7px #FF1E00;
+  }
+  .g-light.go {
+    background: #00E676;
+    box-shadow: 0 0 8px #00E676;
+  }
+  .g-label {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: #D4D4E2;
+    margin-left: 4px;
+  }
+  .hero-lockup {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+  .wordmark {
+    font-size: 36px;
+    font-weight: 800;
+    font-style: italic;
+    letter-spacing: 0.06em;
+    line-height: 0.98;
+    color: #F4F4F7;
+  }
+  .wordmark-sub {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    color: #9E9EB3;
+    margin-top: 5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .hero-tagline {
+    font-size: 14px;
+    color: #D4D4E2;
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+  .hero-desc {
+    font-size: 12.5px;
+    color: #9E9EB3;
+  }
+  .circuit-preview {
+    background: rgba(11, 11, 17, 0.62);
+    border: 1px solid rgba(255, 0, 140, 0.3);
+    border-radius: 10px;
+    padding: 10px;
+  }
+
+  /* CARD */
+  .card {
+    background: var(--card, #15151E);
+    border: 1px solid var(--border, #2D2D44);
+    border-radius: var(--radius, 12px);
+    padding: 14px 16px;
+  }
+  .sec-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 11px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border, #2D2D44);
+  }
+  .sec-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--foreground, #F4F4F7);
+  }
+  .sec-num {
+    background: #FF1E00;
+    color: #F4F4F7;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+  .sec-note {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    color: var(--muted-foreground, #8E8EA6);
+  }
+
+  /* LOGO SUITE */
+  .logo-suite {
+    display: grid;
+    grid-template-columns: 1.35fr 1.35fr 0.9fr 0.9fr;
+    gap: 10px;
+  }
+  .logo-box {
+    border-radius: 8px;
+    padding: 14px 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border: 1px solid #2D2D44;
+    min-height: 92px;
+  }
+  .logo-box.dark { background: #0D0D14; color: #F4F4F7; }
+  .logo-box.light { background: #F4F4F7; color: #15151E; border-color: #D2D2DE; }
+  .logo-box.vegas { background: linear-gradient(145deg, #15151E 0%, #231130 100%); color: #F4F4F7; border-color: #46265C; }
+  .box-cap {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    opacity: 0.72;
+    text-transform: uppercase;
+  }
+
+  /* COLOR PALETTE */
+  .swatch-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .swatch {
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border, #2D2D44);
+    background: var(--secondary, #1C1C28);
+  }
+  .sw-bar { height: 34px; }
+  .sw-info { padding: 6px 8px; }
+  .sw-name { font-size: 11px; font-weight: 700; line-height: 1.2; }
+  .sw-hex {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    color: var(--muted-foreground, #9E9EB3);
+  }
+  .sw-role {
+    font-size: 9.5px;
+    color: var(--muted-foreground, #8E8EA6);
+    margin-top: 2px;
+  }
+  .motif-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    margin-top: 9px;
+  }
+  .motif-chip {
+    border-radius: 6px;
+    border: 1px solid var(--border, #2D2D44);
+    overflow: hidden;
+    background: var(--secondary, #1C1C28);
+  }
+  .motif-strip { height: 14px; }
+  .motif-label {
+    padding: 4px 8px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 9.5px;
+    color: var(--muted-foreground, #B4B4C7);
+  }
+
+  /* TWO COL */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1.12fr;
+    gap: 12px;
+  }
+  .two-col-even {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  /* TIMING TOWER */
+  .tower {
+    background: #0D0D14;
+    border: 1px solid #2D2D44;
+    border-radius: 10px;
+    overflow: hidden;
+    color: #F4F4F7;
+  }
+  .tower-hd {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: #1A1A26;
+    border-bottom: 1px solid #2D2D44;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+  .t-row {
+    display: grid;
+    grid-template-columns: 22px 44px 1fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid #1C1C2A;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+  }
+  .t-row:last-child { border-bottom: none; }
+  .t-pos { color: #7E7E96; font-weight: 700; }
+  .t-code {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 800;
+    color: #F4F4F7;
+  }
+  .t-bar { width: 3.5px; height: 14px; border-radius: 2px; display: inline-block; }
+  .t-sub { color: #9E9EB3; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .t-delta { font-weight: 700; font-size: 10.5px; }
+  .trust-sep {
+    background: rgba(255, 30, 0, 0.12);
+    border-top: 1px dashed #FF1E00;
+    border-bottom: 1px dashed #FF1E00;
+    padding: 4px 10px;
+    text-align: center;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: #FF5942;
+  }
+
+  /* COMPOUND RINGS */
+  .compound-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .compound-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    background: var(--secondary, #1C1C28);
+    border: 1px solid var(--border, #2D2D44);
+  }
+  .tire-ring {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: #0D0D14;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 9.5px; font-weight: 800;
+    flex-shrink: 0;
+  }
+  .c-name {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .c-desc {
+    font-size: 9.5px;
+    color: var(--muted-foreground, #8E8EA6);
+  }
+
+  /* RACE CONTROL FLAGS */
+  .flag-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .flag-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 7px;
+    background: var(--secondary, #1C1C28);
+    border: 1px solid var(--border, #2D2D44);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+  }
+  .flag-pill {
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-weight: 800;
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+  }
+  .flag-copy {
+    color: var(--muted-foreground, #C6C6D6);
+    font-size: 10px;
+    text-align: right;
+  }
+
+  /* APPLICATIONS: PR COMMENT & CLI */
+  .pr-mock {
+    background: #0D0D14;
+    border: 1px solid #2D2D44;
+    border-radius: 10px;
+    overflow: hidden;
+    color: #F4F4F7;
+  }
+  .pr-hd {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    background: #1A1A26;
+    border-bottom: 1px solid #2D2D44;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+  }
+  .pr-body { padding: 10px 12px; }
+  .pr-verdict {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .pr-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+  }
+  .pr-table th, .pr-table td {
+    padding: 4px 6px;
+    border-bottom: 1px solid #1E1E2E;
+    text-align: left;
+  }
+  .pr-table th { color: #8E8EA6; font-weight: 600; }
+  .pr-table td:last-child, .pr-table th:last-child { text-align: right; }
+
+  .cli-mock {
+    background: #09090F;
+    border: 1px solid #2D2D44;
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    line-height: 1.55;
+    color: #C6C6D6;
+    margin-top: 8px;
+  }
+
+  .badge-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .micro-badge {
+    display: inline-flex;
+    border-radius: 5px;
+    overflow: hidden;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 9.5px;
+    font-weight: 700;
+    border: 1px solid #2D2D44;
+  }
+  .mb-l { padding: 3px 7px; color: #0B0B11; font-weight: 800; }
+  .mb-r { padding: 3px 8px; background: #15151E; }
+
+  @media (max-width: 600px) {
+    .hero-grid, .two-col, .two-col-even { grid-template-columns: 1fr; }
+    .logo-suite { grid-template-columns: 1fr 1fr; }
+    .swatch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .compound-grid, .motif-row { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+  <!-- HERO: F1 LAS VEGAS NIGHT RACE -->
+  <section class="hero">
+    <div class="hero-grid">
+      <div>
+        <div class="gantry-bar">
+          <span class="g-light"></span>
+          <span class="g-light"></span>
+          <span class="g-light"></span>
+          <span class="g-light"></span>
+          <span class="g-light go"></span>
+          <span class="g-label">LAS VEGAS NIGHT RACE SPEC // V2.0</span>
+        </div>
+        <div class="hero-lockup">
+          <svg width="52" height="52" viewBox="0 0 64 64" fill="none" aria-label="Pit Crew Mark">
+            <defs>
+              <linearGradient id="bh-r" x1="6" y1="10" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#FF1E00"/><stop offset="100%" stop-color="#D90429"/>
+              </linearGradient>
+              <linearGradient id="bh-n" x1="12" y1="54" x2="58" y2="26" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#B84DFF"/><stop offset="55%" stop-color="#FF008C"/><stop offset="100%" stop-color="#FF1E00"/>
+              </linearGradient>
+            </defs>
+            <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="url(#bh-r)"/>
+            <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+            <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="url(#bh-n)"/>
+          </svg>
+          <div>
+            <div class="wordmark">PIT CREW</div>
+            <div class="wordmark-sub">
+              <span style="display:inline-block;width:12px;height:3px;background:#FF1E00;border-radius:1px;"></span>
+              <span style="display:inline-block;width:8px;height:3px;background:#FF008C;border-radius:1px;"></span>
+              AUTONOMOUS CI TELEMETRY AGENT
+            </div>
+          </div>
+        </div>
+        <div class="hero-tagline">Faster CI. Proven on every bug.</div>
+        <div class="hero-desc">F1 master precision (Warm Red + Carbon Black + broadcast timing) fused with Las Vegas Strip neon telemetry. The managed agent proposes; deterministic code judges.</div>
+      </div>
+
+      <!-- Mini Vegas Strip Circuit + Sphere Graphic -->
+      <div class="circuit-preview">
+        <svg viewBox="0 0 240 132" width="100%" fill="none" aria-label="Las Vegas Night Circuit">
+          <circle cx="152" cy="64" r="48" stroke="#FF008C" stroke-opacity="0.35" stroke-width="1.2" stroke-dasharray="3 4"/>
+          <circle cx="152" cy="64" r="32" stroke="#B84DFF" stroke-opacity="0.45" stroke-width="1.2"/>
+          <!-- Track -->
+          <path d="M26 100 L82 100 L102 82 L166 82 C194 82 208 66 208 48 C208 30 192 18 166 18 L128 18 L108 38 L52 38 L26 64 Z" stroke="#2D2D44" stroke-width="8" stroke-linejoin="round"/>
+          <path d="M26 100 L82 100 L102 82" stroke="#00F0FF" stroke-width="3" stroke-linecap="round"/>
+          <path d="M102 82 L166 82 C194 82 208 66 208 48" stroke="#B84DFF" stroke-width="3.5" stroke-linecap="round"/>
+          <path d="M208 48 C208 30 192 18 166 18 L128 18" stroke="#FFD000" stroke-width="3" stroke-linecap="round"/>
+          <path d="M128 18 L108 38 L52 38" stroke="#FF008C" stroke-width="3" stroke-linecap="round"/>
+          <path d="M52 38 L26 64 L26 100" stroke="#00E676" stroke-width="3.5" stroke-linecap="round"/>
+          <circle cx="26" cy="100" r="4" fill="#00E676"/>
+          <circle cx="166" cy="82" r="4" fill="#B84DFF"/>
+          <circle cx="128" cy="18" r="4" fill="#FFD000"/>
+          <text x="14" y="122" fill="#9E9EB3" font-family="ui-monospace, monospace" font-size="8.5" letter-spacing="0.12em">S1 ANA • S2 OPT • S3 PRF • FINISH RAT</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 01 / LOGO SUITE & AVATARS -->
+  <section class="card">
+    <div class="sec-head">
+      <span class="sec-title"><span class="sec-num">01</span> Logo Suite, Mono &amp; Bot Identity</span>
+      <span class="sec-note">brand/logo-*.svg • github-bot-avatar.svg • favicon.svg</span>
+    </div>
+    <div class="logo-suite">
+      <div class="logo-box dark">
+        <div style="display:flex;align-items:center;gap:9px;margin-top:6px;">
+          <svg width="32" height="32" viewBox="0 0 64 64" fill="none">
+            <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="#FF1E00"/>
+            <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+            <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="#FF008C"/>
+          </svg>
+          <div>
+            <div style="font-size:17px;font-weight:800;font-style:italic;letter-spacing:0.06em;line-height:1;">PIT CREW</div>
+            <div style="font-family:var(--font-mono,monospace);font-size:7.5px;letter-spacing:0.14em;color:#8E8EA6;margin-top:3px;">LAS VEGAS SPEC</div>
+          </div>
+        </div>
+        <span class="box-cap">Dark Lockup</span>
+      </div>
+
+      <div class="logo-box light">
+        <div style="display:flex;align-items:center;gap:9px;margin-top:6px;">
+          <svg width="32" height="32" viewBox="0 0 64 64" fill="none">
+            <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="#E10600"/>
+            <path d="M11 21H37.5L33.5 29H11V21Z" fill="#15151E"/>
+            <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="#B8007A"/>
+          </svg>
+          <div>
+            <div style="font-size:17px;font-weight:800;font-style:italic;letter-spacing:0.06em;line-height:1;">PIT CREW</div>
+            <div style="font-family:var(--font-mono,monospace);font-size:7.5px;letter-spacing:0.14em;color:#525266;margin-top:3px;">LAS VEGAS SPEC</div>
+          </div>
+        </div>
+        <span class="box-cap">Light Lockup</span>
+      </div>
+
+      <div class="logo-box vegas">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+          <div style="display:flex;gap:3px;">
+            <span style="width:4px;height:4px;border-radius:50%;background:#FF1E00;"></span>
+            <span style="width:4px;height:4px;border-radius:50%;background:#FF1E00;"></span>
+            <span style="width:4px;height:4px;border-radius:50%;background:#FF1E00;"></span>
+            <span style="width:4px;height:4px;border-radius:50%;background:#00E676;"></span>
+          </div>
+          <svg width="28" height="28" viewBox="0 0 64 64" fill="none">
+            <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="#FF1E00"/>
+            <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+            <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="#B84DFF"/>
+          </svg>
+          <span style="font-size:10px;font-weight:800;font-style:italic;letter-spacing:0.08em;">PIT CREW</span>
+        </div>
+        <span class="box-cap">Stacked Badge</span>
+      </div>
+
+      <div class="logo-box dark">
+        <div style="display:flex;align-items:center;gap:10px;margin-top:4px;">
+          <div style="width:38px;height:38px;border-radius:10px;background:#15151E;border:1.5px solid #FF008C;display:flex;align-items:center;justify-content:center;">
+            <svg width="24" height="24" viewBox="0 0 64 64" fill="none">
+              <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="#FF1E00"/>
+              <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+              <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="#B84DFF"/>
+            </svg>
+          </div>
+          <svg width="24" height="24" viewBox="0 0 64 64" fill="none">
+            <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="#F4F4F7"/>
+            <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7" opacity="0.65"/>
+            <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="#F4F4F7"/>
+          </svg>
+        </div>
+        <span class="box-cap">Bot &amp; Mono</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 02 / F1 MASTER x LAS VEGAS COLOR SYSTEM -->
+  <section class="card">
+    <div class="sec-head">
+      <span class="sec-title"><span class="sec-num">02</span> F1 Master × Las Vegas Strip Color System</span>
+      <span class="sec-note">brand/tokens.css • tokens.json</span>
+    </div>
+    <div class="swatch-grid">
+      <div class="swatch"><div class="sw-bar" style="background:#0B0B11;"></div><div class="sw-info"><div class="sw-name">Void Asphalt</div><div class="sw-hex">#0B0B11</div><div class="sw-role">Night canvas</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#15151E;"></div><div class="sw-info"><div class="sw-name">F1 Carbon</div><div class="sw-hex">#15151E</div><div class="sw-role">Master surface</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#FF1E00;"></div><div class="sw-info"><div class="sw-name">F1 Warm Red</div><div class="sw-hex">#FF1E00</div><div class="sw-role">Primary / Wall</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#FF008C;"></div><div class="sw-info"><div class="sw-name">Strip Magenta</div><div class="sw-hex">#FF008C</div><div class="sw-role">Fork CI / DSP</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#B84DFF;"></div><div class="sw-info"><div class="sw-name">Sector Purple</div><div class="sw-hex">#B84DFF</div><div class="sw-role">Record CI / OPT</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#00F0FF;"></div><div class="sw-info"><div class="sw-name">Sphere Cyan</div><div class="sw-hex">#00F0FF</div><div class="sw-role">Analysis / S1</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#FFD000;"></div><div class="sw-info"><div class="sw-name">Vegas Gold</div><div class="sw-hex">#FFD000</div><div class="sw-role">Bug Proof / S3</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#00E676;"></div><div class="sw-info"><div class="sw-name">DRS Green</div><div class="sw-hex">#00E676</div><div class="sw-role">Verdict KEEP</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#1C1C28;"></div><div class="sw-info"><div class="sw-name">Paddock Slate</div><div class="sw-hex">#1C1C28</div><div class="sw-role">Elevated UI</div></div></div>
+      <div class="swatch"><div class="sw-bar" style="background:#F4F4F7;"></div><div class="sw-info"><div class="sw-name">High-Vis White</div><div class="sw-hex">#F4F4F7</div><div class="sw-role">Primary ink</div></div></div>
+    </div>
+    <div class="motif-row">
+      <div class="motif-chip">
+        <div class="motif-strip" style="background:linear-gradient(90deg,#FF1E00 0%,#FF008C 52%,#B84DFF 100%);"></div>
+        <div class="motif-label">STRIP NEON TRIM // --pc-grad-strip</div>
+      </div>
+      <div class="motif-chip">
+        <div class="motif-strip" style="background:linear-gradient(90deg,#00F0FF 0%,#B84DFF 50%,#00E676 100%);"></div>
+        <div class="motif-label">TELEMETRY FLOW // S1 → S2 → KEEP</div>
+      </div>
+      <div class="motif-chip">
+        <div class="motif-strip" style="background:repeating-linear-gradient(90deg,#FF1E00 0 14px,#F4F4F7 14px 28px);"></div>
+        <div class="motif-label">F1 APEX KERB // HERO FOOTER ACCENT</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 03 / BROADCAST TIMING TOWER + PIPELINE CIRCUIT -->
+  <section class="card">
+    <div class="sec-head">
+      <span class="sec-title"><span class="sec-num">03</span> Broadcast Timing Tower &amp; Trust Boundary Architecture</span>
+      <span class="sec-note">brand/circuit-architecture.svg</span>
+    </div>
+    <div class="two-col">
+      <!-- F1 Broadcast Timing Tower -->
+      <div class="tower">
+        <div class="tower-hd">
+          <span><span style="color:#FF1E00;">▮</span> PIT WALL TELEMETRY</span>
+          <span style="color:#00E676;">LAP 05/05</span>
+        </div>
+        <div class="t-row">
+          <span class="t-pos">01</span>
+          <span class="t-code"><span class="t-bar" style="background:#00F0FF;"></span>ANA</span>
+          <span class="t-sub">Hypothesis • critical_path</span>
+          <span class="t-delta" style="color:#00F0FF;">S1 DONE</span>
+        </div>
+        <div class="t-row">
+          <span class="t-pos">02</span>
+          <span class="t-code"><span class="t-bar" style="background:#B84DFF;"></span>OPT</span>
+          <span class="t-sub">Candidate • [M] shard-by-timing</span>
+          <span class="t-delta" style="color:#B84DFF;">-142.4s</span>
+        </div>
+        <div class="t-row">
+          <span class="t-pos">03</span>
+          <span class="t-code"><span class="t-bar" style="background:#FFD000;"></span>PRF</span>
+          <span class="t-sub">ReplayPlan • 12 red SHAs</span>
+          <span class="t-delta" style="color:#FFD000;">12 BUGS</span>
+        </div>
+        <div class="trust-sep">━ TRUST WALL // CODE JUDGES ONLY ━</div>
+        <div class="t-row">
+          <span class="t-pos">04</span>
+          <span class="t-code"><span class="t-bar" style="background:#FF008C;"></span>DSP</span>
+          <span class="t-sub">Evidence • Fork Actions N=10</span>
+          <span class="t-delta" style="color:#FF008C;">MEASURED</span>
+        </div>
+        <div class="t-row" style="background:rgba(0,230,118,0.08);">
+          <span class="t-pos" style="color:#00E676;">05</span>
+          <span class="t-code"><span class="t-bar" style="background:#00E676;"></span>RAT</span>
+          <span class="t-sub" style="color:#B7F5D4;">Verdict • exact p=0.004</span>
+          <span class="t-delta" style="color:#00E676;">KEEP ✓</span>
+        </div>
+      </div>
+
+      <!-- Mini Architecture Circuit Diagram -->
+      <div style="background:#0D0D14;border:1px solid #2D2D44;border-radius:10px;padding:10px;display:flex;flex-direction:column;justify-content:space-between;">
+        <svg viewBox="0 0 380 186" width="100%" fill="none" aria-label="Pit Crew Trust Wall Circuit">
+          <!-- Zones -->
+          <rect x="4" y="8" width="196" height="170" rx="8" fill="#15151E" stroke="#2D2D44"/>
+          <text x="14" y="24" fill="#00F0FF" font-family="ui-monospace,monospace" font-size="8" font-weight="700">MANAGED SANDBOX</text>
+          <line x1="210" y1="8" x2="210" y2="178" stroke="#FF1E00" stroke-width="2" stroke-dasharray="5 4"/>
+          <rect x="220" y="8" width="156" height="170" rx="8" fill="#111917" stroke="#234838"/>
+          <text x="230" y="24" fill="#00E676" font-family="ui-monospace,monospace" font-size="8" font-weight="700">DETERMINISTIC CODE</text>
+
+          <!-- Circuit loop -->
+          <path d="M40 132 L40 58 C40 44 52 40 68 40 L176 40 C190 40 192 52 192 64 L192 126 C192 140 202 144 214 144 L340 144 C356 144 362 134 362 118 L362 60 C362 46 350 40 332 40 L254 40" stroke="#252538" stroke-width="8" stroke-linecap="round" fill="none"/>
+          <path d="M40 132 L40 58 C40 44 52 40 68 40 L112 40" stroke="#00F0FF" stroke-width="3" fill="none"/>
+          <path d="M112 40 L176 40 C190 40 192 52 192 64 L192 98" stroke="#B84DFF" stroke-width="3" fill="none"/>
+          <path d="M192 98 L192 126 C192 140 202 144 214 144" stroke="#FFD000" stroke-width="3" fill="none"/>
+          <path d="M214 144 L340 144 C356 144 362 134 362 118 L362 96" stroke="#FF008C" stroke-width="3" fill="none"/>
+          <path d="M362 96 L362 60 C362 46 350 40 332 40 L254 40" stroke="#00E676" stroke-width="3.5" fill="none"/>
+
+          <!-- Nodes -->
+          <rect x="14" y="46" width="76" height="32" rx="5" fill="#0D0D14" stroke="#00F0FF"/>
+          <text x="20" y="60" fill="#00F0FF" font-family="ui-monospace,monospace" font-size="7.5" font-weight="700">S1 ANA</text>
+          <text x="20" y="72" fill="#F4F4F7" font-family="sans-serif" font-size="8.5" font-weight="700">Hypothesis</text>
+
+          <rect x="108" y="46" width="78" height="32" rx="5" fill="#0D0D14" stroke="#B84DFF"/>
+          <text x="114" y="60" fill="#B84DFF" font-family="ui-monospace,monospace" font-size="7.5" font-weight="700">S2 OPT</text>
+          <text x="114" y="72" fill="#F4F4F7" font-family="sans-serif" font-size="8.5" font-weight="700">Candidate</text>
+
+          <rect x="108" y="102" width="78" height="32" rx="5" fill="#0D0D14" stroke="#FFD000"/>
+          <text x="114" y="116" fill="#FFD000" font-family="ui-monospace,monospace" font-size="7.5" font-weight="700">S3 PRF</text>
+          <text x="114" y="128" fill="#F4F4F7" font-family="sans-serif" font-size="8.5" font-weight="700">ReplayPlan</text>
+
+          <rect x="14" y="144" width="172" height="24" rx="5" fill="#1C1C2B" stroke="#464666"/>
+          <text x="100" y="159" text-anchor="middle" fill="#D4D4E2" font-family="ui-monospace,monospace" font-size="8" font-weight="700">LEDGER (contracts.py)</text>
+
+          <rect x="232" y="114" width="118" height="36" rx="5" fill="#0D0D14" stroke="#FF008C"/>
+          <text x="240" y="129" fill="#FF008C" font-family="ui-monospace,monospace" font-size="7.5" font-weight="700">FORK CI // DSP</text>
+          <text x="240" y="143" fill="#F4F4F7" font-family="sans-serif" font-size="8.5" font-weight="700">Evidence (N&gt;=5)</text>
+
+          <rect x="232" y="44" width="118" height="38" rx="5" fill="#0D2118" stroke="#00E676" stroke-width="1.5"/>
+          <text x="240" y="59" fill="#00E676" font-family="ui-monospace,monospace" font-size="7.5" font-weight="700">GANTRY // RATER</text>
+          <text x="240" y="74" fill="#F4F4F7" font-family="sans-serif" font-size="9" font-weight="700">Verdict: KEEP</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- 04 / COMPOUND RINGS & RACE CONTROL FLAGS -->
+  <section class="card">
+    <div class="sec-head">
+      <span class="sec-title"><span class="sec-num">04</span> Optimizer Compound Rings &amp; Race Control Flags</span>
+      <span class="sec-note">Playbook taxonomy + system voice</span>
+    </div>
+    <div class="two-col-even">
+      <div class="compound-grid">
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #FF1E00;color:#FF1E00;">S</div>
+          <div><div class="c-name">dep-cache</div><div class="c-desc">SOFT • Fast build grip</div></div>
+        </div>
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #FFD000;color:#FFD000;">M</div>
+          <div><div class="c-name">shard-by-timing</div><div class="c-desc">MEDIUM • Balanced pace</div></div>
+        </div>
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #F4F4F7;color:#F4F4F7;">H</div>
+          <div><div class="c-name">affected-tests</div><div class="c-desc">HARD • Scoped precision</div></div>
+        </div>
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #00E676;color:#00E676;">I</div>
+          <div><div class="c-name">fail-fast-order</div><div class="c-desc">INTER • Early signal</div></div>
+        </div>
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #00B0FF;color:#00B0FF;">W</div>
+          <div><div class="c-name">flake-quarantine</div><div class="c-desc">WET • Stability isolate</div></div>
+        </div>
+        <div class="compound-item">
+          <div class="tire-ring" style="border:3px solid #FF008C;color:#FF008C;">HS</div>
+          <div><div class="c-name">dedupe-jobs</div><div class="c-desc">HYPER • Strip redundancy</div></div>
+        </div>
+      </div>
+
+      <div class="flag-list">
+        <div class="flag-row">
+          <span class="flag-pill" style="background:#00E676;color:#0B0B11;">GREEN FLAG</span>
+          <span class="flag-copy">Verdict KEEP • p &lt;= 0.05 &amp; 100% bugs caught</span>
+        </div>
+        <div class="flag-row">
+          <span class="flag-pill" style="background:#B84DFF;color:#F4F4F7;">PURPLE SECTOR</span>
+          <span class="flag-copy">New fastest median CI time for repository</span>
+        </div>
+        <div class="flag-row">
+          <span class="flag-pill" style="background:#FFD000;color:#0B0B11;">YELLOW FLAG</span>
+          <span class="flag-copy">Insufficient samples (&lt;5) or high runner noise</span>
+        </div>
+        <div class="flag-row">
+          <span class="flag-pill" style="background:#FF1E00;color:#F4F4F7;">RED FLAG</span>
+          <span class="flag-copy">Verdict REJECT • missed bug or 0 replays</span>
+        </div>
+        <div class="flag-row">
+          <span class="flag-pill" style="background:#F4F4F7;color:#0B0B11;">CHECKERED</span>
+          <span class="flag-copy">Upstream PR opened with ledger evidence</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 05 / TYPOGRAPHY, BADGES & LIVE APPLICATIONS -->
+  <section class="card">
+    <div class="sec-head">
+      <span class="sec-title"><span class="sec-num">05</span> Typography, Badges &amp; Surface Applications</span>
+      <span class="sec-note">brand/badges/*.svg • BRAND.md PR template</span>
+    </div>
+    <div class="two-col">
+      <!-- Left: Typography + Badges -->
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div style="padding:9px 11px;border-radius:8px;background:var(--secondary,#1C1C28);border:1px solid var(--border,#2D2D44);">
+          <div style="font-family:var(--font-mono,monospace);font-size:9px;color:var(--muted-foreground,#8E8EA6);letter-spacing:0.12em;">ENGINEERED DISPLAY // CHAKRA PETCH 700 ITALIC</div>
+          <div style="font-size:17px;font-weight:800;font-style:italic;letter-spacing:0.06em;margin-top:2px;">PIT CREW — LAS VEGAS GP</div>
+        </div>
+        <div style="padding:9px 11px;border-radius:8px;background:var(--secondary,#1C1C28);border:1px solid var(--border,#2D2D44);">
+          <div style="font-family:var(--font-mono,monospace);font-size:9px;color:var(--muted-foreground,#8E8EA6);letter-spacing:0.12em;">MECHANIC SANS // TITILLIUM WEB 400–700</div>
+          <div style="font-size:12px;color:var(--muted-foreground,#C6C6D6);margin-top:2px;">Every optimization ships with measured paired runs and replayed red commits.</div>
+        </div>
+        <div style="padding:9px 11px;border-radius:8px;background:var(--secondary,#1C1C28);border:1px solid var(--border,#2D2D44);">
+          <div style="font-family:var(--font-mono,monospace);font-size:9px;color:var(--muted-foreground,#8E8EA6);letter-spacing:0.12em;">TELEMETRY MONO // JETBRAINS MONO TABULAR</div>
+          <div style="font-family:var(--font-mono,monospace);font-size:12px;font-weight:700;color:#B84DFF;margin-top:2px;">MEDIAN 3m 09s (-42.8%) • p=0.004 • 12/12</div>
+        </div>
+
+        <div class="badge-row">
+          <span class="micro-badge"><span class="mb-l" style="background:#00E676;">VERDICT</span><span class="mb-r" style="color:#00E676;">KEEP // -42.8%</span></span>
+          <span class="micro-badge"><span class="mb-l" style="background:#FFD000;">BUG PROOF</span><span class="mb-r" style="color:#FFE680;">12/12 CAUGHT</span></span>
+          <span class="micro-badge"><span class="mb-l" style="background:#FF1E00;color:#F4F4F7;">RED FLAG</span><span class="mb-r" style="color:#FF6B57;">REJECTED</span></span>
+          <span class="micro-badge"><span class="mb-l" style="background:#FF1E00;color:#F4F4F7;font-style:italic;">PIT CREW</span><span class="mb-r" style="color:#FF79C4;">VEGAS SPEC</span></span>
+        </div>
+      </div>
+
+      <!-- Right: GitHub PR Verdict Comment + CLI Telemetry -->
+      <div>
+        <div class="pr-mock">
+          <div class="pr-hd">
+            <span><strong style="color:#F4F4F7;">pit-crew[bot]</strong> <span style="color:#8E8EA6;">commented on PR #184</span></span>
+            <span style="color:#00E676;font-weight:700;">VERDICT: KEEP</span>
+          </div>
+          <div class="pr-body">
+            <div class="pr-verdict">
+              <span style="font-size:12px;font-weight:700;">🏁 Compound: <span style="color:#FFD000;font-family:var(--font-mono,monospace);">[M] shard-by-timing</span></span>
+              <span style="font-family:var(--font-mono,monospace);font-size:10px;color:#B84DFF;font-weight:700;">PURPLE SECTOR</span>
+            </div>
+            <table class="pr-table">
+              <thead><tr><th>Metric</th><th>Base</th><th>Cand</th><th>Delta</th></tr></thead>
+              <tbody>
+                <tr><td>Median CI</td><td>5m 32s</td><td>3m 09s</td><td style="color:#B84DFF;font-weight:700;">-42.8%</td></tr>
+                <tr><td>Perm Test</td><td>—</td><td>p=0.004</td><td style="color:#00E676;font-weight:700;">PASS</td></tr>
+                <tr><td>Bug Replays</td><td>12/12</td><td>12/12</td><td style="color:#00E676;font-weight:700;">100% SAFE</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="cli-mock">
+          <div><span style="color:#FF1E00;">▶</span> <span style="color:#F4F4F7;font-weight:700;">pit-crew</span> run --repo acme/api --spec vegas</div>
+          <div><span style="color:#00F0FF;">[S1 ANA]</span> critical_path=pytest (312s) → hyp_019</div>
+          <div><span style="color:#B84DFF;">[S2 OPT]</span> pushed fork/opt-shard-019 (compound=M)</div>
+          <div><span style="color:#FFD000;">[S3 PRF]</span> replay_plan=12 red commits locked</div>
+          <div><span style="color:#00E676;">[VERDICT]</span> KEEP -142.4s (p=0.004) → PR #184 opened</div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+</body>
+</html>

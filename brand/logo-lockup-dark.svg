@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 76" fill="none">
+  <defs>
+    <linearGradient id="ld-r" x1="6" y1="10" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF1E00"/>
+      <stop offset="100%" stop-color="#D90429"/>
+    </linearGradient>
+    <linearGradient id="ld-n" x1="12" y1="54" x2="58" y2="26" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#B84DFF"/>
+      <stop offset="55%" stop-color="#FF008C"/>
+      <stop offset="100%" stop-color="#FF1E00"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(4, 6)">
+    <path d="M12 10H42C51.5 10 57 15.6 57 24.5C57 33.4 51.5 39 42 39H25.5L19 52H8.5L17.5 34H40.5C44.8 34 47.2 31.3 47.2 24.5C47.2 17.7 44.8 15 40.5 15H17L12 10Z" fill="url(#ld-r)"/>
+    <path d="M11 21H37.5L33.5 29H11V21Z" fill="#F4F4F7"/>
+    <path d="M31.5 44H56.5L52.5 52H27.5L31.5 44Z" fill="url(#ld-n)"/>
+  </g>
+  <text x="80" y="43" fill="#F4F4F7" font-family="'Chakra Petch', 'Titillium Web', 'Space Grotesk', sans-serif" font-size="36" font-weight="700" font-style="italic" letter-spacing="0.08em">PIT CREW</text>
+  <rect x="82" y="52" width="16" height="3" rx="1.5" fill="#FF1E00"/>
+  <rect x="101" y="52" width="10" height="3" rx="1.5" fill="#FF008C"/>
+  <text x="118" y="57" fill="#9494A8" font-family="'JetBrains Mono', ui-monospace, monospace" font-size="10" font-weight="600" letter-spacing="0.18em">LAS VEGAS SPEC // CI AGENT</text>
+</svg>
