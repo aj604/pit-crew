@@ -171,8 +171,29 @@ class _Profiled:
     fetched: int  # runs the history returned before any exclusion
 
 
-# Events whose run executes the workflow file as committed at head_sha.
-_HEAD_SHA_EVENTS = frozenset({"push", "workflow_dispatch", "schedule", "merge_group"})
+# Events whose run executes the workflow file as committed at head_sha, in the order they are fetched.
+_HEAD_SHA_EVENT_ORDER = ("push", "merge_group", "workflow_dispatch", "schedule")
+_HEAD_SHA_EVENTS = frozenset(_HEAD_SHA_EVENT_ORDER)
+
+
+def _newest_first(run: dict[str, Any]) -> tuple[str, int]:
+    raw_id = run.get("id")
+    return str(run.get("run_started_at") or run.get("created_at") or ""), raw_id if isinstance(raw_id, int) else 0
+
+
+def _fetch_trusted_history(repo: str, workflow: str, runs: int, branch: str | None) -> list[dict[str, Any]]:
+    """The newest `runs` runs among the trusted events, newest first.
+
+    One request per event (at most four), each asking only for what is still missing, so pull-request runs
+    never use up the window and no jobs are fetched for runs that would be dropped. Runs are de-duplicated by id.
+    """
+    collected: dict[object, dict[str, Any]] = {}
+    for event in _HEAD_SHA_EVENT_ORDER:
+        if len(collected) >= runs:
+            break
+        for run in history.fetch_history(repo, workflow, runs=runs - len(collected), branch=branch, event=event):
+            collected.setdefault(run.get("id"), run)
+    return sorted(collected.values(), key=_newest_first, reverse=True)[: max(runs, 0)]
 
 
 def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
@@ -189,7 +210,8 @@ def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
     Only runs whose workflow file is byte-identical to the checkout's are profiled: a run of another
     revision may have a same-named step that runs a different command. Only events that execute the
     workflow at head_sha count: pull_request runs the merge commit's file and pull_request_target the
-    base branch's, so the blob at head_sha says nothing about what ran.
+    base branch's, so the blob at head_sha says nothing about what ran. The history is fetched per trusted
+    event, so pull-request runs cannot fill the window; the event filter below stays as defence in depth.
     """
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
@@ -198,7 +220,7 @@ def _profile_workflow(  # noqa: PLR0913  mirrors profile_ci parameters
         workflow_path(workflow)  # reject a bad workflow name before any network call
     else:
         _validate_workflow_name(workflow)
-    fetched = history.fetch_history(repo, workflow, runs=runs, branch=branch)
+    fetched = _fetch_trusted_history(repo, workflow, runs, branch)
     raw = [r for r in fetched if r.get("event") in _HEAD_SHA_EVENTS]
     text = _load_workflow_text(repo, workflow, branch, raw, workflow_content=workflow_content, ref=ref)
     spec = parse_workflow(text)

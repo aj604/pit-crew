@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -308,3 +309,53 @@ def test_event_exclusion_alongside_a_revision_mismatch_gives_only_the_revision_n
     assert len(result["uncovered"]) == 1
     assert "exact workflow file" in result["uncovered"][0]
     assert "pull-request" not in result["uncovered"][0]
+
+
+@pytest.mark.usefixtures("checkout")
+def test_the_window_is_filled_per_trusted_event_so_pull_request_runs_cannot_crowd_it_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    by_event = {
+        "pull_request": [with_event(make_run(100 + i, OTHER_NEWEST, 10 + i, 200), "pull_request") for i in range(9)],
+        "push": [make_run(2, MATCH_NEW, 5, 100), make_run(1, MATCH_OLD, 1, 110)],
+        "schedule": [with_event(make_run(i, MATCH_OLD, 3, 105), "schedule") for i in (3, 4)],
+    }
+    every = {r["id"]: r for runs in by_event.values() for r in runs}
+    run_requests: list[tuple[str, int]] = []
+    jobs_requested: list[int] = []
+
+    def get(url: str) -> tuple[Any, str | None]:
+        if "/jobs" in url:
+            run_id = int(url.split("/runs/")[1].split("/", maxsplit=1)[0])
+            jobs_requested.append(run_id)
+            return {"jobs": every[run_id]["jobs"]}, None
+        query = parse_qs(urlparse(url).query)
+        event, per_page = query["event"][0], int(query["per_page"][0])
+        run_requests.append((event, per_page))
+        page = [{k: v for k, v in r.items() if k != "jobs"} for r in by_event.get(event, [])[:per_page]]
+        return {"workflow_runs": page}, None
+
+    real_fetch = history.fetch_history
+    monkeypatch.setattr(history, "fetch_history", lambda *a, **k: real_fetch(*a, **k, get=get))
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, local))
+
+    result = tools.call("profile_ci", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml", "runs": 3})
+
+    # Push first, then each call asks only for what is missing; pull_request is never requested.
+    assert run_requests == [("push", 3), ("merge_group", 1), ("workflow_dispatch", 1), ("schedule", 1)]
+    assert sorted(jobs_requested) == [1, 2, 3]  # jobs only for the three kept runs
+    assert result["runs_analyzed"] == 3
+    assert result["runs_excluded_event"] == 0
+
+
+@pytest.mark.usefixtures("checkout")
+def test_runs_returned_by_more_than_one_event_call_are_counted_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = history.workflow_blob_sha(CHECKOUT)
+    raw = [make_run(2, MATCH_NEW, 2, 100), make_run(1, MATCH_OLD, 1, 110)]
+    patch_history(monkeypatch, raw, {MATCH_NEW: local, MATCH_OLD: local})
+
+    result = tools.call("find_bottlenecks", InMemoryLedger(), {"repo": REPO, "workflow": "ci.yml"})
+
+    assert result["profile_summary"]["runs_analyzed"] == 2  # the same fake answers every event call
+    assert result["profile_summary"]["base_sha"] == MATCH_NEW
