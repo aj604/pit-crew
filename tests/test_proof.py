@@ -245,7 +245,7 @@ def test_shell_order_comparisons_skip_commands_nested_in_arithmetic(opening: str
 
 @pytest.mark.parametrize(
     ("redirect", "indent"),
-    [("<<'EOF'", ""), ('<<"EOF"', ""), ("<<-'EOF'", "\t"), (r"<<E\OF", "")],
+    [("<<'EOF'", ""), ('<<"EOF"', ""), ("<<-'EOF'", "\t"), (r"<<E\OF", ""), ("<<$'EOF'", ""), ('<<$"EOF"', "")],
 )
 def test_shell_mutants_skip_quoted_heredoc_bodies(redirect: str, indent: str) -> None:
     source = f"cat {redirect}\n{indent}(( a < b )) && true\n{indent}EOF\n(( x > y ))\n"

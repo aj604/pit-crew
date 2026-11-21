@@ -50,7 +50,7 @@ _SHELL_PARENS_RE = re.compile(r"\\[^\n]|\$?\(\(|\$\(|[()]")
 _HEREDOC_RE = re.compile(
     r"""<<(?P<tabs>-?)[ \t]*(?![ \t<#])(?P<word>(?:[^ \t\n;&|()<>'"\\]|\\[^\n]|'[^'\n]*'|"(?:\\[^\n]|[^"\\\n])*")+)"""
 )
-_DELIMITER_QUOTES_RE = re.compile(r"""'[^']*'|"(?:\\.|[^"\\])*"|\\.""")
+_DELIMITER_QUOTES_RE = re.compile(r"""\$?(?:'[^']*'|"(?:\\.|[^"\\])*")|\\.""")
 
 type _HereDoc = tuple[str, bool, bool]
 
@@ -138,7 +138,7 @@ def _shell_paren(context: list[bool], marker: str) -> None:
 
 
 def _unquote_delimiter(match: re.Match[str]) -> str:
-    quoted = match.group()
+    quoted = match.group().removeprefix("$")
     if quoted.startswith('"'):
         return re.sub(r'\\([\\$\x60"])', r"\1", quoted[1:-1])
     return quoted[1:-1] if quoted.startswith("'") else quoted[1:]
