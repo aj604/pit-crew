@@ -153,6 +153,67 @@ def test_each_guard_alone_keeps_its_worktree(layout: dict[str, Path], guard: str
     assert layout[guard].exists()
 
 
+def add_nested_worktree(repo: Path, parent: Path, name: str, *, ignored: bool = True) -> Path:
+    """A worktree of ``repo`` placed inside ``parent``'s directory, optionally gitignored there."""
+    if ignored:
+        exclude = Path(git(parent, "rev-parse", "--git-path", "info/exclude").strip())
+        exclude = exclude if exclude.is_absolute() else parent / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(".wt/\n")
+    path = parent / ".wt" / name
+    git(repo, "worktree", "add", "-q", "-b", name, str(path), "main")
+    return path
+
+
+def test_dirty_worktree_nested_in_a_removable_one_survives_apply(repo: Path) -> None:
+    parent = add_worktree(repo, "parent")
+    child = add_nested_worktree(repo, parent, "child")
+    (child / "wip.txt").write_text("uncommitted\n")
+    lines: list[str] = []
+
+    prune(repo, apply=True, open_prs=lambda _: frozenset(), out=lines.append)
+
+    assert (child / "wip.txt").read_text() == "uncommitted\n"
+    assert parent.exists()
+    assert registered(repo) == {repo.resolve(), parent.resolve(), child.resolve()}
+    assert any(line.startswith("keep") and f"{parent}  " in line and "contains worktree" in line for line in lines)
+    assert not any(line.startswith("removed") for line in lines)
+
+
+def test_clean_nested_worktrees_are_removed_before_their_parent(repo: Path) -> None:
+    parent = add_worktree(repo, "parent")
+    child = add_nested_worktree(repo, parent, "child")
+
+    prune(repo, apply=True, open_prs=lambda _: frozenset(), out=lambda _: None)
+
+    assert not parent.exists()
+    assert not child.exists()
+    assert registered(repo) == {repo.resolve()}
+
+
+def test_kept_grandchild_keeps_every_ancestor(repo: Path) -> None:
+    parent = add_worktree(repo, "parent")
+    child = add_nested_worktree(repo, parent, "child")
+    grandchild = add_nested_worktree(repo, child, "grandchild")
+    (grandchild / "wip.txt").write_text("uncommitted\n")
+
+    prune(repo, apply=True, open_prs=lambda _: frozenset(), out=lambda _: None)
+
+    assert (grandchild / "wip.txt").exists()
+    assert registered(repo) == {repo.resolve(), parent.resolve(), child.resolve(), grandchild.resolve()}
+
+
+def test_dry_run_does_not_promise_to_remove_a_parent_of_a_kept_worktree(repo: Path) -> None:
+    parent = add_worktree(repo, "parent")
+    child = add_nested_worktree(repo, parent, "child")
+    (child / "wip.txt").write_text("uncommitted\n")
+    lines: list[str] = []
+
+    prune(repo, apply=False, open_prs=lambda _: frozenset(), out=lines.append)
+
+    assert not any(line.startswith("remove ") for line in lines)
+
+
 def test_apply_prunes_entries_whose_directory_is_gone(repo: Path) -> None:
     gone = add_worktree(repo, "gone")
     shutil.rmtree(gone)

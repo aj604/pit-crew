@@ -10,7 +10,9 @@ lost, so it is skipped when it is:
 - the main checkout, a bare entry, locked, or the one the command runs from;
 - dirty: staged, unstaged, or untracked changes;
 - holding commits that are not on the base ref (``origin/HEAD``, ``origin/main`` or ``main``);
-- on a branch with an open pull request.
+- on a branch with an open pull request;
+- holding another worktree's directory that is itself kept (every worktree is judged before any
+  is removed, and nested ones are removed before the ones that contain them).
 
 Anything it cannot check (a failed ``git status``, an unknown base, no answer from ``gh``)
 counts as unsafe, so the worktree is kept. Removal uses ``git worktree remove`` without
@@ -198,6 +200,24 @@ def classify(
     return Verdict(worktree, reason)
 
 
+def _keep_parents_of_kept(verdicts: Sequence[Verdict]) -> list[Verdict]:
+    """Keep any worktree whose directory still holds a kept worktree, so removal can't delete it.
+
+    Deepest first, so a kept grandchild also keeps its parent and grandparent.
+    """
+    kept: set[Path] = set()
+    resolved: dict[Path, Verdict] = {}
+    for verdict in sorted(verdicts, key=lambda v: len(v.worktree.path.resolve().parts), reverse=True):
+        path = verdict.worktree.path.resolve()
+        inner = next((k for k in kept if k != path and k.is_relative_to(path)), None)
+        if verdict.removable and inner is not None:
+            verdict = Verdict(verdict.worktree, f"contains worktree that is kept: {inner}")  # noqa: PLW2901
+        if not verdict.removable and path.is_dir():
+            kept.add(path)
+        resolved[path] = verdict
+    return [resolved[v.worktree.path.resolve()] for v in verdicts]
+
+
 def disk_usage(path: Path) -> int:
     """Bytes on disk under ``path``, not following symlinks (so ``.venv`` links aren't double counted)."""
     total = 0
@@ -248,7 +268,10 @@ def prune(  # noqa: PLR0913  keyword-only seams for tests and the CLI
         out("warning: could not list open pull requests; keeping every worktree on a branch\n")
 
     total = 0
-    for verdict in (classify(w, main=main, cwd=here, base=base, open_prs=prs) for w in worktrees):
+    # Judge every worktree before removing any: a removal can delete directories nested inside it.
+    verdicts = _keep_parents_of_kept([classify(w, main=main, cwd=here, base=base, open_prs=prs) for w in worktrees])
+    # Remove nested worktrees before the ones that contain them.
+    for verdict in sorted(verdicts, key=lambda v: len(v.worktree.path.resolve().parts), reverse=True):
         worktree = verdict.worktree
         if not verdict.removable:
             out(f"keep    {worktree.path}  ({_label(worktree)}): {verdict.reason}\n")
