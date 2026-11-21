@@ -80,7 +80,8 @@ class JobSpec:
     matrix_keys: tuple[str, ...] = ()  # keys under strategy.matrix, minus include/exclude
     needs_refs: frozenset[str] = frozenset()  # jobs whose outputs this job reads via `needs.<id>`
     matrix_values: tuple[tuple[str, tuple[str, ...]], ...] = ()  # literal values per matrix key, include entries added
-    matrix_definition: str = ""  # canonical JSON of the whole strategy.matrix (include/exclude too), or its expression
+    matrix_definition: str = ""  # the whole strategy.matrix (include/exclude too) in YAML flow form, or its expression
+    if_: str | None = None  # the job-level `if:`, as text
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ def parse_workflow(text: str) -> Workflow:
             needs_refs=_needs_refs(body, needs),
             matrix_values=_matrix_values(body),
             matrix_definition=_matrix_definition(body),
+            if_=_scalar(body.get("if")),
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
@@ -154,6 +156,18 @@ def _text(value: object) -> str | None:
     GitHub requires these fields to be strings, and stringifying a YAML container would expand every alias.
     """
     return value if isinstance(value, str) and value else None
+
+
+def _scalar(value: object) -> str | None:
+    """A YAML scalar as text (`false` and "false" differ from no value), or None for a container or nothing.
+
+    Booleans are lower-cased the way a workflow author writes them, so `if: false` never reads as "no condition".
+    """
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, str | int | float):
+        return str(value)
+    return None
 
 
 def _with_value(value: object) -> str:
@@ -176,11 +190,11 @@ def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
         StepSpec(
             name=_step_name(item),
             uses=_text(item.get("uses")),
-            run=item["run"] if isinstance(item.get("run"), str) else None,
+            run=_scalar(item.get("run")),
             with_={
                 str(k): _with_value(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()
             },
-            if_=item["if"] if isinstance(item.get("if"), str) else None,
+            if_=_scalar(item.get("if")),
         )
         for item in raw
         if isinstance(item, dict)

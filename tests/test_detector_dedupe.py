@@ -306,6 +306,31 @@ def test_matrix_shared_scalar_is_bounded_by_expanded_size() -> None:
     assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
 
 
+def _findings(text: str) -> int:
+    p, wf = profiled(text, {"a": 100, "b": 200})
+    return len(detect_dedupe_jobs(p, wf, PATH))
+
+
+def test_dedupe_does_not_treat_if_false_as_no_condition() -> None:
+    gated = "- run: make integration\n        if: false"
+    assert _findings(_pair(step_a=gated, step_b="- run: make integration")) == 0
+    assert _findings(_pair(step_a=gated, step_b="- run: make integration\n        if: true")) == 0
+    assert _findings(_pair(step_a=gated, step_b=gated)) == 1
+
+
+def test_run_scalars_keep_their_value() -> None:
+    wf = parse_workflow(_pair(step_a="- run: true", step_b="- run: false"))
+    assert wf.jobs["a"].steps[0].run == "true"
+    assert wf.jobs["b"].steps[0].run == "false"
+    assert _findings(_pair(step_a="- run: true", step_b="- run: false")) == 0
+
+
+def test_job_level_if_is_kept_as_text() -> None:
+    wf = parse_workflow(_pair("    if: false\n", ""))
+    assert wf.jobs["a"].if_ == "false"
+    assert wf.jobs["b"].if_ is None
+
+
 def test_matrix_recursive_anchor_does_not_hang() -> None:
     start = time.perf_counter()
     wf = parse_workflow(_pair("    strategy:\n      matrix:\n        a: &r [*r]\n", ""))
