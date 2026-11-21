@@ -1,17 +1,28 @@
 import gzip
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+import yaml
+
+from pit_crew.lanes.analysis import workflow as workflow_module
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.detectors.dedupe import detect_dedupe_jobs
 from pit_crew.lanes.analysis.history import parse_runs
-from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
+from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, Workflow, _canonical, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PATH = ".github/workflows/ci.yml"
 T0 = datetime(2026, 11, 1, tzinfo=UTC)
+
+
+@pytest.fixture
+def inner_bounds_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the whole-document bound so a test reaches the per-field bounds behind it."""
+    monkeypatch.setattr(workflow_module, "_require_bounded_document", lambda _doc: None)
 
 
 def at(seconds: float) -> str:
@@ -58,12 +69,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: First name
-        run: pytest   -q
+        run: |
+          pytest -q
+          coverage report
   test-b:
     runs-on: ubuntu-latest
     steps:
       - name: Other name
-        run: pytest -q
+        run: |
+                pytest -q
+                coverage report
 """
     p, wf = profiled(text, {"test-a": 100, "test-b": 200})
     findings = detect_dedupe_jobs(p, wf, PATH)
@@ -81,6 +96,7 @@ jobs:
     assert float(f.evidence["max_saving_seconds"]) > 10
     assert f.expected_savings_seconds == f.evidence["max_saving_seconds"]
     assert "keep one" in f.description.lower()
+    assert "drop 'test-b' and keep test-a" in f.description
     assert "never remove the check" in f.description.lower()
 
 
@@ -194,7 +210,245 @@ def test_dedupe_ignores_dynamic_matrix_vs_no_matrix() -> None:
     assert detect_dedupe_jobs(p, wf, PATH) == []
 
 
-def test_dedupe_known_limitation_flags_different_dynamic_matrices_on_same_key() -> None:
+def test_dedupe_ignores_different_dynamic_matrices_on_same_key() -> None:
     other = DYNAMIC.replace("needs.x.outputs.v", "needs.y.outputs.w")
     p, wf = profiled(_pair(DYNAMIC, other), {"a": 100, "b": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_matrices_that_differ_only_in_exclude() -> None:
+    def matrix(excluded: str) -> str:
+        return (
+            "    strategy:\n      matrix:\n        py: ['3.11', '3.12']\n"
+            f"        exclude:\n          - py: '{excluded}'\n"
+        )
+
+    p, wf = profiled(_pair(matrix("3.12"), matrix("3.11")), {"a (3.11)": 100, "b (3.12)": 200})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_flags_identical_matrices_with_exclude() -> None:
+    matrix = "    strategy:\n      matrix:\n        py: ['3.11', '3.12']\n        exclude:\n          - py: '3.12'\n"
+    p, wf = profiled(_pair(matrix, matrix), {"a (3.11)": 100, "b (3.11)": 200})
     assert len(detect_dedupe_jobs(p, wf, PATH)) == 1
+
+
+TWINS = """
+jobs:
+  test-a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q
+  test-b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q
+"""
+
+
+def test_dedupe_drops_savings_under_ten_seconds() -> None:
+    p, wf = profiled(TWINS, {"test-a": 3.0, "test-b": 5.0})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_drops_zero_savings() -> None:
+    p, wf = profiled(TWINS, {"test-a": 30.0, "test-b": 30.0})
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_scripts_that_differ_in_internal_whitespace() -> None:
+    p, wf = profiled(
+        _pair(step_a="- run: grep -F 'a  b' f", step_b="- run: grep -F 'a b' f"),
+        {"a": 100, "b": 200},
+    )
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_dedupe_ignores_jobs_whose_step_conditions_differ() -> None:
+    def steps(first: str, second: str) -> str:
+        return f"- run: make lint\n        if: {first}\n      - run: make test\n        if: {second}"
+
+    p, wf = profiled(
+        _pair(
+            step_a=steps("github.event_name == 'push'", "always()"),
+            step_b=steps("always()", "github.event_name == 'push'"),
+        ),
+        {"a": 100, "b": 200},
+    )
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def _laughs(levels: int) -> str:
+    lines = ["    strategy:", "      matrix:", "        l0: &a0 [x, x, x, x, x, x, x, x, x]"]
+    lines += [f"        l{i}: &a{i} [{', '.join([f'*a{i - 1}'] * 9)}]" for i in range(1, levels)]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.usefixtures("inner_bounds_only")
+def test_matrix_billion_laughs_is_cheap_and_bounded() -> None:
+    start = time.perf_counter()
+    wf = parse_workflow(_pair(_laughs(9), ""))
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5
+    definition = wf.jobs["a"].matrix_definition
+    assert definition == MATRIX_TOO_LARGE or len(definition) < 64 * 1024
+
+
+def test_dedupe_skips_jobs_with_oversized_matrices() -> None:
+    big = "    strategy:\n      matrix:\n        v: [" + ", ".join(str(i) for i in range(20_000)) + "]\n"
+    p, wf = profiled(_pair(big, big), {"a": 100, "b": 200})
+    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
+    assert detect_dedupe_jobs(p, wf, PATH) == []
+
+
+def test_matrix_definition_ignores_key_order() -> None:
+    one = parse_workflow(_pair("    strategy:\n      matrix:\n        a: [1]\n        b: [2]\n", ""))
+    two = parse_workflow(_pair("    strategy:\n      matrix:\n        b: [2]\n        a: [1]\n", ""))
+    assert one.jobs["a"].matrix_definition == two.jobs["a"].matrix_definition != ""
+
+
+@pytest.mark.usefixtures("inner_bounds_only")
+def test_matrix_shared_scalar_is_bounded_by_expanded_size() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 2_000)
+    matrix = f'    strategy:\n      matrix:\n        x: &s "{big}"\n        y: [{refs}]\n'
+    start = time.perf_counter()
+    wf = parse_workflow(_pair(matrix, ""))
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["a"].matrix_definition == MATRIX_TOO_LARGE
+
+
+def _script_job(name: str, body: str, indent: int = 10) -> str:
+    pad = " " * indent
+    block = "".join(f"{pad}{line}\n" for line in body.splitlines())
+    return f"  {name}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n{block}"
+
+
+_REPORT_AFTER = "python - <<'EOF'\nfor t in tests:\n    run(t)\nreport()\nEOF"
+_REPORT_INSIDE = "python - <<'EOF'\nfor t in tests:\n    run(t)\n    report()\nEOF"
+
+
+def test_dedupe_ignores_scripts_that_differ_only_in_nested_indentation() -> None:
+    text = "jobs:\n" + _script_job("a", _REPORT_AFTER) + _script_job("b", _REPORT_INSIDE)
+    assert _findings(text) == 0
+
+
+def test_dedupe_flags_same_script_at_different_block_indents() -> None:
+    text = "jobs:\n" + _script_job("a", _REPORT_AFTER, 10) + _script_job("b", _REPORT_AFTER, 14)
+    assert _findings(text) == 1
+
+
+def _findings(text: str) -> int:
+    p, wf = profiled(text, {"a": 100, "b": 200})
+    return len(detect_dedupe_jobs(p, wf, PATH))
+
+
+@pytest.mark.parametrize(
+    ("extra_a", "extra_b"),
+    [
+        ("    env: {DB: postgres}\n", "    env: {DB: mysql}\n"),
+        ("    env: {DB: postgres}\n", ""),
+        ("    if: github.event_name == 'push'\n", "    if: github.event_name == 'pull_request'\n"),
+        ("    container: python:3.12\n", "    container: python:3.13\n"),
+        ("    services: {db: {image: postgres}}\n", "    services: {db: {image: mysql}}\n"),
+        ("    defaults: {run: {shell: bash}}\n", "    defaults: {run: {shell: sh}}\n"),
+        ("    timeout-minutes: 5\n", "    timeout-minutes: 50\n"),
+        ("    continue-on-error: true\n", ""),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_job_settings(extra_a: str, extra_b: str) -> None:
+    assert _findings(_pair(extra_a, extra_b)) == 0
+
+
+@pytest.mark.parametrize(
+    ("field_a", "field_b"),
+    [
+        ("env: {DB: postgres}", "env: {DB: mysql}"),
+        ("working-directory: frontend", "working-directory: backend"),
+        ("shell: bash", "shell: sh"),
+        ("timeout-minutes: 5", "timeout-minutes: 50"),
+        ("continue-on-error: true", "continue-on-error: false"),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_step_settings(field_a: str, field_b: str) -> None:
+    step = "- run: pytest\n        "
+    assert _findings(_pair(step_a=step + field_a, step_b=step + field_b)) == 0
+    assert _findings(_pair(step_a=step + field_a, step_b=step + field_a)) == 1
+
+
+def test_dedupe_skips_jobs_with_non_scalar_with_values() -> None:
+    step = "- uses: some/action@v1\n        with: {paths: [a]}"
+    assert _findings(_pair(step_a=step, step_b=step)) == 0
+
+
+def test_dedupe_skips_jobs_with_oversized_env() -> None:
+    big = "    env: {X: " + "A" * 70_000 + "}\n"
+    assert _findings(_pair(big, big)) == 0
+
+
+def test_dedupe_does_not_treat_if_false_as_no_condition() -> None:
+    gated = "- run: make integration\n        if: false"
+    assert _findings(_pair(step_a=gated, step_b="- run: make integration")) == 0
+    assert _findings(_pair(step_a=gated, step_b="- run: make integration\n        if: true")) == 0
+    assert _findings(_pair(step_a=gated, step_b=gated)) == 1
+
+
+def test_run_scalars_keep_their_value() -> None:
+    wf = parse_workflow(_pair(step_a="- run: true", step_b="- run: false"))
+    assert wf.jobs["a"].steps[0].run == "true"
+    assert wf.jobs["b"].steps[0].run == "false"
+    assert _findings(_pair(step_a="- run: true", step_b="- run: false")) == 0
+
+
+def test_job_level_if_is_kept_as_text() -> None:
+    wf = parse_workflow(_pair("    if: false\n", ""))
+    assert wf.jobs["a"].if_ == "false"
+    assert wf.jobs["b"].if_ is None
+
+
+def _runner_pair(runs_a: str, runs_b: str, extra_a: str = "", extra_b: str = "") -> str:
+    return (
+        f"jobs:\n  a:\n    runs-on: {runs_a}\n{extra_a}    steps: [{{run: pytest}}]\n"
+        f"  b:\n    runs-on: {runs_b}\n{extra_b}    steps: [{{run: pytest}}]\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("runs_a", "runs_b", "extra_a", "extra_b"),
+    [
+        ("[self-hosted, 1]", "[self-hosted, 2]", "", ""),
+        ("{group: gpu}", "{group: cpu}", "", ""),
+        ("ubuntu-latest", "ubuntu-latest", "    environment: prod\n", "    environment: staging\n"),
+        (
+            "ubuntu-latest",
+            "ubuntu-latest",
+            "    permissions: {contents: read}\n",
+            "    permissions: {contents: write}\n",
+        ),
+        ("ubuntu-latest", "ubuntu-latest", "    if: 2024-01-01\n", ""),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_runner_environment_permissions_or_if(
+    runs_a: str, runs_b: str, extra_a: str, extra_b: str
+) -> None:
+    assert _findings(_runner_pair(runs_a, runs_b, extra_a, extra_b)) == 0
+
+
+def test_dedupe_still_flags_identical_runner_environment_and_permissions() -> None:
+    extra = "    environment: prod\n    permissions: {contents: read}\n    if: 2024-01-01\n"
+    assert _findings(_runner_pair("[self-hosted, 1]", "[self-hosted, 1]", extra, extra)) == 1
+    assert _findings(_runner_pair("{group: gpu}", "{group: gpu}")) == 1
+
+
+def test_recursive_anchor_is_refused_without_hanging() -> None:
+    start = time.perf_counter()
+    with pytest.raises(ValueError, match="expands beyond"):
+        parse_workflow(_pair("    strategy:\n      matrix:\n        a: &r [*r]\n", ""))
+    assert time.perf_counter() - start < 0.5
+
+
+def test_matrix_recursive_anchor_does_not_hang() -> None:
+    cyclic = yaml.safe_load("a: &r [*r]")
+    start = time.perf_counter()
+    assert _canonical(cyclic) == MATRIX_TOO_LARGE
+    assert time.perf_counter() - start < 0.5

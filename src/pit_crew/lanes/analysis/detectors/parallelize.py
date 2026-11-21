@@ -3,12 +3,98 @@
 from dataclasses import replace
 
 from pit_crew.lanes.analysis.critical_path import CIProfile, critical_path
-from pit_crew.lanes.analysis.detectors.base import Finding
+from pit_crew.lanes.analysis.detectors.base import Finding, keep_worthwhile
 from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
 
 _UPLOAD = "actions/upload-artifact"
 _DOWNLOAD = "actions/download-artifact"
 _CONFIDENCE = 0.6
+_TRIVIAL_COMMANDS = frozenset({"echo", "exit", "true"})
+_SPACE = " \t"  # the only blanks bash recognises; \r, \f and \v are word characters
+
+
+def _opaque(c: str, nxt: str, quote: str) -> bool:
+    """True where the script can run something this scan cannot see: substitutions, heredocs, process substitution.
+
+    `$'` (ANSI-C quoting, where a backslash escapes a quote) is opaque too: it is treated as real work, not parsed.
+    Inside single quotes nothing expands, so a backtick or `$(` there is literal text; inside double quotes it runs.
+    """
+    if quote == "'":
+        return False
+    if c == "`" or (c == "$" and nxt == "("):
+        return True
+    if quote:
+        return False
+    return (c in "<>" and nxt == "(") or (c == "<" and nxt == "<") or (c == "$" and nxt == "'")
+
+
+def _is_separator(run: str, i: int, prev: str) -> bool:
+    r"""Whether an unquoted `;`, `|`, `&` or newline at i ends a command (an `&` in a redirect does not).
+
+    `prev` is the last token scanned: an escaped `\>` is a two-character token, so it never reads as a redirect.
+    """
+    if run[i] != "&":
+        return True
+    nxt = run[i + 1 : i + 2]
+    return not (prev in {">", "<"} or nxt == ">")  # `>&2`, `2>&1`, `&>file`
+
+
+def _segments(run: str) -> list[str] | None:
+    """The shell command segments of a script, or None when it cannot be told apart from real work.
+
+    One linear pass over the whole script (a quote may span lines). Segments end at `&&`, `||`, `;`, `|`, `&`
+    and a newline, but only outside quotes; a comment is skipped. Substitutions, heredocs and process
+    substitutions return None: they can run anything, and a heredoc body could hold a stray quote.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""  # the open quote character, or ""
+    i = 0
+    while i < len(run):
+        c, nxt = run[i], run[i + 1 : i + 2]
+        if _opaque(c, nxt, quote):
+            return None
+        step = 1
+        if c == "\\" and quote != "'":
+            current.append(run[i : i + 2])
+            step = 2
+        elif quote:
+            quote = "" if c == quote else quote
+            current.append(c)
+        elif c in "'\"":
+            quote = c
+            current.append(c)
+        elif c == "#" and (not current or current[-1] in _SPACE):
+            end = run.find("\n", i)
+            step = (len(run) if end == -1 else end) - i
+        elif c in "\n;|&" and _is_separator(run, i, current[-1] if current else ""):
+            segments.append("".join(current))
+            current = []
+            step = 2 if nxt == c and c in "|&" else 1  # `&&` and `||` are one separator
+        else:
+            current.append(c)
+        i += step
+    segments.append("".join(current))
+    return segments
+
+
+def _trivial_run(run: str) -> bool:
+    """True when every shell segment starts with a trivial command; substitutions and heredocs are never trivial."""
+    segments = _segments(run)
+    if segments is None:
+        return False
+    for segment in segments:
+        words = segment.split(maxsplit=1)
+        if words and words[0].lower() not in _TRIVIAL_COMMANDS:
+            return False
+    return True
+
+
+def _only_waits(job: JobSpec) -> bool:
+    """True for a job that does no work of its own (echo, exit, true or nothing): it exists to wait, as a gate."""
+    if job.uses is not None or not job.steps:  # a reusable-workflow call does real work; a step-less job is a stub
+        return False
+    return all(s.uses is None and (s.run is None or _trivial_run(s.run)) for s in job.steps)
 
 
 def _uses(job: JobSpec, action: str) -> bool:
@@ -16,10 +102,44 @@ def _uses(job: JobSpec, action: str) -> bool:
 
 
 def _removable(dep: JobSpec, job: JobSpec) -> bool:
-    """False when the job reads the dependency's outputs or downloads what it uploads."""
+    """False when the job reads the dependency's outputs, downloads what it uploads, or only waits on it."""
+    if _only_waits(job):
+        return False
     if dep.id in job.needs_refs:
         return False
     return not (_uses(dep, _UPLOAD) and _uses(job, _DOWNLOAD))
+
+
+def _ancestors(jobs: dict[str, JobSpec], start: str, cut: tuple[str, str]) -> set[str]:
+    """Every job `start` transitively needs, ignoring the one edge `cut` (job, dependency). Linear BFS."""
+    seen: set[str] = set()
+    queue = [start]
+    while queue:
+        current = queue.pop()
+        for need in jobs[current].needs:
+            if (current, need) != cut and need not in seen:
+                seen.add(need)
+                queue.append(need)
+    return seen
+
+
+def _loses_artifact_handoff(workflow: Workflow, dep_id: str, job_id: str) -> bool:
+    """True when cutting `job.needs: dep` strands a downloading job (job or a descendant) from an uploader."""
+    jobs = workflow.jobs
+    uploaders = {i for i, j in jobs.items() if _uses(j, _UPLOAD)}
+    if not uploaders:
+        return False
+    no_cut = ("", "")
+    for downloader_id, downloader in jobs.items():
+        if not _uses(downloader, _DOWNLOAD):
+            continue
+        before = _ancestors(jobs, downloader_id, no_cut)
+        if downloader_id != job_id and job_id not in before:
+            continue  # the cut sits upstream of neither this job nor anything it needs
+        after = _ancestors(jobs, downloader_id, (job_id, dep_id))
+        if (before - after) & uploaders:
+            return True
+    return False
 
 
 def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
@@ -33,6 +153,8 @@ def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path
         for dep_id in job.needs:
             dep = workflow.jobs.get(dep_id)
             if dep is None or dep_id not in on_path or not _removable(dep, job):
+                continue
+            if _loses_artifact_handoff(workflow, dep_id, job_id):
                 continue
             trimmed = replace(job, needs=tuple(n for n in job.needs if n != dep_id))
             after = critical_path(replace(workflow, jobs={**workflow.jobs, job_id: trimmed}), seconds).seconds
@@ -65,4 +187,4 @@ def detect_parallelize_dag(profile: CIProfile, workflow: Workflow, workflow_path
                     risk="medium",
                 )
             )
-    return findings
+    return keep_worthwhile(findings)

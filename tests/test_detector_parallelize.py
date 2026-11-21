@@ -6,8 +6,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from pit_crew.lanes.analysis.critical_path import CIProfile, CriticalPath, profile
-from pit_crew.lanes.analysis.detectors.parallelize import detect_parallelize_dag
+from pit_crew.lanes.analysis.detectors.parallelize import _trivial_run, detect_parallelize_dag
 from pit_crew.lanes.analysis.history import parse_runs
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow
 
@@ -148,7 +150,7 @@ jobs:
 """
     p, wf = profiled(chain, {"a": (0, 100), "b": (100, 110), "c": (110, 120)})
     by_job = {f.job: f for f in detect_parallelize_dag(p, wf, PATH)}
-    # Cutting `b.needs: a` lets b start at 0, so c finishes at 20 instead of 120: 20s from a 10s job.
+    # Cutting `b.needs: a` lets b start at 0, so the critical path drops from 120 to 100: 20s from a 10s job.
     # The ceiling is the critical-path drop, not b's own max_saving (10s).
     assert by_job["b"].expected_savings_seconds == 20.0
     assert by_job["b"].evidence["max_saving_seconds"] == 20.0
@@ -164,3 +166,260 @@ def test_parallelize_fastapi() -> None:
     # Critical path is changes -> test -> coverage-combine -> test-alls-green. test reads changes' outputs,
     # coverage-combine downloads the artifacts test uploads, and test-alls-green is the toJSON(needs) gate.
     assert detect_parallelize_dag(profile(wf, runs), wf, "test.yml") == []
+
+
+def gated(job_body: str, steps: str) -> str:
+    return two_jobs(f"{job_body}\n{steps}" if job_body else steps)
+
+
+GATE_FORMS = {
+    "vite test-passed": ("    if: (!cancelled() && !failure())", '    steps:\n      - run: echo "Build & Test Passed"'),
+    "bare failure": ("    if: '!failure()'", "    steps:\n      - run: pytest"),
+    "always with needs.*": (
+        "    if: \"always() && contains(needs.*.result, 'failure')\"",
+        "    steps:\n      - run: pytest",
+    ),
+    "toJson lowercase": ("", "    steps:\n      - run: echo '${{ toJson(needs) }}'"),
+    "toJSON with spaces": ("", "    steps:\n      - run: echo '${{ toJSON( needs ) }}'"),
+    "needs index": ("", "    steps:\n      - run: echo \"${{ needs['lint'].result }}\""),
+    "uppercase ref": ("", "    steps:\n      - run: echo '${{ NEEDS.Lint.outputs.x }}'"),
+    "status function spacing": ("    if: SUCCESS ()", "    steps:\n      - run: pytest"),
+}
+
+
+@pytest.mark.parametrize("form", GATE_FORMS)
+def test_parallelize_keeps_every_gate_form(form: str) -> None:
+    job_if, steps = GATE_FORMS[form]
+    p, wf = profiled(gated(job_if, steps), SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        "    steps:\n      - run: echo done",
+        "    steps:\n      - run: 'true'",
+        "    steps:\n      - run: exit 0",
+        "    steps:\n      - run: true",
+        "    steps:\n      - run: Echo ok",
+        "    steps:\n      - run: |\n          # wait\n          echo a\n\n          echo b",
+        "    steps:\n      - name: nothing to run",
+    ],
+)
+def test_parallelize_keeps_edges_into_wait_only_jobs(steps: str) -> None:
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_still_flags_jobs_that_do_work_beyond_echo() -> None:
+    p, wf = profiled(two_jobs("    steps:\n      - run: echo hi\n      - run: pytest"), SPANS)
+    assert [f.job for f in detect_parallelize_dag(p, wf, PATH)] == ["test"]
+
+
+VITE_GATE = """
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm test
+  test-passed:
+    if: (!cancelled() && !failure())
+    needs: test
+    runs-on: ubuntu-slim
+    name: Build & Test Passed or Skipped
+    steps:
+      - run: echo "Build & Test Passed or Skipped"
+"""
+
+
+def test_parallelize_vite_test_passed_gate_has_no_finding() -> None:
+    p, wf = profiled(VITE_GATE, {"test": (0, 300), "Build & Test Passed or Skipped": (300, 305)})
+    assert wf.jobs["test-passed"].needs_refs == {"test"}
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_keeps_fastapi_bracket_needs_reference() -> None:
+    wf_yaml = """
+name: CI
+on: [push]
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - run: echo filter
+  test:
+    needs: [changes]
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+        if: needs['changes'].outputs.src == 'true'
+"""
+    p, wf = profiled(wf_yaml, {"changes": (0, 60), "test": (60, 360)})
+    assert wf.jobs["test"].needs_refs == {"changes"}
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+def test_parallelize_keeps_spaced_tojson_gate_need() -> None:
+    wf_yaml = """
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest
+  coverage-combine:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: coverage combine
+  gate:
+    needs: [coverage-combine]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '${{ toJSON( needs ) }}'
+"""
+    p, wf = profiled(wf_yaml, {"test": (0, 100), "coverage-combine": (100, 150), "gate": (150, 160)})
+    assert wf.jobs["gate"].needs_refs == {"coverage-combine"}
+    assert [f for f in detect_parallelize_dag(p, wf, PATH) if f.job == "gate"] == []
+
+
+TRANSITIVE = """
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+  lint:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: ruff check
+  test:
+    needs: {test_needs}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: pytest
+"""
+TRANSITIVE_SPANS = {"build": (0, 100), "lint": (100, 110), "test": (110, 135)}
+
+
+def test_parallelize_keeps_transitive_artifact_handoff() -> None:
+    p, wf = profiled(TRANSITIVE.format(test_needs="lint"), TRANSITIVE_SPANS)
+    assert detect_parallelize_dag(p, wf, PATH) == []  # cutting test<-lint or lint<-build strands test's artifact
+
+
+def test_parallelize_allows_cut_when_uploader_stays_an_ancestor() -> None:
+    p, wf = profiled(TRANSITIVE.format(test_needs="[lint, build]"), TRANSITIVE_SPANS)
+    by_edge = {(f.job, f.evidence["removed_need"]): f for f in detect_parallelize_dag(p, wf, PATH)}
+    assert ("test", "lint") in by_edge  # build is still a direct need of test
+    assert ("test", "build") not in by_edge  # the direct upload/download edge stays
+    assert by_edge["test", "lint"].expected_savings_seconds == 10.0
+
+
+def test_parallelize_logging_prefix_does_not_hide_real_work() -> None:
+    steps = "    steps:\n      - run: echo Starting tests && npm test"
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert [(f.job, f.expected_savings_seconds) for f in detect_parallelize_dag(p, wf, PATH)] == [("test", 60.0)]
+
+
+@pytest.mark.parametrize(
+    ("script", "trivial"),
+    [
+        ("echo a; echo b", True),
+        ("echo a && true", True),
+        ("echo a | true", True),
+        ("echo a; npm test", False),
+        ("true || npm test", False),
+        ("echo a | npm test", False),
+        ("echo $(make build)", False),
+        ("echo `make build`", False),
+        ("echo done;", True),
+        ('echo "All checks passed; merge allowed"', True),
+        ("echo 'tests && lint ok'", True),
+        ('echo "::notice::All jobs passed; ready"', True),
+        ("echo ok >&2", True),
+        ("echo ok 2>&1", True),
+        ("echo ok &> /dev/null", True),
+        ('echo "a\necho done" ; curl x', False),  # a quote spanning lines must not hide the command after it
+        ("echo a # don't\ncurl x", False),  # an apostrophe in a comment opens no quote
+        ("echo ok & curl x", False),
+        ("cat <<EOF\nit's\nEOF\ncurl x", False),
+        ("echo <(curl x)", False),
+        ("echo Starting tests && npm test", False),
+        ("echo $VAR", True),
+        ("echo ok # ; npm test", True),
+        ('echo "a" ; npm test', False),
+        ("echo \\>& curl x", False),  # an escaped `>` is a literal: the `&` after it ends the command
+        ("echo \\<& curl x", False),
+        ("echo a\r# ; curl x", False),  # bash treats only space and tab as blanks, so this `#` is no comment
+        ("echo a\f# ; curl x", False),
+        ("echo a\v# ; curl x", False),
+        ("echo a\t# ; curl x", True),
+        ("echo $'\\'' ; curl x ; echo 'z'", False),  # ANSI-C quoting: a backslash escapes the quote
+        ("echo $'a' ; curl x", False),
+        ("echo 'All checks passed: `ok`'", True),  # single quotes: nothing expands
+        ("echo 'status $(not run)'", True),
+        ('echo "result: $(make build)"', False),  # double quotes still expand
+        ('echo "x `make build`"', False),
+    ],
+)
+def test_trivial_run_checks_every_segment(script: str, *, trivial: bool) -> None:
+    assert _trivial_run(script) is trivial
+
+
+def test_parallelize_keeps_gate_that_echoes_a_semicolon_message() -> None:
+    steps = '    steps:\n      - run: echo "All checks passed; merge allowed"'
+    wf_yaml = f"""
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  gate:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+{steps}
+"""
+    p, wf = profiled(wf_yaml, {"a": (0, 50), "b": (0, 100), "gate": (100, 125)})
+    assert detect_parallelize_dag(p, wf, PATH) == []
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "echo \\>& curl x",
+        "echo a\r# ; curl x",
+        "echo a\f# ; curl x",
+        "echo a\v# ; curl x",
+        "echo $'\\'' ; curl x ; echo 'z'",
+    ],
+)
+def test_parallelize_does_not_treat_tokenizer_edge_cases_as_wait_only(script: str) -> None:
+    steps = f"    steps:\n      - run: {json.dumps(script)}"
+    p, wf = profiled(two_jobs(steps), SPANS)
+    assert [f.job for f in detect_parallelize_dag(p, wf, PATH)] == ["test"]
+
+
+def test_parallelize_keeps_gate_that_echoes_single_quoted_backticks() -> None:
+    steps = "    steps:\n      - run: |\n          echo 'All checks passed: `ok`'"
+    wf_yaml = f"""
+jobs:
+  a:
+    runs-on: ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  gate:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+{steps}
+"""
+    p, wf = profiled(wf_yaml, {"a": (0, 50), "b": (0, 100), "gate": (100, 125)})
+    assert detect_parallelize_dag(p, wf, PATH) == []

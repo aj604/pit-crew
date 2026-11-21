@@ -3,18 +3,73 @@
 from collections import defaultdict
 
 from pit_crew.lanes.analysis.critical_path import CIProfile
-from pit_crew.lanes.analysis.detectors.base import Finding, job_profile
-from pit_crew.lanes.analysis.workflow import JobSpec, Workflow
+from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile
+from pit_crew.lanes.analysis.workflow import MATRIX_TOO_LARGE, NON_SCALAR, JobSpec, StepSpec, Workflow
 
-StepSig = tuple[str, str, tuple[tuple[str, str], ...]]
-Signature = tuple[str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...]]
+StepSig = tuple[str, str, tuple[tuple[str, str], ...], str, str, str, str, str, str]  # uses, run, with, if, extras
+Signature = tuple[
+    str, tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...], tuple[StepSig, ...], str, str, tuple[str, ...]
+]
+
+
+def _script(run: str | None) -> str:
+    """The script exactly as written, minus whitespace around the whole text.
+
+    YAML already removes block-scalar indentation. Stripping each line would merge scripts whose indentation
+    matters (heredocs, Python) and could turn a trailing backslash-space into a line continuation.
+    """
+    return (run or "").strip()
+
+
+def _step_signature(s: StepSpec) -> StepSig:
+    return (
+        s.uses or "",
+        _script(s.run),
+        tuple(sorted(s.with_.items())),
+        s.if_ or "",
+        s.env,
+        s.working_directory,
+        s.shell,
+        s.timeout_minutes,
+        s.continue_on_error,
+    )
+
+
+def _job_extras(job: JobSpec) -> tuple[str, ...]:
+    return (
+        job.env,
+        job.container,
+        job.services,
+        job.defaults,
+        job.timeout_minutes,
+        job.continue_on_error,
+        job.environment,
+        job.permissions,
+        job.if_definition,
+    )
+
+
+def _unknown(job: JobSpec) -> bool:
+    """True when any compared field was too large to canonicalise (or a `with:` value was not a scalar)."""
+    fields = [job.matrix_definition, job.runs_on_definition, *_job_extras(job)]
+    for s in job.steps:
+        fields += [s.env, s.working_directory, s.shell, s.timeout_minutes, s.continue_on_error, *s.with_.values()]
+    return MATRIX_TOO_LARGE in fields or NON_SCALAR in fields
 
 
 def _signature(job: JobSpec) -> Signature:
-    """What a job does and where: runner, matrix values, and each step's command and inputs. Step names are ignored."""
-    steps = tuple((s.uses or "", " ".join((s.run or "").split()), tuple(sorted(s.with_.items()))) for s in job.steps)
+    """What a job does and where: runner, matrix, `if:`, job settings and each step's command, inputs and settings."""
+    steps = tuple(_step_signature(s) for s in job.steps)
     matrix = tuple(sorted((key, tuple(sorted(values))) for key, values in job.matrix_values))
-    return (job.runs_on, job.matrix_keys, matrix, steps)
+    return (
+        job.runs_on_definition,
+        job.matrix_keys,
+        matrix,
+        steps,
+        job.matrix_definition,
+        job.if_ or "",
+        _job_extras(job),
+    )
 
 
 def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: str) -> list[Finding]:
@@ -23,7 +78,7 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
     savings: dict[str, float] = {}
     for job_id, job in workflow.jobs.items():
         measured = job_profile(profile, job_id)
-        if job.steps and measured is not None:
+        if job.steps and measured is not None and not _unknown(job):  # unknown coverage
             groups[_signature(job)].append(job_id)
             savings[job_id] = measured.max_saving_seconds
 
@@ -44,7 +99,8 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
                 description=(
                     f"Job '{target}' runs the same steps on the same runner as {others}. "
                     f"They were found identical in runner, matrix and every step's command and inputs. "
-                    f"Confirm they are equivalent, then keep one of these jobs and drop the redundant copy; "
+                    f"Confirm they are equivalent, then keep one copy: drop '{target}' and keep {others}, "
+                    f"since the saving assumes '{target}' is the one removed; "
                     f"never remove the check itself, since the job that stays still runs it."
                 ),
                 expected_savings_seconds=saving,
@@ -53,4 +109,4 @@ def detect_dedupe_jobs(profile: CIProfile, workflow: Workflow, workflow_path: st
                 risk="medium",
             )
         )
-    return findings
+    return keep_worthwhile(findings)

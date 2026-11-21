@@ -1,10 +1,13 @@
 import base64
 import gzip
+import io
 import json
 import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from email.message import Message
+from http.client import HTTPMessage
 from pathlib import Path
 from typing import Any
 
@@ -369,6 +372,19 @@ def test_http_getter_only_sends_the_token_to_the_github_api() -> None:
         get("https://evil.example/repos/o/r")
 
 
+def test_redirect_handler_refuses_a_foreign_host_and_follows_the_api() -> None:
+    handler = history._NoForeignRedirect()  # noqa: SLF001
+    request = urllib.request.Request(  # noqa: S310  https-only
+        f"{history.API}/repos/o/r/actions/runs", headers={"Authorization": "Bearer t"}
+    )
+    headers = HTTPMessage()
+    with pytest.raises(ValueError, match="refusing to follow"):
+        handler.redirect_request(request, io.BytesIO(), 302, "Found", headers, "https://other.example/x")
+    followed = handler.redirect_request(request, io.BytesIO(), 302, "Found", headers, f"{history.API}/other")
+    assert followed is not None
+    assert followed.full_url == f"{history.API}/other"
+
+
 # Real history: FastAPI's test.yml, 12 pushes to master (Nov 2026).
 
 
@@ -442,6 +458,8 @@ def test_profile_ci_tool_reads_the_workspace_workflow(monkeypatch: pytest.Monkey
     monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path))
     raw = fastapi_raw()
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    blob = history.workflow_blob_sha((FIXTURES / "fastapi" / "test.yml").read_text())
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
 
     build_request("analysis", "")
     result = tools.call("profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml"})
@@ -491,6 +509,7 @@ def test_profile_ci_accepts_workflow_content_without_host_checkout(
     raw = fastapi_raw()
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
     monkeypatch.setattr(history, "fetch_workflow", lambda *_args, **_kwargs: pytest.fail("must not fetch"))
+    _match_every_run(monkeypatch, (FIXTURES / "fastapi" / "test.yml").read_text())
 
     build_request("analysis", "")
     result = tools.call(
@@ -517,6 +536,7 @@ def test_profile_ci_accepts_explicit_ref_without_host_checkout(monkeypatch: pyte
 
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    _match_every_run(monkeypatch, workflow_text)
 
     build_request("analysis", "")
     result = tools.call(
@@ -573,6 +593,7 @@ def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
 
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    _match_every_run(monkeypatch, yaml_text)
 
     build_request("analysis", "")
     result = tools.call(
@@ -581,6 +602,12 @@ def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
 
     assert fetched == [("fastapi/fastapi", "test.yml", "master")]
     assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]
+
+
+def _match_every_run(monkeypatch: pytest.MonkeyPatch, yaml_text: str) -> None:
+    """Make every run's remote workflow blob equal `yaml_text`, so revision matching keeps all runs."""
+    blob = history.workflow_blob_sha(yaml_text)
+    monkeypatch.setattr(history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob))
 
 
 def _http_error(code: int) -> urllib.error.HTTPError:
@@ -605,6 +632,7 @@ def test_profile_ci_resolves_deleted_branch_workflow_from_run_commit(
 
     monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
     monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+    _match_every_run(monkeypatch, yaml_text)
 
     build_request("analysis", "")
     result = tools.call(
@@ -666,7 +694,7 @@ def test_profile_ci_propagates_non_fallback_http_errors(
         "fetch_history",
         (lambda *_args, **_kwargs: [{"head_sha": "deadbeef"}])
         if second_code is not None
-        else (lambda *_args, **_kwargs: pytest.fail("must not fetch history")),
+        else (lambda *_args, **_kwargs: []),
     )
 
     build_request("analysis", "")

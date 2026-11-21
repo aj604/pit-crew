@@ -1,17 +1,26 @@
 import gzip
 import json
+import random
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from pit_crew.lanes.analysis import workflow as workflow_module
 from pit_crew.lanes.analysis.critical_path import profile
 from pit_crew.lanes.analysis.detectors.base import Finding, job_profile, keep_worthwhile, step_profile
 from pit_crew.lanes.analysis.history import parse_runs
-from pit_crew.lanes.analysis.workflow import match_step_name, parse_workflow
+from pit_crew.lanes.analysis.workflow import _tokenize, match_step_name, parse_workflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture
+def inner_bounds_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the whole-document bound so a test reaches the per-field bounds behind it."""
+    monkeypatch.setattr(workflow_module, "_require_bounded_document", lambda _doc: None)
 
 
 def make_finding(**overrides: Any) -> Finding:  # noqa: ANN401
@@ -270,3 +279,108 @@ jobs:
     assert wf.job_id_for("Test io_uring on Linux 7.3.5") == "uring"
     assert wf.job_id_for("Test io_uring on Linux 7.3.5 / build") == "uring"
     assert wf.job_id_for("zzz") is None  # a zero-literal expandable name is still never a wildcard
+
+
+@pytest.mark.parametrize("repeat", ["${{", "${{ x ", "${{ x }", "${{\n}}"])
+def test_adversarial_names_are_processed_in_linear_time(repeat: str) -> None:
+    name = repeat * (60_000 // len(repeat))
+    wf = parse_workflow(f"name: CI\njobs:\n  a:\n    name: {json.dumps(name)}\n    runs-on: x\n")
+    start = time.perf_counter()
+    assert not match_step_name(name, "a" * 100)
+    assert wf.job_id_for("zzz") is None
+    assert time.perf_counter() - start < 0.5
+
+
+def test_unclosed_expression_is_literal_text() -> None:
+    assert match_step_name("Run ${{ unclosed", "Run ${{ unclosed")
+    assert not match_step_name("Run ${{ unclosed", "Run anything")
+    assert match_step_name("a ${{ x }} ${{ b", "a z ${{ b")
+
+
+def test_expression_does_not_span_a_newline() -> None:
+    assert not match_step_name("a ${{ x\n}} b", "a z b")
+    assert match_step_name("a ${{ x\n}} b", "a ${{ x\n}} b")
+
+
+@pytest.mark.parametrize(
+    ("text", "expressions"),
+    [
+        ("${{" * 20_000 + "\n}}", 0),
+        (("${{" * 5_000 + "\n") * 4 + "}}", 0),
+        ("${{ a }}" * 8_000, 8_000),
+        ("${{ a }}\n" * 3_000 + "${{" * 5_000, 3_000),
+    ],
+)
+def test_tokenizer_newline_handling_is_linear(text: str, expressions: int) -> None:
+    start = time.perf_counter()
+    literals, found = _tokenize(text)
+    assert time.perf_counter() - start < 0.5
+    assert len(found) == expressions
+    assert len(literals) == expressions + 1
+    assert "".join(a + b for a, b in zip(literals, [*found, ""], strict=True)) == text
+
+
+def test_tokenizer_matches_the_regex_it_replaced() -> None:
+    expression = re.compile(r"\$\{\{.*?\}\}")
+    rng = random.Random(1)  # noqa: S311  seeded for a repeatable test, not for security
+    pieces = ["${{", "}}", "$", "{", "}", "\n", "a", " ", "${{{"]
+    for _ in range(5_000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        assert _tokenize(text) == (expression.split(text), expression.findall(text)), text
+
+
+@pytest.mark.usefixtures("inner_bounds_only")
+def test_job_body_with_shared_huge_scalar_reads_all_needs_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(f"k{i}: *s" for i in range(2_000))
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  a: {{runs-on: ubuntu-latest}}
+  b: {{runs-on: ubuntu-latest}}
+  c:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - run: echo hi
+        env: {{{refs}}}
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].needs_refs == frozenset({"a", "b"})
+
+
+@pytest.mark.usefixtures("inner_bounds_only")
+def test_step_run_list_of_shared_huge_scalar_is_ignored_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 5_000)
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - run: [{refs}]
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].steps[0].run is None
+    assert wf.jobs["c"].steps[0].name == "Run"
+
+
+@pytest.mark.usefixtures("inner_bounds_only")
+def test_step_with_container_value_becomes_placeholder_quickly() -> None:
+    big = "A" * 100_000
+    refs = ", ".join(["*s"] * 5_000)
+    start = time.perf_counter()
+    wf = parse_workflow(f"""
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    env: {{X: &s "{big}"}}
+    steps:
+      - uses: actions/checkout@v4
+        with: {{path: [{refs}], depth: 1}}
+""")
+    assert time.perf_counter() - start < 0.5
+    assert wf.jobs["c"].steps[0].with_ == {"path": "<non-scalar>", "depth": "1"}

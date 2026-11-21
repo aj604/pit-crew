@@ -2489,6 +2489,10 @@ def test_default_runner_profiles_ci_and_records_hypothesis_without_host_checkout
     ]
     monkeypatch.setattr(analysis_history, "fetch_history", lambda *_a, **_kw: sample_runs)
     monkeypatch.setattr(analysis_history, "fetch_workflow", lambda *_a, **_kw: workflow_yaml)
+    blob = analysis_history.workflow_blob_sha(workflow_yaml)  # every run used this exact file
+    monkeypatch.setattr(
+        analysis_history, "fetch_workflow_blob_shas", lambda _r, _p, refs, **_k: dict.fromkeys(refs, blob)
+    )
 
     class _FakeInteractions:
         def __init__(self) -> None:

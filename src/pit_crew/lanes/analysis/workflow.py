@@ -7,15 +7,64 @@ to job ids ("test"). Analysis needs both sides joined to build the dependency gr
 import itertools
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 
 import yaml
 
-_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
 _MATRIX_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 _MAX_EXPANSIONS = 1000
-_NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)")
+_MAX_DOCUMENT_BYTES = 8_000_000  # the whole document with every alias expanded; beyond it the workflow is refused
+_MAX_DOCUMENT_NODES = 500_000  # node visits; a cyclic alias would otherwise walk until the byte limit
+_MAX_RUNS_ON_ITEMS = 64
+_MAX_RUNS_ON_CHARS = 4096
+_MAX_STEP_NAME_CHARS = 1024
+_MAX_NEEDS_NAMES = 10
+_MAX_NEEDS_NAME_CHARS = 100
+# GitHub expressions are case-insensitive and allow spaces around the dot. Group 1 is the named job, if any;
+# every other use of the word (`needs[...]`, `needs.*`, `format('{0}', needs)`, bare `needs`) is the whole context.
+_NEEDS_USE = re.compile(r"\bneeds\b(?:\s*\.\s*([A-Za-z0-9_-]+))?", re.IGNORECASE)
+_STATUS_FUNCTION = re.compile(r"\b(success|failure|always|cancelled)\s*\(", re.IGNORECASE)
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
+def _tokenize(text: str) -> tuple[list[str], list[str]]:
+    """Split text into its literal pieces and its `${{ ... }}` expressions: len(literals) == len(expressions) + 1.
+
+    Linear in the text (names are repo-controlled, so a regex with `.*?` would be quadratic). An expression
+    does not span a newline, and an unclosed `${{` is literal text.
+    """
+    literals: list[str] = []
+    expressions: list[str] = []
+    start = 0  # where the current literal piece began
+    pos = text.find("${{")
+    newline = -1  # next "\n" at or after pos (len(text) when there is none)
+    close = -1  # first "}}" at or after the last position searched from; reused while still ahead of pos
+    while pos != -1:
+        if close < pos + 3:
+            close = text.find("}}", pos + 3)
+            if close == -1:
+                break  # nothing closes any later `${{` either
+        if newline < pos:  # the next newline at or after pos, found once and reused while still ahead
+            newline = text.find("\n", pos)
+            newline = len(text) if newline == -1 else newline
+        if newline > close:
+            literals.append(text[start:pos])
+            expressions.append(text[pos : close + 2])
+            start = close + 2
+            pos = text.find("${{", start)
+        else:  # no opener before the newline can reach a closer without crossing it
+            pos = text.find("${{", newline + 1)
+    literals.append(text[start:])
+    return literals, expressions
+
+
+def _has_expression(text: str) -> bool:
+    return bool(_tokenize(text)[1])
 
 
 @dataclass(frozen=True)
@@ -27,6 +76,12 @@ class StepSpec:
     run: str | None
     with_: dict[str, str]
     if_: str | None
+    # Bounded canonical forms ("" if absent, MATRIX_TOO_LARGE if oversized) of fields that change what a step does.
+    env: str = ""
+    working_directory: str = ""
+    shell: str = ""
+    timeout_minutes: str = ""
+    continue_on_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +98,19 @@ class JobSpec:
     matrix_keys: tuple[str, ...] = ()  # keys under strategy.matrix, minus include/exclude
     needs_refs: frozenset[str] = frozenset()  # jobs whose outputs this job reads via `needs.<id>`
     matrix_values: tuple[tuple[str, tuple[str, ...]], ...] = ()  # literal values per matrix key, include entries added
+    matrix_definition: str = ""  # the whole strategy.matrix (include/exclude too) in YAML flow form, or its expression
+    if_: str | None = None  # the job-level `if:`, as text
+    # Bounded canonical forms ("" if absent, MATRIX_TOO_LARGE if oversized) of fields that change what a job does.
+    env: str = ""
+    container: str = ""
+    services: str = ""
+    defaults: str = ""
+    timeout_minutes: str = ""
+    continue_on_error: str = ""
+    runs_on_definition: str = ""  # the whole `runs-on` (list, dict form, expression), unlike the display string runs_on
+    environment: str = ""
+    permissions: str = ""
+    if_definition: str = ""  # the raw `if:` when it is not a plain scalar (a date, say), else ""
 
 
 @dataclass(frozen=True)
@@ -57,7 +125,7 @@ class Workflow:
         jobs = list(self.jobs.values())
         wanted = _normalize(display_name)
         for job in jobs:  # a literal name, or the raw one GitHub shows for a skipped matrix job
-            if display_name == job.name or (_EXPRESSION.search(job.name) is None and wanted == _normalize(job.name)):
+            if display_name == job.name or (not _has_expression(job.name) and wanted == _normalize(job.name)):
                 return job.id
         expanded = {job.id: _expand_name(job) for job in jobs}
         for job in jobs:  # `${{ matrix.key }}` names with known values are literal names in disguise
@@ -78,9 +146,17 @@ class Workflow:
         return None
 
 
+def _require_bounded_document(doc: object) -> None:
+    """Refuse a document whose aliases expand it past the analysis limit (or that is cyclic): not analysing is safe."""
+    if not _expanded_size_within(doc, _MAX_DOCUMENT_BYTES, _MAX_DOCUMENT_NODES):
+        msg = "workflow expands beyond the analysis limit (aliases multiply its size), so it will not be analysed"
+        raise ValueError(msg)
+
+
 def parse_workflow(text: str) -> Workflow:
-    """Parse workflow YAML. Raises ValueError when a job needs a job that does not exist."""
+    """Parse workflow YAML. Raises ValueError when a job needs a job that does not exist or the YAML expands too far."""
     doc = yaml.safe_load(text) or {}
+    _require_bounded_document(doc)
     jobs = {}
     for job_id, raw_body in (doc.get("jobs") or {}).items():
         body = raw_body or {}
@@ -88,31 +164,72 @@ def parse_workflow(text: str) -> Workflow:
         needs = (raw_needs,) if isinstance(raw_needs, str) else tuple(raw_needs)
         jobs[job_id] = JobSpec(
             id=job_id,
-            name=str(body.get("name") or job_id),
+            name=_text(body.get("name")) or str(job_id),
             needs=needs,
             has_matrix=bool((body.get("strategy") or {}).get("matrix")),
-            uses=body.get("uses"),
+            uses=_text(body.get("uses")),
             steps=_parse_steps(body.get("steps")),
             runs_on=_runs_on(body.get("runs-on")),
             matrix_keys=_matrix_keys(body),
             needs_refs=_needs_refs(body, needs),
             matrix_values=_matrix_values(body),
+            matrix_definition=_matrix_definition(body),
+            if_=_scalar(body.get("if")),
+            env=_canonical(body.get("env")),
+            container=_canonical(body.get("container")),
+            services=_canonical(body.get("services")),
+            defaults=_canonical(body.get("defaults")),
+            timeout_minutes=_canonical(body.get("timeout-minutes")),
+            continue_on_error=_canonical(body.get("continue-on-error")),
+            runs_on_definition=_canonical(body.get("runs-on")),
+            environment=_canonical(body.get("environment")),
+            permissions=_canonical(body.get("permissions")),
+            if_definition=_canonical(body.get("if")) if _scalar(body.get("if")) is None else "",
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
         if unknown:
-            msg = f"job {job.id!r} needs unknown job(s) {unknown}"
+            shown = [_clip(str(n), _MAX_NEEDS_NAME_CHARS) for n in unknown[:_MAX_NEEDS_NAMES]]
+            more = f" and {len(unknown) - len(shown)} more" if len(unknown) > len(shown) else ""
+            msg = f"job {_clip(str(job.id), _MAX_NEEDS_NAME_CHARS)!r} needs unknown job(s) {shown}{more}"
             raise ValueError(msg)
-    return Workflow(name=str(doc.get("name") or ""), jobs=jobs)
+    return Workflow(name=_text(doc.get("name")) or "", jobs=jobs)
+
+
+NON_SCALAR = "<non-scalar>"  # stands in for a `with:` value that is a list or mapping
+
+
+def _text(value: object) -> str | None:
+    """The value when it is a non-empty string, else None.
+
+    GitHub requires these fields to be strings, and stringifying a YAML container would expand every alias.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def _scalar(value: object) -> str | None:
+    """A YAML scalar as text (`false` and "false" differ from no value), or None for a container or nothing.
+
+    Booleans are lower-cased the way a workflow author writes them, so `if: false` never reads as "no condition".
+    """
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, str | int | float):
+        return str(value)
+    return None
+
+
+def _with_value(value: object) -> str:
+    return str(value) if isinstance(value, str | int | float | bool) or value is None else NON_SCALAR
 
 
 def _step_name(item: dict[str, Any]) -> str:
-    if item.get("name"):
-        return str(item["name"])
-    if item.get("uses"):
-        return f"Run {item['uses']}"
-    lines = str(item.get("run") or "").strip().splitlines()
-    return f"Run {lines[0].strip()}" if lines else "Run"
+    if name := _text(item.get("name")):
+        return _clip(name, _MAX_STEP_NAME_CHARS)
+    if uses := _text(item.get("uses")):
+        return _clip(f"Run {_clip(uses, _MAX_STEP_NAME_CHARS)}", _MAX_STEP_NAME_CHARS)
+    lines = (_text(item.get("run")) or "").strip().splitlines()
+    return _clip(f"Run {lines[0].strip()}", _MAX_STEP_NAME_CHARS) if lines else "Run"
 
 
 def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
@@ -121,10 +238,17 @@ def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
     return tuple(
         StepSpec(
             name=_step_name(item),
-            uses=str(item["uses"]) if item.get("uses") else None,
-            run=str(item["run"]) if item.get("run") is not None else None,
-            with_={str(k): str(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()},
-            if_=str(item["if"]) if item.get("if") is not None else None,
+            uses=_text(item.get("uses")),
+            run=_scalar(item.get("run")),
+            with_={
+                str(k): _with_value(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()
+            },
+            if_=_scalar(item.get("if")),
+            env=_canonical(item.get("env")),
+            working_directory=_canonical(item.get("working-directory")),
+            shell=_canonical(item.get("shell")),
+            timeout_minutes=_canonical(item.get("timeout-minutes")),
+            continue_on_error=_canonical(item.get("continue-on-error")),
         )
         for item in raw
         if isinstance(item, dict)
@@ -135,7 +259,8 @@ def _runs_on(raw: object) -> str:
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):
-        return ", ".join(str(r) for r in raw)
+        names = (r for r in raw if isinstance(r, str))
+        return _clip(", ".join(itertools.islice(names, _MAX_RUNS_ON_ITEMS)), _MAX_RUNS_ON_CHARS)
     return ""
 
 
@@ -165,6 +290,76 @@ def _matrix_values(body: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], .
     return tuple((k, tuple(dict.fromkeys(v))) for k, v in values.items())
 
 
+MATRIX_TOO_LARGE = "<matrix too large>"  # sentinel: coverage unknown, so dedupe never treats such a job as a copy
+_MAX_MATRIX_BYTES = 64 * 1024
+_MAX_BODY_BYTES = 1_000_000
+_ENTRY_COST = 2  # rough serialized overhead per container entry and per key
+
+
+_SCALAR_TYPES = (str, int, float, bool, type(None), date, datetime, bytes)
+_CONTAINERS = (list, tuple, set, frozenset)  # built once: a union made inside the walk's loop slowed it under coverage
+
+
+def _expanded_size_within(obj: object, limit: int, max_visits: int | None = None) -> bool:
+    """Whether `obj`, with every shared reference expanded, serializes to at most about `limit` characters.
+
+    YAML aliases to scalars are written out in full on every use, so counting distinct nodes is not enough.
+    Shared nodes are visited each time they are referenced; the visit count is capped too (at `max_visits`,
+    default `limit`), which bounds cycles.
+    """
+    total = 0
+    visits = 0
+    max_visits = limit if max_visits is None else max_visits
+    stack = [obj]
+    while stack:
+        node = stack.pop()
+        visits += 1
+        if visits > max_visits:
+            return False
+        if isinstance(node, dict):
+            total += _ENTRY_COST * len(node)
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, _CONTAINERS):  # !!pairs, !!omap and !!set load as these
+            total += _ENTRY_COST * len(node)
+            stack.extend(node)
+        elif isinstance(node, _SCALAR_TYPES):
+            total += len(str(node))
+        else:
+            return False  # an unknown type: str() on it could expand every alias inside it
+        if total > limit:
+            return False
+    return True
+
+
+def _canonical(value: object) -> str:
+    """A value as a canonical string for comparison: "" when absent, a string as written, else YAML flow form.
+
+    Workflow YAML is hostile input: `safe_dump` emits anchors for shared nodes instead of expanding them,
+    and an oversized or unserializable value becomes the MATRIX_TOO_LARGE sentinel rather than being walked.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_MATRIX_BYTES else MATRIX_TOO_LARGE
+    if not _expanded_size_within(value, _MAX_MATRIX_BYTES):
+        return MATRIX_TOO_LARGE
+    try:
+        text = yaml.safe_dump(value, sort_keys=True, default_flow_style=True, width=2**31)
+    except (yaml.YAMLError, TypeError, ValueError, RecursionError):
+        return MATRIX_TOO_LARGE
+    return text if len(text) <= _MAX_MATRIX_BYTES else MATRIX_TOO_LARGE
+
+
+def _matrix_definition(body: dict[str, Any]) -> str:
+    """The full `strategy.matrix` as a canonical string, so exclusions and inclusions tell matrices apart."""
+    strategy = body.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if isinstance(matrix, str | dict):  # a string is an expression such as fromJSON(...): compared as written
+        return _canonical(matrix)
+    return ""
+
+
 def _is_literal(value: object) -> bool:
     return isinstance(value, str | int | float | bool) and "${{" not in str(value)
 
@@ -176,7 +371,7 @@ def _normalize(name: str) -> str:
 
 def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
     """Every concrete display name of a job named only by `${{ matrix.<key> }}` expressions, or None."""
-    expressions = _EXPRESSION.findall(job.name)
+    literals, expressions = _tokenize(job.name)
     keys = [m.group(1) if (m := _MATRIX_EXPRESSION.fullmatch(e)) else None for e in expressions]
     values = dict(job.matrix_values)
     if not expressions or any(k is None or k not in values for k in keys):
@@ -187,7 +382,6 @@ def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
         combos *= len(values[k])
     if combos > _MAX_EXPANSIONS:
         return None
-    literals = _EXPRESSION.split(job.name)
     names = []
     for combo in itertools.product(*(values[k] for k in used)):
         chosen = dict(zip(used, combo, strict=True))
@@ -199,14 +393,24 @@ def _expand_name(job: JobSpec) -> tuple[str, ...] | None:
 
 
 def _literal_length(name: str) -> int:
-    return len(_EXPRESSION.sub("", name))
+    return sum(len(piece) for piece in _tokenize(name)[0])
 
 
 def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
-    text = yaml.safe_dump(body)
-    if "toJSON(needs)" in text:
-        return frozenset(needs)
-    return frozenset(_NEEDS_REF.findall(text)) & frozenset(needs)
+    """The needs a job reads. A gate (status-function `if:`, `needs.*`, `toJSON(needs)`) reads all of them."""
+    if_ = body.get("if")
+    if isinstance(if_, str) and _STATUS_FUNCTION.search(if_):
+        return frozenset(needs)  # the job decides on its needs' results, so every edge carries a signal
+    if not _expanded_size_within(body, _MAX_BODY_BYTES):
+        return frozenset(needs)  # too large to scan: assume it reads every need, so no edge is ever cut
+    own = {k: v for k, v in body.items() if k != "needs"}  # the `needs:` key itself is not a read
+    text = yaml.safe_dump(own, width=2**31)  # no line wrapping, so a pattern is never split across lines
+    named: set[str] = set()
+    for match in _NEEDS_USE.finditer(text):
+        if match.group(1) is None:
+            return frozenset(needs)  # the whole context is read: assume every need, so no edge is ever cut
+        named.add(match.group(1).lower())
+    return frozenset(n for n in needs if n.lower() in named)
 
 
 def match_step_name(spec_name: str, measured_name: str) -> bool:
@@ -214,7 +418,7 @@ def match_step_name(spec_name: str, measured_name: str) -> bool:
     spec_name = SHA.sub("<sha>", spec_name)  # measured names are folded; a SHA-pinned `uses:` must be too
     if spec_name == measured_name:
         return True
-    return _wildcard_match(_EXPRESSION.split(spec_name), measured_name)
+    return _wildcard_match(_tokenize(spec_name)[0], measured_name)
 
 
 def _wildcard_match(parts: list[str], text: str) -> bool:
@@ -259,7 +463,7 @@ def topological_order(workflow: Workflow) -> list[str]:
 def _matches(job: JobSpec, display_name: str) -> bool:
     if display_name == job.name:
         return True
-    if not _EXPRESSION.search(job.name):
+    if not _has_expression(job.name):
         # GitHub appends the matrix values when the name does not use them
         return job.has_matrix and display_name.startswith(f"{job.name} (") and display_name.endswith(")")
-    return _wildcard_match(_EXPRESSION.split(job.name), display_name)
+    return _wildcard_match(_tokenize(job.name)[0], display_name)
