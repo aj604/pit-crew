@@ -58,7 +58,7 @@ class StaleMutantError(ValueError):
 def mutants(path: str, source: str, limit: int = 50) -> list[Mutant]:
     """Return one-operator mutants of a source file, spread evenly across it, at most `limit`."""
     suffix = PurePosixPath(path).suffix
-    if suffix not in _C_LIKE | _HASH:
+    if limit < 1 or suffix not in _C_LIKE | _HASH:
         return []
     hash_comments = suffix in _HASH
     code = _mask(source, hash_comments=hash_comments)
@@ -76,7 +76,7 @@ def mutants(path: str, source: str, limit: int = 50) -> list[Mutant]:
 def apply_mutant(source: str, mutant: Mutant) -> str:
     """Return `source` with the mutant's line replaced. Raises StaleMutantError if the line changed."""
     lines = source.split("\n")
-    if lines[mutant.line - 1] != mutant.before:
+    if not 1 <= mutant.line <= len(lines) or lines[mutant.line - 1] != mutant.before:
         raise StaleMutantError(mutant)
     lines[mutant.line - 1] = mutant.after
     return "\n".join(lines)

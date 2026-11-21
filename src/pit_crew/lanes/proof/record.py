@@ -23,11 +23,12 @@ import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TextIO
 
 WIDTH, HEIGHT = 120, 36
 # Gemini samples video at one frame a second; hold the last screen, where test runners
@@ -40,32 +41,29 @@ _SIGNAL_EXIT_BASE = 128  # a shell reports death by signal N as exit code 128 + 
 def record(argv: list[str], cast_path: str | Path, echo: BinaryIO | None = None) -> int:
     """Run argv in a pseudo-terminal, write an asciicast v2 recording, and return its exit code."""
     out = echo if echo is not None else sys.stdout.buffer
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", HEIGHT, WIDTH, 0, 0))
     env = {**os.environ, "TERM": "xterm-256color", "COLUMNS": str(WIDTH), "LINES": str(HEIGHT)}
-    start = time.monotonic()
-    proc = subprocess.Popen(  # noqa: S603  running the check it is given is this tool's job
-        argv, stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True
-    )
-    os.close(slave)
-
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    # Opened first, so a recording that can't be written fails before the check starts.
     with Path(cast_path).open("w") as cast:
         header = {"version": 2, "width": WIDTH, "height": HEIGHT, "timestamp": int(time.time())}
         cast.write(json.dumps({**header, "command": shlex.join(argv), "env": {"TERM": env["TERM"]}}) + "\n")
-        for data in _chunks(master):
-            out.write(data)
-            out.flush()
-            if text := decoder.decode(data):
-                cast.write(json.dumps([round(time.monotonic() - start, 6), "o", text]) + "\n")
-    os.close(master)
+        master, slave = pty.openpty()
+        try:
+            start = time.monotonic()
+            proc = _start(argv, slave, env)
+            try:
+                _copy(master, out, cast, start)
+            except BaseException:
+                proc.kill()  # the recording broke: stop the check rather than leave it running unseen
+                proc.wait()
+                raise
+        finally:
+            os.close(master)
     code = proc.wait()
     return _SIGNAL_EXIT_BASE - code if code < 0 else code
 
 
-def video_commands(cast_path: str, video_path: str) -> list[list[str]]:
-    """Return the commands that turn a recording into an MP4 Gemini can watch."""
-    gif = str(Path(video_path).with_suffix(".gif"))
+def video_commands(cast_path: str, video_path: str, gif: str) -> list[list[str]]:
+    """Return the commands that turn a recording into an MP4 Gemini can watch, by way of a GIF."""
     agg = ["agg", "--idle-time-limit", str(IDLE_SECONDS), "--last-frame-duration", str(LAST_FRAME_SECONDS)]
     # H.264 needs even dimensions and yuv420p to play everywhere, including in Gemini.
     ffmpeg = ["ffmpeg", "-y", "-loglevel", "error", "-i", gif, "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
@@ -74,8 +72,10 @@ def video_commands(cast_path: str, video_path: str) -> list[list[str]]:
 
 def render_video(cast_path: str, video_path: str) -> None:
     """Render a recording to MP4. Raises OSError or CalledProcessError if agg or ffmpeg fails."""
-    for command in video_commands(cast_path, video_path):
-        subprocess.run(command, check=True)  # noqa: S603  fixed commands built by video_commands
+    # The GIF is only a step on the way, so it goes somewhere it can't collide with the video.
+    with tempfile.TemporaryDirectory(prefix="pit-crew-") as tmp:
+        for command in video_commands(cast_path, video_path, str(Path(tmp) / "replay.gif")):
+            subprocess.run(command, check=True)  # noqa: S603  fixed commands built by video_commands
 
 
 def main(args: list[str] | None = None) -> int:
@@ -96,6 +96,31 @@ def main(args: list[str] | None = None) -> int:
         except (OSError, subprocess.CalledProcessError) as error:
             sys.stderr.write(f"pit-crew: no video, so this replay stays unverified: {error}\n")
     return code
+
+
+def _start(argv: list[str], slave: int, env: dict[str, str]) -> "subprocess.Popen[bytes]":
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", HEIGHT, WIDTH, 0, 0))
+        return subprocess.Popen(  # noqa: S603  running the check it is given is this tool's job
+            argv, stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True
+        )
+    finally:
+        os.close(slave)  # the check has its own copy; ours would hold the terminal open after it exits
+
+
+def _copy(master: int, out: BinaryIO, cast: TextIO, start: float) -> None:
+    """Stream the check's output to the job log and to the recording until it closes the terminal."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    for data in _chunks(master):
+        out.write(data)
+        out.flush()
+        _event(cast, start, decoder.decode(data))
+    _event(cast, start, decoder.decode(b"", final=True))  # a character cut off by the check exiting
+
+
+def _event(cast: TextIO, start: float, text: str) -> None:
+    if text:
+        cast.write(json.dumps([round(time.monotonic() - start, 6), "o", text]) + "\n")
 
 
 def _chunks(master: int) -> Iterator[bytes]:

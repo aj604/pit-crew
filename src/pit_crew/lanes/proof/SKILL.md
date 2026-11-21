@@ -29,7 +29,7 @@ Output: one replay plan.
      keep the whole mutated file. Do not commit or push; the host replays it for you.
    - Never write a bug that fails every check, such as a syntax error. It proves nothing
      about the check the candidate touched.
-   - Every replay is recorded on video, and Gemini 4 Neon checks that the candidate fails
+   - Every replay is recorded on video, and Gemini 4 Carbon checks that the candidate fails
      the same way the baseline does. Pick mutants that fail with a specific, readable
      message, like an assertion showing expected and actual values, not a crash or a hang.
 4. Call `plan_replays` with the required replays and your additions as `bug_shas`, and each
@@ -39,6 +39,6 @@ Output: one replay plan.
 If an uncovered check has no code you can mutate, say so in your final message and still
 plan the replays you have. The gap shows in the evidence instead of hiding.
 
-You choose what is replayed. Code runs and records the replays, has Gemini 4 Neon confirm
+You choose what is replayed. Code runs and records the replays, has Gemini 4 Carbon confirm
 each failure matches the baseline's, drops bugs the baseline does not catch, and decides
 the verdict. The proof card and recordings go on the PR.

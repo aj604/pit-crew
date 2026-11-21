@@ -10,9 +10,9 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
-from pathlib import PurePosixPath
 
 from pit_crew.contracts import BugCase, Candidate, ReplayPlan
+from pit_crew.lanes.proof.checks import Check
 from pit_crew.lanes.proof.miner import RedCommit
 from pit_crew.lanes.proof.mutants import mutants
 from pit_crew.ledger import Ledger
@@ -41,16 +41,17 @@ class InvalidReplayPlanError(ValueError):
         return cls(f"a mutation needs a relative path and the whole mutated file, got path {path!r}")
 
 
-def pick_replays(red: Iterable[RedCommit], touched: set[str] | None, limit: int = MAX_REPLAYS) -> list[str]:
+def pick_replays(red: Iterable[RedCommit], touched: Iterable[Check] | None, limit: int = MAX_REPLAYS) -> list[str]:
     """Return bugs the touched checks caught, taking turns between checks so each gets coverage.
 
     Within a check, bugs that were later fixed come first (a red-to-green fix is a real
     bug, not a broken branch), then the newest. touched=None means every check.
     """
+    keys = None if touched is None else {key for check in touched for key in check}
     queues: dict[str, list[str]] = defaultdict(list)
     for commit in sorted(red, key=lambda c: not c.fixed):  # stable: keeps newest first
         for check in commit.checks:
-            if touched is None or check in touched:
+            if keys is None or check in keys:
                 queues[check].append(commit.sha)
 
     picked: list[str] = []
@@ -64,10 +65,13 @@ def pick_replays(red: Iterable[RedCommit], touched: set[str] | None, limit: int 
     return picked
 
 
-def uncovered_checks(red: Iterable[RedCommit], touched: set[str]) -> set[str]:
-    """Return touched checks with no recorded bug. Each needs a mutant, or the change is unproven there."""
-    caught = {check for commit in red for check in commit.checks}
-    return touched - caught
+def uncovered_checks(red: Iterable[RedCommit], touched: Iterable[Check]) -> set[Check]:
+    """Return touched checks with no bug recorded under any of their keys.
+
+    Each needs a mutant, or the change is unproven there.
+    """
+    caught = {key for commit in red for key in commit.checks}
+    return {check for check in touched if check.isdisjoint(caught)}
 
 
 @tool(
@@ -77,7 +81,7 @@ def uncovered_checks(red: Iterable[RedCommit], touched: set[str]) -> set[str]:
         "properties": {
             "path": {"type": "string", "description": "Repository path of the source file"},
             "source": {"type": "string", "description": "The file's full contents"},
-            "limit": {"type": "integer", "description": "Most mutants to return (default 50)"},
+            "limit": {"type": "integer", "minimum": 1, "description": "Most mutants to return (default 50)"},
         },
         "required": ["path", "source"],
     },
@@ -146,8 +150,8 @@ def plan_replays(
 
 def _mutation_case(mutation: Mapping[str, str]) -> BugCase:
     path, content = mutation.get("path", ""), mutation.get("content", "")
-    parts = PurePosixPath(path).parts
-    if not path or path.startswith("/") or ".." in parts or not content:
+    # Every segment must name a file or folder: no "", ".", "..", or Windows separators.
+    if not content or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
         raise InvalidReplayPlanError.bad_mutation(path)
     return BugCase(
         kind="mutation", mutated_files={path: content}, reason=mutation.get("reason") or "synthetic mutation"

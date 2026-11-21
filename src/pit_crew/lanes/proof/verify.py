@@ -1,13 +1,13 @@
-"""Gemini 4 Neon watches each bug fail twice and says whether it is the same failure.
+"""Gemini 4 Carbon watches each bug fail twice and says whether it is the same failure.
 
 An exit code says a replay failed, not why. Replayed on the candidate, a bug can fail for
 an unrelated reason (a dependency that no longer installs, a runner that died, a test
 file the new selection skipped and then crashed on) and still look caught. So each
 replay is recorded as a terminal video (see record.py) on the baseline and on the
-candidate, and Neon watches both.
+candidate, and Carbon watches both.
 
-Neon can only make the proof stricter. A bug counts as caught only when the exit codes
-show both runs failed and Neon says the two failures match. If Neon is unreachable or
+Carbon can only make the proof stricter. A bug counts as caught only when the exit codes
+show both runs failed and Carbon says the two failures match. If Carbon is unreachable or
 answers something unreadable, the bug is unverified and does not count. A model never
 turns a miss into a catch.
 
@@ -16,11 +16,12 @@ Lanes may not import google-genai, so the model call is passed in: the dispatche
 """
 
 import json
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
-MODEL = "gemini-4-neon"
-MAX_INLINE_BYTES = 20 * 1024 * 1024  # Gemini's limit for a request with inline media
+MODEL = "gemini-4-carbon"  # the proof lane's model, as in managed_agent.MODELS
+MAX_INLINE_BYTES = 20 * 1024 * 1024  # Gemini's limit for a whole request with inline media
 
 PROMPT = """\
 You are checking evidence for a CI change. Both recordings show the check `{check}` running
@@ -68,13 +69,13 @@ class RecordingsTooLargeError(ValueError):
     """Raised when two recordings are too large to send inline in one request."""
 
     def __init__(self, size: int) -> None:
-        """Give the combined size."""
-        super().__init__(f"recordings total {size} bytes, over the {MAX_INLINE_BYTES}-byte inline limit")
+        """Give the request's size."""
+        super().__init__(f"the request would be {size} bytes, over the {MAX_INLINE_BYTES}-byte inline limit")
 
 
 @dataclass(frozen=True)
 class FailureMatch:
-    """Neon's reading of one bug's two recordings."""
+    """Carbon's reading of one bug's two recordings."""
 
     same: bool
     baseline_failure: str
@@ -97,7 +98,7 @@ class Replay:
 
     @property
     def caught(self) -> bool:
-        """Both runs failed and Neon confirmed it is the same failure."""
+        """Both runs failed and Carbon confirmed it is the same failure."""
         return self.baseline_failed and self.candidate_failed and self.match is not None and self.match.same
 
     @property
@@ -127,7 +128,7 @@ class Replay:
 
 
 def failure_request(baseline_video: bytes, candidate_video: bytes, check: str) -> list[Part]:
-    """Return the prompt and both recordings, in the order Neon reads them."""
+    """Return the prompt and both recordings, in the order Carbon reads them."""
     return [
         ("text", PROMPT.format(check=check)),
         ("text", "Recording 1, baseline:"),
@@ -138,15 +139,20 @@ def failure_request(baseline_video: bytes, candidate_video: bytes, check: str) -
 
 
 def compare_failures(baseline_video: bytes, candidate_video: bytes, check: str, ask: AskModel) -> FailureMatch:
-    """Ask Gemini 4 Neon whether two recordings of `check` show the same failure."""
-    size = len(baseline_video) + len(candidate_video)
-    if size > MAX_INLINE_BYTES:
+    """Ask Gemini 4 Carbon whether two recordings of `check` show the same failure."""
+    parts = failure_request(baseline_video, candidate_video, check)
+    if (size := request_bytes(parts)) > MAX_INLINE_BYTES:
         raise RecordingsTooLargeError(size)
-    return parse_match(ask(MODEL, failure_request(baseline_video, candidate_video, check), SCHEMA))
+    return parse_match(ask(MODEL, parts, SCHEMA))
+
+
+def request_bytes(parts: Iterable[Part]) -> int:
+    """Return about how large a request with these parts is: media is sent base64-encoded, 4 bytes per 3."""
+    return sum(len(v.encode()) if isinstance(v, str) else 4 * math.ceil(len(v) / 3) for _, v in parts)
 
 
 def parse_match(answer: str | None) -> FailureMatch:
-    """Read Neon's JSON answer. Raises UnreadableAnswerError unless it matches SCHEMA exactly."""
+    """Read Carbon's JSON answer. Raises UnreadableAnswerError unless it matches SCHEMA exactly."""
     try:
         data = json.loads(answer or "")
     except json.JSONDecodeError as error:
@@ -164,7 +170,7 @@ def verify_replays(
     load: Callable[[str], bytes],
     compare: Callable[[bytes, bytes, str], FailureMatch],
 ) -> list[Replay]:
-    """Have Neon compare every replay where both runs failed. Anything that goes wrong leaves it unverified."""
+    """Have Carbon compare every replay where both runs failed. Anything that goes wrong leaves it unverified."""
     out = []
     for replay in replays:
         checked = replay
@@ -173,9 +179,14 @@ def verify_replays(
                 match = compare(load(replay.baseline_video), load(replay.candidate_video), replay.check)
                 checked = replace(replay, match=match)
             except Exception as error:  # noqa: BLE001  fail closed: whatever went wrong, the bug is not confirmed
-                checked = replace(replay, note=f"not verified: {error}")
+                checked = replace(replay, note=f"not verified: {_describe(error)}")
         out.append(checked)
     return out
+
+
+def _describe(error: Exception) -> str:
+    # Some errors, such as TimeoutError(), have no message; the type still says what happened.
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
 
 
 def tally(replays: Iterable[Replay]) -> tuple[int, int]:

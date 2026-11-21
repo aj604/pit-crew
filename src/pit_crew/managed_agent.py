@@ -159,14 +159,7 @@ def run_lane(
 ) -> InteractionLike:
     """Run one lane interaction to completion, servicing `requires_action` tool calls via `tools.call`."""
     active_ledger = ledger if ledger is not None else InMemoryLedger()
-    active_client = (
-        client
-        if client is not None
-        else cast(
-            "InteractionsClientLike",
-            genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"}),
-        )
-    )
+    active_client = client if client is not None else cast("InteractionsClientLike", _gemini_client())
 
     request = build_request(lane, task, extra_sources=extra_sources)
     allowed_tool_names = {t["name"] for t in request["tools"]}
@@ -298,12 +291,10 @@ def ask_multimodal(
     """Send text and media to ``model`` and return its JSON answer, constrained to ``schema``.
 
     Each part is ``("text", str)`` or ``(mime_type, bytes)``, e.g. ``("video/mp4", recording)``.
-    The proof lane uses this to have Gemini 4 Neon watch replay recordings, since lanes may not
+    The proof lane uses this to have Gemini 4 Carbon watch replay recordings, since lanes may not
     import google-genai themselves. Needs GEMINI_API_KEY unless ``client`` is given.
     """
-    active_client = (
-        client if client is not None else cast("ModelsClientLike", genai.Client(api_key=os.environ["GEMINI_API_KEY"]))
-    )
+    active_client = client if client is not None else cast("ModelsClientLike", _gemini_client())
     response = active_client.models.generate_content(
         model=model,
         contents=[_part(kind, value) for kind, value in parts],
@@ -314,6 +305,11 @@ def ask_multimodal(
         ),
     )
     return response.text or ""
+
+
+def _gemini_client() -> genai.Client:
+    # The SDK defaults to v1, but the Interactions API is v1beta; both calls use it so they see the same API.
+    return genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"api_version": "v1beta"})
 
 
 def _part(kind: str, value: str | bytes) -> types.Part:
