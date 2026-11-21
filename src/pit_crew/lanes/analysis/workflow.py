@@ -6,10 +6,24 @@ to job ids ("test"). Analysis needs both sides joined to build the dependency gr
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import yaml
 
 _EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
+SHA = re.compile(r"\b[0-9a-f]{40}\b")  # step names embed commit SHAs that differ per run; fold to "<sha>"
+_NEEDS_REF = re.compile(r"needs\.([A-Za-z0-9_-]+)")
+
+
+@dataclass(frozen=True)
+class StepSpec:
+    """One entry under a job's `steps:`."""
+
+    name: str  # what GitHub shows: `name:`, else "Run <uses>", else "Run <first line of run>"
+    uses: str | None
+    run: str | None
+    with_: dict[str, str]
+    if_: str | None
 
 
 @dataclass(frozen=True)
@@ -21,6 +35,10 @@ class JobSpec:
     needs: tuple[str, ...]
     has_matrix: bool
     uses: str | None  # set when the job calls a reusable workflow
+    steps: tuple[StepSpec, ...] = ()
+    runs_on: str = ""
+    matrix_keys: tuple[str, ...] = ()  # keys under strategy.matrix, minus include/exclude
+    needs_refs: frozenset[str] = frozenset()  # jobs whose outputs this job reads via `needs.<id>`
 
 
 @dataclass(frozen=True)
@@ -47,13 +65,18 @@ def parse_workflow(text: str) -> Workflow:
     jobs = {}
     for job_id, raw_body in (doc.get("jobs") or {}).items():
         body = raw_body or {}
-        needs = body.get("needs") or ()
+        raw_needs = body.get("needs") or ()
+        needs = (raw_needs,) if isinstance(raw_needs, str) else tuple(raw_needs)
         jobs[job_id] = JobSpec(
             id=job_id,
             name=str(body.get("name") or job_id),
-            needs=(needs,) if isinstance(needs, str) else tuple(needs),
+            needs=needs,
             has_matrix=bool((body.get("strategy") or {}).get("matrix")),
             uses=body.get("uses"),
+            steps=_parse_steps(body.get("steps")),
+            runs_on=_runs_on(body.get("runs-on")),
+            matrix_keys=_matrix_keys(body),
+            needs_refs=_needs_refs(body, needs),
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
@@ -61,6 +84,61 @@ def parse_workflow(text: str) -> Workflow:
             msg = f"job {job.id!r} needs unknown job(s) {unknown}"
             raise ValueError(msg)
     return Workflow(name=str(doc.get("name") or ""), jobs=jobs)
+
+
+def _step_name(item: dict[str, Any]) -> str:
+    if item.get("name"):
+        return str(item["name"])
+    if item.get("uses"):
+        return f"Run {item['uses']}"
+    lines = str(item.get("run") or "").strip().splitlines()
+    return f"Run {lines[0].strip()}" if lines else "Run"
+
+
+def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        StepSpec(
+            name=_step_name(item),
+            uses=str(item["uses"]) if item.get("uses") else None,
+            run=str(item["run"]) if item.get("run") is not None else None,
+            with_={str(k): str(v) for k, v in (item.get("with") or {}).items()},
+            if_=str(item["if"]) if item.get("if") is not None else None,
+        )
+        for item in raw
+        if isinstance(item, dict)
+    )
+
+
+def _runs_on(raw: object) -> str:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return ", ".join(str(r) for r in raw)
+    return ""
+
+
+def _matrix_keys(body: dict[str, Any]) -> tuple[str, ...]:
+    matrix = (body.get("strategy") or {}).get("matrix")
+    if not isinstance(matrix, dict):
+        return ()
+    return tuple(str(k) for k in matrix if k not in ("include", "exclude"))
+
+
+def _needs_refs(body: dict[str, Any], needs: tuple[str, ...]) -> frozenset[str]:
+    text = yaml.safe_dump(body)
+    if "toJSON(needs)" in text:
+        return frozenset(needs)
+    return frozenset(_NEEDS_REF.findall(text)) & frozenset(needs)
+
+
+def match_step_name(spec_name: str, measured_name: str) -> bool:
+    """Whether a YAML step's display name is the measured step `measured_name` (SHAs already folded to <sha>)."""
+    if spec_name == measured_name:
+        return True
+    pattern = ".+?".join(re.escape(part) for part in _EXPRESSION.split(spec_name))
+    return re.fullmatch(pattern, measured_name) is not None
 
 
 def topological_order(workflow: Workflow) -> list[str]:
