@@ -701,8 +701,13 @@ class Dispatcher:
         repo_key = normalize_repo(repo)
         hyp_ids = {hyp.id for hyp in self.ledger.hypotheses_for_repo(repo)}
         rated_ids = {verdict.candidate_id for verdict in self.ledger.all(Verdict)}
+        # A candidate built before the latest KEEP lacks that change, so it is never evaluated on the new base.
+        kept = self.ledger.latest_kept_candidate(repo)
+        current_base = kept.head_sha if kept is not None else ""
         for cand in self.ledger.all(Candidate):
-            if cand.id not in rated_ids and (cand.hypothesis_id in hyp_ids or normalize_repo(cand.repo) == repo_key):
+            stale = bool(current_base and cand.base_sha and cand.base_sha != current_base)
+            in_repo = cand.hypothesis_id in hyp_ids or normalize_repo(cand.repo) == repo_key
+            if cand.id not in rated_ids and in_repo and not stale:
                 return cand
         return None
 
@@ -1245,6 +1250,9 @@ class Dispatcher:
             resolved_base_sha = self.resolve_base_sha(repo, base_sha)
             logger.info("Starting cycle for %s at base_sha=%s", repo, resolved_base_sha[:12])
             hypothesis = self.select_next_hypothesis(repo)
+            if hypothesis is None and self._has_inflight_optimizer(repo):
+                logger.info("Optimizer lanes still running for %s; not re-analyzing", repo)
+                return None
             if hypothesis is None or hypothesis.base_sha != resolved_base_sha:
                 self._report_progress("analysis", 0, 0)
                 self._run_analysis(repo, resolved_base_sha)
@@ -1420,6 +1428,9 @@ class Dispatcher:
         if first_error is not None:
             raise first_error
         return None
+
+    def _has_inflight_optimizer(self, repo: str) -> bool:
+        return any(hyp.id in self._inflight_hypothesis_ids for hyp in self.ledger.hypotheses_for_repo(repo))
 
     def _optimize_one(self, repo: str, base_sha: str, hypothesis: Hypothesis) -> Candidate | None:
         logger.info(

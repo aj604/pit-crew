@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, override
 
-from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan
+from pit_crew.contracts import Candidate, Evidence, Hypothesis, ReplayPlan, Verdict
 from pit_crew.dispatcher import DISALLOWED_PATH_REASON, Dispatcher, DispatcherConfig, LaneRunner
 from pit_crew.github import GitHubClient, WorkflowRunResult
 from pit_crew.ledger import InMemoryLedger, Ledger, SqliteLedger
@@ -792,3 +792,87 @@ def test_run_cycle_fans_out_optimizer_so_a_stuck_hypothesis_does_not_block_a_fas
     assert both_stuck_started
     assert optimized == ["h-fast", "h-stuck", "h-third"]
     assert next_hypothesis is None  # in-flight hypotheses are not handed out again
+
+
+def test_run_cycle_skips_pending_candidate_built_on_a_base_superseded_by_a_keep() -> None:
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    _seed_hypotheses(ledger, repo, [("h-kept", 120.0), ("h-stale", 90.0), ("h-next", 60.0)])
+    for hyp_id in ("h-kept", "h-stale"):
+        ledger.add(
+            Candidate(
+                id=f"cand-{hyp_id}",
+                hypothesis_id=hyp_id,
+                repo=repo,
+                branch=f"pit-crew/{hyp_id}",
+                base_sha="sha-default",
+                head_sha=f"head-{hyp_id}",
+                summary=f"Apply {hyp_id}",
+                changed_files=(".github/workflows/ci.yml",),
+            )
+        )
+    ledger.add(Verdict(candidate_id="cand-h-kept", keep=True, speedup=1.5, p_value=0.01, reason="kept"))
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=_FakeGitHubClient({repo: "sha-default"}),
+        lane_runner=_ScriptedLaneRunner(),
+        evidence_by_candidate={
+            "cand-h-next": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(50.0, 51.0, 49.0, 52.0, 50.0),
+            ),
+        },
+    )
+
+    verdict = dispatcher.run_cycle(repo)
+
+    assert verdict is not None
+    assert verdict.candidate_id == "cand-h-next"
+    assert dispatcher.evidence_base_shas == [("cand-h-next", "head-h-kept")]
+
+
+def test_run_until_sla_does_not_reanalyze_while_optimizer_lanes_are_still_running() -> None:
+    repo = "org/repo"
+    ledger = InMemoryLedger()
+    _seed_hypotheses(ledger, repo, [("h-stuck", 120.0), ("h-fast", 60.0)])
+    release_stuck = threading.Event()
+
+    class _StuckRunner(_ScriptedLaneRunner):
+        @override
+        def __call__(
+            self,
+            lane: str,
+            task: str,
+            ledger: Ledger | None = None,
+            *,
+            repo: str | None = None,
+        ) -> object:
+            context = _parse_task_context(task)
+            if lane == "optimizer" and context["hypothesis"]["id"] == "h-stuck":
+                self.calls.append(_LaneCall(lane=lane, context=context, repo=repo))
+                release_stuck.wait(timeout=5)
+                return None
+            return super().__call__(lane, task, ledger, repo=repo)
+
+    runner = _StuckRunner()
+    dispatcher = _ControlledEvidenceDispatcher(
+        ledger=ledger,
+        github=_FakeGitHubClient({repo: "sha-default"}),
+        lane_runner=runner,
+        evidence_by_candidate={
+            "cand-h-fast": _EvidenceSpec(
+                baseline_seconds=(180.0, 181.0, 179.0, 182.0, 178.0),
+                candidate_seconds=(120.0, 121.0, 119.0, 122.0, 120.0),
+            ),
+        },
+        config=DispatcherConfig(optimizer_fanout=2, max_compounding_cycles=3),
+    )
+
+    try:
+        verdicts = dispatcher.run_until_sla(repo)
+        analysis_calls = [c.lane for c in runner.calls].count("analysis")
+    finally:
+        release_stuck.set()
+
+    assert [(v.candidate_id, v.keep, v.sla_met) for v in verdicts] == [("cand-h-fast", True, False)]
+    assert analysis_calls == 1
