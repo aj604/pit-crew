@@ -269,10 +269,53 @@ def test_a_quoted_here_document_delimiter_is_not_mutated() -> None:
     assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
 
 
-@pytest.mark.parametrize("source", ['cat <<E"O"F\n(( n > 2 ))\nEOF\n', "cat <<EOF\n(( n > 2 ))\n"])
-def test_a_here_document_it_cannot_close_masks_nothing(source: str) -> None:
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [
+        ("<<E\\OF", "EOF"),
+        ("<<E'OF'", "EOF"),
+        ('<<E"O"F', "EOF"),
+        ("<<$'EOF'", "EOF"),
+        ('<<$"EOF"', "EOF"),
+        ('<<"E\\$F"', "E$F"),
+        ("<<'E\\$F'", "E\\$F"),
+    ],
+)
+def test_a_partly_quoted_here_document_delimiter_is_read_as_bash_reads_it(opener: str, closer: str) -> None:
+    source = f"cat {opener}\n(( a < b )) && true\n{closer}\n(( n > 2 ))\n"
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == [(4, "> -> <=")]
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["cat <<$'E\\x4fF'\n(( n > 2 ))\nEOF\n", "cat <<E`echo O`F\n(( n > 2 ))\nEOF\n", "cat <<EOF\n(( n > 2 ))\n"],
+)
+def test_a_here_document_it_cannot_read_or_close_masks_nothing(source: str) -> None:
     # Better a mutant in text than none for the rest of the file.
     assert (2, "> -> <=") in [(m.line, m.operator) for m in mutants("a.sh", source)]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # The body of INNER follows the newline inside $( ), and OUTER's follows the one after the ).
+        (
+            "echo <<'OUTER' $(cat <<'INNER'\n(( a < b ))\nINNER\n(( x > y ))\n)\n(( a > b ))\nOUTER\n(( x < y ))\n",
+            [(4, "> -> <="), (8, "< -> >=")],
+        ),
+        # The )) of (( )) inside $( ) does not close it.
+        (
+            "cat <<'OUTER' $( (( n > 1 )) && cat <<'INNER'\n(( a < b ))\nINNER\n)\n(( c < d ))\nOUTER\n(( x > y ))\n",
+            [(1, "> -> <="), (1, "&& -> ||"), (7, "> -> <=")],
+        ),
+        # A substitution closed before the newline leaves its here-document to the next one.
+        ("x=$(cat <<'EOF')\n(( a < b ))\nEOF\n(( n > 2 ))\n", [(4, "> -> <=")]),
+    ],
+)
+def test_a_here_document_in_a_command_substitution_has_its_body_there(
+    source: str, expected: list[tuple[int, str]]
+) -> None:
+    assert [(m.line, m.operator) for m in mutants("a.sh", source)] == expected
 
 
 def test_shell_arithmetic_in_double_quotes_is_still_code() -> None:

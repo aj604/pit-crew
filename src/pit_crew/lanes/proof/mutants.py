@@ -46,9 +46,10 @@ _WORDS = {"true": "false", "false": "true", "True": "False", "False": "True"}
 _FLIPS = _BINARY | _WORDS
 _BINARY_RE = re.compile(r"(?<=\s)(" + "|".join(re.escape(op) for op in _BINARY) + r")(?=\s)")
 _WORD_RE = re.compile(r"\b(" + "|".join(_WORDS) + r")\b")
-# A shell here-document: <<EOF, <<-EOF, << 'EOF', <<"END-OF-FILE", <<\EOF, but not the here-string <<<.
-# The delimiter is the whole word; one this can't read whole (<<E"O"F) is not taken as a here-document.
-_HEREDOC = re.compile(r"""(?<!<)<<(?!<)(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([^\s;|&<>()'"`]+))(?=[\s;|&<>()]|$)""")
+# A shell here-document opener: <<EOF, <<-EOF, << 'EOF', but not the here-string <<<. _delimiter reads the word.
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*")
+_WORD_END = frozenset(";|&<>()")  # with whitespace, what ends an unquoted shell word
+_DOUBLE_QUOTE_ESCAPES = frozenset('$`"\\')  # what a backslash escapes in shell double quotes
 _SHELL_WORD_START = " \t\n;|&()"  # where a shell # starts a comment; elsewhere ($#, ${#x}) it is code
 
 
@@ -138,33 +139,116 @@ def _mutant(path: str, number: int, line: str, col: int, op: str) -> Mutant:
     return Mutant(path, number, line, line[:col] + new + line[col + len(op) :], f"{op} -> {new}")
 
 
+class _Substitutions:
+    """The shell command substitutions `$( )` open at a point, outermost first; the script itself is the first.
+
+    A here-document's body starts after the next newline in the substitution it was opened in, so each
+    keeps its own here-documents waiting for a body. Each also counts the ( it has open, so that the )
+    closing a group or `(( ))` does not close the substitution.
+    """
+
+    def __init__(self) -> None:
+        """Start outside any substitution."""
+        self._waiting: list[list[tuple[str, bool]]] = [[]]  # (delimiter, tabs stripped)
+        self._groups = [0]
+
+    @property
+    def waiting(self) -> list[tuple[str, bool]]:
+        """The here-documents opened in the innermost substitution since its last newline."""
+        return self._waiting[-1]
+
+    def step(self, source: str, i: int) -> int:
+        """Follow a `$(`, `(` or `)` at `i`; return how many characters it was, or 0 if none is there."""
+        if source.startswith("$(", i) and not source.startswith("$((", i):
+            self._waiting.append([])
+            self._groups.append(0)
+            return 2
+        if source[i] == "(":
+            self._groups[-1] += 1
+        elif source[i] == ")" and self._groups[-1]:
+            self._groups[-1] -= 1
+        elif source[i] == ")" and len(self._groups) > 1:
+            self._groups.pop()
+            closed = self._waiting.pop()
+            # Closed before a newline: read the bodies at the next one, which risks masking code, never a bug in text.
+            self._waiting[-1] += closed
+        return 1 if source[i] in "()" else 0
+
+
 def _mask(source: str, *, hash_comments: bool, shell: bool = False) -> str:
     """Return the source with strings, comments and here-documents blanked to spaces; newlines and offsets kept."""
     out = list(source)
-    heredocs: list[tuple[str, bool]] = []  # here-documents opened on the current line: (delimiter, tabs stripped)
+    substitutions = _Substitutions()
     i = 0
     while i < len(source):
-        if source[i] == "\n" and heredocs:
-            body_end = _heredoc_end(source, i + 1, heredocs)
-            heredocs = []
+        if source[i] == "\n" and substitutions.waiting:
+            body_end = _heredoc_end(source, i + 1, substitutions.waiting)
+            substitutions.waiting.clear()
             if body_end is None:  # no delimiter line: most likely not a here-document, so mask nothing
                 i += 1
             else:
                 _blank(out, i + 1, body_end)
                 i = body_end
-        elif shell and (heredoc := _HEREDOC.match(source, i)) and not _in_arithmetic(out, i):
-            delimiter = next(word for word in heredoc.group(2, 3, 4) if word is not None)
-            heredocs.append((delimiter, heredoc.group(1) == "-"))
-            _blank(out, i, heredoc.end())  # a flip in a quoted delimiter would stop it matching its closing line
-            i = heredoc.end()
+        elif shell and (heredoc := _heredoc(source, i)) and not _in_arithmetic(out, i):
+            delimiter, tabs, opener_end = heredoc
+            substitutions.waiting.append((delimiter, tabs))
+            _blank(out, i, opener_end)  # a flip in a quoted delimiter would stop it matching its closing line
+            i = opener_end
         elif (end := _literal_end(source, i, hash_comments=hash_comments, shell=shell)) is not None:
             _blank(out, i, end)
             if shell and source[i] == '"':
                 _keep_arithmetic(out, source, i, end)
             i = end
         else:
-            i += 1
+            i += (substitutions.step(source, i) if shell else 0) or 1
     return "".join(out)
+
+
+def _heredoc(source: str, i: int) -> tuple[str, bool, int] | None:
+    """Read a here-document opener at `i`: return (delimiter, tabs stripped, end), or None if none is there."""
+    opener = _HEREDOC.match(source, i)
+    if opener is None or (word := _delimiter(source, opener.end())) is None:
+        return None
+    return word[0], opener.group(1) == "-", word[1]
+
+
+def _delimiter(source: str, i: int) -> tuple[str, int] | None:
+    r"""Read the delimiter word at `i` with its quotes removed, as Bash does: (delimiter, end), or None.
+
+    Any part may be quoted, so E\OF, E'OF', E"O"F, $'EOF' and $"EOF" all end at a line reading EOF. A
+    $'...' with a backslash in it is not read: what its escapes decode to differs between Bash versions.
+    """
+    start = i
+    parts: list[str] = []
+    while i < len(source) and not source[i].isspace() and source[i] not in _WORD_END:
+        skip = 1 if source.startswith(("$'", '$"'), i) else 0  # $'...' and $"..." quote as '...' and "..."
+        char = source[i + skip]
+        if char in "'\"":
+            quoted = _quoted(source, i + skip + 1, char, ansi=skip == 1 and char == "'")
+            if quoted is None:
+                return None
+            part, i = quoted
+        elif char == "\\" and source[i + 1 : i + 2] not in ("", "\n"):
+            part, i = source[i + 1], i + 2
+        elif char in "\\`":
+            return None  # a line continuation, or a command substitution in the word: not a word this can read
+        else:
+            part, i = char, i + 1
+        parts.append(part)
+    return ("".join(parts), i) if i > start else None
+
+
+def _quoted(source: str, i: int, quote: str, *, ansi: bool) -> tuple[str, int] | None:
+    """Read a quoted part of a delimiter, from just after its opening quote: (text, end), or None."""
+    parts: list[str] = []
+    while i < len(source) and source[i] != quote:
+        if source[i] == "\n" or (source[i] == "\\" and ansi):
+            return None
+        if source[i] == "\\" and quote == '"' and source[i + 1 : i + 2] in _DOUBLE_QUOTE_ESCAPES:
+            i += 1
+        parts.append(source[i])
+        i += 1
+    return ("".join(parts), i + 1) if i < len(source) else None
 
 
 def _blank(out: list[str], start: int, end: int) -> None:
