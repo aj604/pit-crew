@@ -281,6 +281,7 @@ def test_dispatcher_config_exposes_spec_defaults_and_is_frozen() -> None:
         "auto_open_pr",
         "base_branch",
         "max_parallel_runs",
+        "optimizer_fanout",
     ]
     assert cfg.timing_pairs == 5
     assert cfg.max_compounding_cycles == 5
@@ -290,6 +291,7 @@ def test_dispatcher_config_exposes_spec_defaults_and_is_frozen() -> None:
     assert cfg.auto_open_pr is True
     assert cfg.base_branch == "main"
     assert cfg.max_parallel_runs == 1
+    assert cfg.optimizer_fanout == 1
 
     with pytest.raises(FrozenInstanceError):
         cfg.timing_pairs = 10  # type: ignore[misc]

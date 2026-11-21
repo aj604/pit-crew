@@ -276,9 +276,16 @@ def _execute_tool_step(
 
 
 def _serialize_result(output: object) -> str | dict[str, Any]:
-    """Pass ``str`` and ``dict`` through; JSON-encode everything else (the SDK rejects bare lists and scalars)."""
+    """Pass ``str`` and ``dict`` through; wrap sequences as ``{"items": ...}`` and JSON-encode scalars.
+
+    The Interactions API rejects bare lists and scalars, and Antigravity agent models can loop
+    on list-returning tools (such as ``list_prior_attempts``) when given a stringified JSON
+    array instead of a structured object.
+    """
     if isinstance(output, (str, dict)):
         return output
+    if isinstance(output, (list, tuple)):
+        return {"items": json.loads(json.dumps(list(output), default=str))}
     return json.dumps(output, default=str)
 
 

@@ -246,8 +246,7 @@ def test_run_lane_forwards_repo_and_falls_back_when_environment_id_missing(monke
     tool_reply = follow_up["input"]
     assert isinstance(tool_reply, list)
     result = tool_reply[0]["result"]
-    assert isinstance(result, str)
-    assert json.loads(result) == [{"path": "src/a.py", "line": 2}]
+    assert result == {"items": [{"path": "src/a.py", "line": 2}]}
 
 
 def test_serialize_tool_result_accepts_all_output_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,7 +266,7 @@ def test_serialize_tool_result_accepts_all_output_shapes(monkeypatch: pytest.Mon
     assert isinstance(tool_reply, list)
     results = [item["result"] for item in tool_reply]
     assert results[0] == {"ok": True}
-    assert results[1] == "[1, 2]"
+    assert results[1] == {"items": [1, 2]}
     assert results[2] == "42"
     assert results[3] == "true"
     assert results[4] == "null"
@@ -596,14 +595,14 @@ class _Opaque:
     [
         ("plain", "plain"),
         ({"k": [1, None]}, {"k": [1, None]}),
-        ([1, "a"], '[1, "a"]'),
-        ((1, 2), "[1, 2]"),
+        ([1, "a"], {"items": [1, "a"]}),
+        ((1, 2), {"items": [1, 2]}),
         (3, "3"),
         (2.5, "2.5"),
         (True, "true"),
         (False, "false"),
         (None, "null"),
-        ([_Opaque()], '["opaque"]'),
+        ([_Opaque()], {"items": ["opaque"]}),
     ],
 )
 def test_tool_outputs_are_serialized_for_the_sdk(
