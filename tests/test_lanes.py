@@ -289,6 +289,59 @@ def test_follow_up_falls_back_to_the_initial_environment_id() -> None:
     assert [c["environment"] for c in fake_client.interactions.calls[1:]] == ["env-1", "env-1"]
 
 
+def test_follow_up_remembers_an_environment_id_seen_only_while_polling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(managed_agent, "POLL_INTERVAL_SECONDS", 0.0)
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(id="int-1", status="queued", steps=[]),
+            _FakeInteraction(id="int-2", status="requires_action", steps=[_record_call()]),
+            _FakeInteraction(id="int-3", status="completed", steps=[]),
+        ],
+        polled=[
+            _FakeInteraction(id="int-1", status="in_progress", steps=[], environment_id="env-polled"),
+            _FakeInteraction(id="int-1", status="requires_action", steps=[_record_call()]),
+        ],
+    )
+
+    run_lane("analysis", "analyze", client=fake_client)
+
+    assert [c["environment"] for c in fake_client.interactions.calls[1:]] == ["env-polled", "env-polled"]
+
+
+def test_follow_up_remembers_an_environment_id_on_a_pending_create_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(managed_agent, "POLL_INTERVAL_SECONDS", 0.0)
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(id="int-1", status="queued", steps=[], environment_id="env-created"),
+            _FakeInteraction(id="int-2", status="completed", steps=[]),
+        ],
+        polled=[_FakeInteraction(id="int-1", status="requires_action", steps=[_record_call()])],
+    )
+
+    run_lane("analysis", "analyze", client=fake_client)
+
+    assert fake_client.interactions.calls[1]["environment"] == "env-created"
+
+
+def test_follow_up_remembers_an_environment_id_first_assigned_on_a_later_turn() -> None:
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(id="int-1", status="requires_action", steps=[_record_call()]),
+            _FakeInteraction(
+                id="int-2", status="requires_action", steps=[_record_call("call-2")], environment_id="env-2"
+            ),
+            _FakeInteraction(id="int-3", status="requires_action", steps=[_record_call("call-3")]),
+            _FakeInteraction(id="int-4", status="completed", steps=[]),
+        ]
+    )
+
+    run_lane("analysis", "analyze", client=fake_client)
+
+    environments = [c["environment"] for c in fake_client.interactions.calls[1:]]
+    assert isinstance(environments[0], dict)
+    assert environments[1:] == ["env-2", "env-2"]
+
+
 def test_follow_up_resends_environment_config_when_no_id_was_assigned() -> None:
     fake_client = _FakeClient(
         responses=[

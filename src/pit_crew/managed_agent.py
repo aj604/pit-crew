@@ -181,13 +181,14 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
     allowed_tool_names = {t["name"] for t in request["tools"]}
 
     interaction = active_client.interactions.create(**request)
-    # Follow-up turns resume the same sandbox, so pin the environment ID the API assigned to the first turn.
-    initial_environment_id = _environment_id(interaction)
+    # Follow-up turns resume the same sandbox, so remember the first environment ID the API assigns.
+    environment_id: str | None = None
     for _ in range(MAX_TOOL_TURNS):
+        environment_id = environment_id or _environment_id(interaction)
         while interaction.status in PENDING_STATUSES:
             time.sleep(POLL_INTERVAL_SECONDS)
             interaction = active_client.interactions.get(interaction.id)
-            initial_environment_id = initial_environment_id or _environment_id(interaction)
+            environment_id = environment_id or _environment_id(interaction)
 
         if interaction.status is not None and interaction.status in FAILED_STATUSES:
             raise InteractionFailedError(lane, interaction.id, interaction.status)
@@ -196,7 +197,7 @@ def run_lane(  # noqa: PLR0913  keyword-only options mirror build_request plus t
             "agent": BASE_AGENT,
             "previous_interaction_id": interaction.id,
             "agent_config": request["agent_config"],
-            "environment": _environment_id(interaction) or initial_environment_id or request["environment"],
+            "environment": _environment_id(interaction) or environment_id or request["environment"],
             "tools": request["tools"],
         }
 
