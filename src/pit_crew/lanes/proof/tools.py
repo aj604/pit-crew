@@ -8,7 +8,7 @@ The deterministic part runs in code the dispatcher calls before starting the age
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 
 from pit_crew.contracts import BugCase, Candidate, ReplayPlan, is_allowed_candidate_path
@@ -20,6 +20,7 @@ from pit_crew.tools import tool
 
 MAX_REPLAYS = 20
 _SHA = re.compile(r"^[0-9a-f]{4,40}$")  # git's shortest abbreviation up to a full SHA-1
+_DEFAULT_COMMIT_REASON = "historical red commit"
 
 
 class InvalidReplayPlanError(ValueError):
@@ -37,7 +38,7 @@ class InvalidReplayPlanError(ValueError):
 
     @classmethod
     def not_a_list(cls, field: str) -> "InvalidReplayPlanError":
-        """Build the error for bug_shas or mutations given as something other than a list."""
+        """Build the error for bug_shas, commits or mutations given as something other than a list."""
         return cls(f"{field} must be a list")
 
     @classmethod
@@ -52,6 +53,11 @@ class InvalidReplayPlanError(ValueError):
             f"a mutation must change code under test, not {path!r}: the candidate may change that file, "
             "so replaying the mutation would overwrite the change it is meant to test"
         )
+
+    @classmethod
+    def bad_expected_checks(cls, value: object) -> "InvalidReplayPlanError":
+        """Build the error for expected_checks that is not a non-empty list of check names."""
+        return cls(f"expected_checks must be a non-empty list of check names, got {value!r}")
 
 
 def pick_replays(red: Iterable[RedCommit], touched: Iterable[Check] | None, limit: int = MAX_REPLAYS) -> list[str]:
@@ -85,6 +91,21 @@ def uncovered_checks(red: Iterable[RedCommit], touched: Iterable[Check]) -> set[
     """
     caught = {key for commit in red for key in commit.checks}
     return {check for check in touched if check.isdisjoint(caught)}
+
+
+def expected_checks_for(commit: RedCommit, touched: Iterable[Check] | None) -> tuple[str, ...]:
+    """Return the check keys expected to fail when replaying ``commit`` against ``touched``.
+
+    When ``touched`` is given, each touched check that caught ``commit`` contributes all of its
+    aliases (job id, display name, and old/new names across renames) so a renamed job still
+    matches. Falls back to ``commit.checks`` when ``touched`` is None or does not name the
+    commit's checks.
+    """
+    if touched is not None:
+        matched = {key for check in touched if not check.isdisjoint(commit.checks) for key in check}
+        if matched:
+            return tuple(sorted(matched))
+    return tuple(sorted(set(commit.checks)))
 
 
 @tool(
@@ -122,7 +143,28 @@ def propose_mutants(
             "bug_shas": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Commits that turned CI red and must still fail on the candidate",
+                "description": "Commits that turned CI red without structured expected_checks; prefer `commits`",
+            },
+            "commits": {
+                "type": "array",
+                "description": "Historical red commits with the CI check(s) expected to fail on the candidate",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "sha": {"type": "string", "description": "Commit SHA that turned CI red"},
+                        "expected_checks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "CI check keys (workflow/job, including id and display-name aliases) "
+                                "expected to fail on this commit"
+                            ),
+                        },
+                        "reason": {"type": "string", "description": "Why this commit is replayed"},
+                    },
+                    "required": ["sha", "expected_checks"],
+                },
             },
             "mutations": {
                 "type": "array",
@@ -133,8 +175,17 @@ def propose_mutants(
                         "path": {"type": "string", "description": "Repository path of the mutated file"},
                         "content": {"type": "string", "description": "The whole file, with the bug in it"},
                         "reason": {"type": "string", "description": "Which check should catch it, and why"},
+                        "expected_checks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "CI check keys (workflow/job, including id and display-name aliases) "
+                                "expected to catch this mutation"
+                            ),
+                        },
                     },
-                    "required": ["path", "content", "reason"],
+                    "required": ["path", "content", "reason", "expected_checks"],
                 },
             },
         },
@@ -144,13 +195,13 @@ def propose_mutants(
 def plan_replays(
     ledger: Ledger,
     candidate_id: str,
-    bug_shas: list[str] | None = None,
-    mutations: list[dict[str, str]] | None = None,
+    bug_shas: Sequence[str] | None = None,
+    mutations: Sequence[Mapping[str, object]] | None = None,
+    commits: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     """Choose which bugs to replay against a candidate: red commits and mutated files. Returns the plan id."""
     candidate = ledger.get(Candidate, candidate_id)  # fail on an unknown candidate
-    shas = _shas(_listed(bug_shas, "bug_shas"))
-    cases = [BugCase(kind="commit", commit_sha=sha, reason="historical red commit") for sha in shas]
+    shas, cases = _commit_cases(_listed(bug_shas, "bug_shas"), _listed(commits, "commits"))
     cases += [_mutation_case(m, candidate) for m in _listed(mutations, "mutations")]
     if not cases:
         raise InvalidReplayPlanError.empty()
@@ -171,12 +222,44 @@ def _listed(value: object, field: str) -> list[object]:
     return value
 
 
-def _shas(values: list[object]) -> tuple[str, ...]:
-    # A number is refused, not read as hex: 0012345 written as a number is the wrong commit.
-    shas = [v.strip().lower() for v in values if isinstance(v, str)]
-    if bad := [repr(v) for v in values if not isinstance(v, str)] + [sha for sha in shas if not _SHA.match(sha)]:
-        raise InvalidReplayPlanError.not_shas(bad)
-    return tuple(dict.fromkeys(shas))
+def _commit_cases(bug_shas: list[object], commits: list[object]) -> tuple[tuple[str, ...], list[BugCase]]:
+    raw_entries: list[tuple[object, tuple[str, ...], str]] = [(sha, (), "") for sha in bug_shas]
+    for entry in commits:
+        fields = entry if isinstance(entry, Mapping) else {}
+        raw_reason = fields.get("reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        raw_entries.append((fields.get("sha"), _parse_expected_checks(fields.get("expected_checks")), reason))
+
+    bad: list[str] = []
+    merged_checks: dict[str, list[str]] = {}
+    merged_reason: dict[str, str] = {}
+    for raw_sha, checks, reason in raw_entries:
+        # A number is refused, not read as hex: 0012345 written as a number is the wrong commit.
+        sha = raw_sha.strip().lower() if isinstance(raw_sha, str) else ""
+        if not _SHA.match(sha):
+            bad.append(sha if isinstance(raw_sha, str) else repr(raw_sha))
+            continue
+        bucket = merged_checks.setdefault(sha, [])
+        for check in checks:
+            if check not in bucket:
+                bucket.append(check)
+        if reason and not merged_reason.get(sha):
+            merged_reason[sha] = reason
+
+    if bad:
+        raise InvalidReplayPlanError.not_shas(dict.fromkeys(bad))
+
+    shas = tuple(merged_checks)
+    cases = [
+        BugCase(
+            kind="commit",
+            commit_sha=sha,
+            reason=merged_reason.get(sha) or _DEFAULT_COMMIT_REASON,
+            expected_checks=tuple(checks),
+        )
+        for sha, checks in merged_checks.items()
+    ]
+    return shas, cases
 
 
 def _mutation_case(mutation: object, candidate: Candidate) -> BugCase:
@@ -189,4 +272,23 @@ def _mutation_case(mutation: object, candidate: Candidate) -> BugCase:
         raise InvalidReplayPlanError.bad_mutation(path)
     if is_allowed_candidate_path(path) or path in candidate.changed_files:
         raise InvalidReplayPlanError.mutates_the_candidate(path)
-    return BugCase(kind="mutation", mutated_files={path: content}, reason=reason or "synthetic mutation")
+    expected_checks = _parse_expected_checks(fields["expected_checks"]) if "expected_checks" in fields else ()
+    return BugCase(
+        kind="mutation",
+        mutated_files={path: content},
+        reason=reason.strip() or "synthetic mutation",
+        expected_checks=expected_checks,
+    )
+
+
+def _parse_expected_checks(raw: object) -> tuple[str, ...]:
+    if isinstance(raw, str | bytes) or not isinstance(raw, Sequence) or not raw:
+        raise InvalidReplayPlanError.bad_expected_checks(raw)
+    checks: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise InvalidReplayPlanError.bad_expected_checks(raw)
+        stripped = item.strip()
+        if stripped not in checks:
+            checks.append(stripped)
+    return tuple(checks)

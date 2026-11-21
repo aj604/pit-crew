@@ -36,9 +36,11 @@ Output: one replay plan.
    - Every replay is recorded on video, and Gemini 4 Carbon checks that the candidate fails
      the same way the baseline does. Pick mutants that fail with a specific, readable
      message, like an assertion showing expected and actual values, not a crash or a hang.
-4. Call `plan_replays` with the required replays and your additions as `bug_shas`, and each
-   mutant as a `mutations` entry: its path, the whole mutated file, and which check should
-   catch it.
+4. Call `plan_replays` with the required replays and your additions in `commits` (each with
+   its `sha` and `expected_checks`, keeping every check key and display-name alias from the
+   touched check or red commit), and each mutant as a `mutations` entry: its `path`, the whole
+   mutated file `content`, `reason`, and `expected_checks` (every key of the uncovered check
+   that should catch it).
 
 If an uncovered check has no code you can mutate, say so in your final message and still
 plan the replays you have. The gap shows in the evidence instead of hiding.

@@ -8,8 +8,8 @@ from pit_crew.contracts import Candidate, ReplayPlan
 from pit_crew.lanes.proof.checks import Check, FileChange, all_checks, touched_checks
 from pit_crew.lanes.proof.miner import JobRun, RedCommit, flaky_checks, red_commits
 from pit_crew.lanes.proof.mutants import Mutant, StaleMutantError, apply_mutant, mutants
-from pit_crew.lanes.proof.tools import InvalidReplayPlanError, pick_replays, uncovered_checks
-from pit_crew.ledger import InMemoryLedger
+from pit_crew.lanes.proof.tools import InvalidReplayPlanError, expected_checks_for, pick_replays, uncovered_checks
+from pit_crew.ledger import InMemoryLedger, SqliteLedger
 from pit_crew.managed_agent import build_request
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -201,6 +201,19 @@ def test_diff_to_replays_end_to_end(red: list[RedCommit]) -> None:
     assert touched is not None
     assert pick_replays(red, touched) == ["d4d4d4d"]
     assert uncovered_checks(red, touched) == set()
+
+
+def test_expected_checks_for_preserves_aliases_and_scopes_multi_check_commits(red: list[RedCommit]) -> None:
+    unit_bug = next(c for c in red if c.sha == "b2b2b2b")
+    renamed = check("CI/test", "CI/Unit tests", "CI/Tests")
+    assert expected_checks_for(unit_bug, {TEST}) == ("CI/Unit tests", "CI/test")
+    assert expected_checks_for(unit_bug, {renamed}) == ("CI/Tests", "CI/Unit tests", "CI/test")
+
+    both = RedCommit("abcd123", "main", "2026-11-01T00:00:00Z", ("CI/Unit tests", "CI/lint"), fixed=True)
+    assert expected_checks_for(both, {TEST}) == ("CI/Unit tests", "CI/test")
+    assert expected_checks_for(both, {LINT, TEST}) == ("CI/Unit tests", "CI/lint", "CI/test")
+    assert expected_checks_for(both, None) == ("CI/Unit tests", "CI/lint")
+    assert expected_checks_for(unit_bug, {LINT}) == ("CI/Unit tests",)
 
 
 # Mutation fallback
@@ -441,11 +454,81 @@ def test_a_plan_of_only_mutations_is_valid(ledger_and_candidate: tuple[InMemoryL
     assert plan.cases[0].reason == "synthetic mutation"
 
 
+def test_plan_replays_populates_expected_checks_for_commits_and_mutations(tmp_path: Path) -> None:
+    build_request("proof", "")
+    ledger = SqliteLedger(tmp_path / "pit_crew.db")
+    candidate = Candidate("h1", "pc/cache", "cache deps")
+    ledger.add(candidate)
+
+    plan_id = tools.call(
+        "plan_replays",
+        ledger,
+        {
+            "candidate_id": candidate.id,
+            "commits": [
+                {
+                    "sha": "B2B2B2B ",
+                    "expected_checks": [" CI/Unit tests ", "CI/test", "CI/Unit tests"],
+                    "reason": "unit test regression",
+                },
+                {"sha": "d4d4d4d", "expected_checks": ["CI/lint"]},
+            ],
+            "mutations": [
+                {
+                    "path": "src/merge.ts",
+                    "content": "return a != b;\n",
+                    "reason": "report check: == -> !=",
+                    "expected_checks": ["CI/report", "CI/Report job", "CI/report"],
+                }
+            ],
+        },
+    )
+    plan = ledger.get(ReplayPlan, plan_id)
+    assert plan.bug_shas == ("b2b2b2b", "d4d4d4d")
+    assert [(c.kind, c.commit_sha, c.expected_checks, c.reason) for c in plan.cases] == [
+        ("commit", "b2b2b2b", ("CI/Unit tests", "CI/test"), "unit test regression"),
+        ("commit", "d4d4d4d", ("CI/lint",), "historical red commit"),
+        ("mutation", None, ("CI/report", "CI/Report job"), "report check: == -> !="),
+    ]
+
+
+def test_plan_replays_merges_duplicate_commit_shas_across_bug_shas_and_commits(
+    ledger_and_candidate: tuple[InMemoryLedger, str],
+) -> None:
+    ledger, candidate_id = ledger_and_candidate
+    plan_id = tools.call(
+        "plan_replays",
+        ledger,
+        {
+            "candidate_id": candidate_id,
+            "bug_shas": ["b2b2b2b", "d4d4d4d"],
+            "commits": [
+                {"sha": "B2B2B2B", "expected_checks": ["CI/Unit tests"], "reason": "first reason"},
+                {"sha": "b2b2b2b", "expected_checks": ["CI/test", "CI/Unit tests"], "reason": "ignored second"},
+            ],
+        },
+    )
+    plan = ledger.get(ReplayPlan, plan_id)
+    assert plan.bug_shas == ("b2b2b2b", "d4d4d4d")
+    assert [(c.commit_sha, c.expected_checks, c.reason) for c in plan.cases] == [
+        ("b2b2b2b", ("CI/Unit tests", "CI/test"), "first reason"),
+        ("d4d4d4d", (), "historical red commit"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
         ({"bug_shas": []}, "at least one bug"),
         ({"bug_shas": ["b2b2b2b", "main"]}, "not commit SHAs: main"),
+        ({"commits": [{"sha": "main", "expected_checks": ["CI/lint"]}]}, "not commit SHAs: main"),
+        ({"commits": [{"sha": 123, "expected_checks": ["CI/lint"]}]}, "not commit SHAs: 123"),
+        ({"commits": [{"sha": "b2b2b2b"}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": None}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": []}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": "CI/lint"}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": [""]}]}, "expected_checks"),
+        ({"commits": [{"sha": "b2b2b2b", "expected_checks": [42]}]}, "expected_checks"),
         ({"mutations": [{"path": "/etc/passwd", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "../up.py", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "..\\..\\etc\\passwd", "content": "x", "reason": "r"}]}, "relative path"),
@@ -453,13 +536,32 @@ def test_a_plan_of_only_mutations_is_valid(ledger_and_candidate: tuple[InMemoryL
         ({"mutations": [{"path": "./", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "src//a.py", "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "", "content": "x", "reason": "r"}]}, "relative path"),
+        ({"mutations": [{"path": 123, "content": "x", "reason": "r"}]}, "relative path"),
         ({"mutations": [{"path": "a.py", "content": "", "reason": "r"}]}, "whole mutated file"),
+        ({"mutations": [{"path": "a.py", "content": 123, "reason": "r"}]}, "whole mutated file"),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": None}]},
+            "expected_checks",
+        ),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": []}]},
+            "expected_checks",
+        ),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": "CI/lint"}]},
+            "expected_checks",
+        ),
+        (
+            {"mutations": [{"path": "a.py", "content": "x", "reason": "r", "expected_checks": ["  "]}]},
+            "expected_checks",
+        ),
         # The model writes these arguments; a wrong type must come back as an error, not crash the lane.
         ({"bug_shas": [1818181]}, "not commit SHAs: 1818181"),
         ({"bug_shas": "b2b2b2b"}, "bug_shas must be a list"),
+        ({"commits": {"sha": "b2b2b2b", "expected_checks": ["CI/lint"]}}, "commits must be a list"),
+        ({"commits": ["b2b2b2b"]}, "expected_checks"),
         ({"mutations": {"path": "a.py", "content": "x"}}, "mutations must be a list"),
         ({"mutations": ["src/a.py"]}, "relative path"),
-        ({"mutations": [{"path": "a.py", "content": 5, "reason": "r"}]}, "whole mutated file"),
         ({"mutations": [{"path": "a.py", "content": "x", "reason": 3}]}, "whole mutated file"),
         # Replaying these would overwrite the candidate's own CI change.
         ({"mutations": [{"path": ".github/workflows/ci.yml", "content": "x", "reason": "r"}]}, "code under test"),
@@ -472,6 +574,18 @@ def test_plan_replays_refuses_a_plan_that_proves_nothing(
     ledger, candidate_id = ledger_and_candidate
     with pytest.raises(InvalidReplayPlanError, match=message):
         tools.call("plan_replays", ledger, {"candidate_id": candidate_id, **arguments})
+    assert ledger.all(ReplayPlan) == []
+
+
+def test_plan_replays_schema_requires_non_empty_expected_checks() -> None:
+    build_request("proof", "")
+    (spec,) = [t for t in tools.for_lane("proof") if t.name == "plan_replays"]
+    commits_item = spec.parameters["properties"]["commits"]["items"]
+    mutations_item = spec.parameters["properties"]["mutations"]["items"]
+    assert "expected_checks" in commits_item["required"]
+    assert commits_item["properties"]["expected_checks"]["minItems"] == 1
+    assert "expected_checks" in mutations_item["required"]
+    assert mutations_item["properties"]["expected_checks"]["minItems"] == 1
 
 
 def test_plan_replays_refuses_to_mutate_a_file_the_candidate_changed() -> None:
