@@ -37,7 +37,11 @@ push: the host publishes your branch, and GitHub Actions measures it.
   `--exit-zero`, or anything else that hides a failure. The guard rejects these, and so does
   the rater when a replayed bug stops failing.
 - Keep every failure artifact upload (screenshots, videos, traces). The Proof lane inspects them.
-- Keep existing job ids and names, since branch protection may require them.
+- Keep existing job ids and names, since branch protection may require them. If you move a
+  job's checks into new jobs, the old job becomes a gate: `needs:` them, `if: always()`, and a
+  step that fails unless every needed job succeeded.
+- A check must keep running on every runner, OS, toolchain version and directory it ran on.
+- Do not use YAML anchors or aliases (`&name`, `*name`); the guard rejects them.
 - Do not run the pipeline in the sandbox.
 
 ## When to stop

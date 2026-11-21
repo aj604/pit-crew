@@ -11,13 +11,19 @@ pull request's branch.
 - Duplicated matrix values: list each value once.
 - `push` plus `pull_request` on every branch: limit `push` to the default branch
   (`branches: [main]`). Pull requests are still checked by the `pull_request` trigger.
+  An unfiltered `push` also runs for tags, and a `branches` filter alone stops that, so add
+  `tags: ['**']` (or keep the existing tag filter). The guard rejects a branch filter that drops
+  tag runs.
 - Add `concurrency` with `cancel-in-progress: true` keyed on the workflow and ref, so a new
   push cancels the stale run on that branch. Never cancel runs on the default branch.
 
 ## Keep
 
 - Every distinct check runs at least once for every pull request and every commit to main.
-- Every trigger event. The guard rejects dropping one; narrow its branches instead.
+- Every trigger event, and tag runs. The guard rejects dropping an event or adding `paths`,
+  `*-ignore` or (outside `push`) `branches` filters.
+- Jobs that run the same command on a different runner, OS, toolchain version or directory are
+  not duplicates. The guard compares checks per runner and version.
 - Required status check names. If branch protection requires the job you remove, keep a job with
   that name.
 
@@ -27,6 +33,7 @@ pull request's branch.
 on:
   push:
     branches: [main]
+    tags: ['**']
   pull_request:
 
 concurrency:

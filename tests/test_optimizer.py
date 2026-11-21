@@ -91,12 +91,127 @@ def test_removing_an_identical_duplicate_job_passes() -> None:
     assert check_change(CI, duplicated, BASE).ok
 
 
-def test_parallelizing_by_moving_a_command_to_another_job_passes() -> None:
-    after = (
-        _changed("      - run: npm run lint\n", "")
-        + "  lint-only:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n"
+LINT_ONLY = "  lint-only:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n"
+
+
+def test_moving_a_check_out_of_a_kept_job_needs_an_aggregate_gate() -> None:
+    moved = _changed("      - run: npm run lint\n", "") + LINT_ONLY
+    assert any("job `lint` no longer runs `npm run lint` itself" in p for p in _problems(moved))
+
+    gate = (
+        "    needs: [lint-only]\n"
+        "    if: always()\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 10\n"
+        "    steps:\n"
+        "      - run: echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == \"success\")'\n"
     )
-    assert _problems(after) == []
+    lint_job = BASE[BASE.index("    runs-on: ubuntu-latest\n    timeout-minutes: 10") : BASE.index("  test:")]
+    gated = BASE.replace(lint_job, gate, 1) + LINT_ONLY
+    assert _problems(gated) == []
+
+
+def test_compound_install_keeps_its_chained_check() -> None:
+    head = "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n"
+    before = head + "      - run: npm install && npm test\n"
+    report = check_change(CI, before, head + "      - run: npm ci && npm test\n")
+    assert report.ok
+    assert report.warnings == [f"{CI}: changes the install command `npm install`"]
+    assert _problems(head + "      - run: npm ci\n", before) == [f"{CI}: drops the check `npm test` on x"]
+
+
+def test_removing_a_trailing_or_true_is_allowed() -> None:
+    assert _problems(BASE, _changed("npm run lint", "npm run lint || true")) == []
+
+
+@pytest.mark.parametrize(
+    ("before_jobs", "after_jobs", "expected"),
+    [
+        (  # a "duplicate" on another OS is not a duplicate
+            (
+                "  u:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n"
+                "  w:\n    runs-on: windows-latest\n    steps:\n      - run: npm test\n"
+            ),
+            "  u:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n",
+            "drops the check `npm test` on windows-latest",
+        ),
+        (  # matrix runners expand per value
+            (
+                "  t:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest, macos-latest]\n"
+                "    steps:\n      - run: npm test\n"
+            ),
+            "  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n",
+            "drops the check `npm test` on macos-latest",
+        ),
+        (  # include adds a combination; dropping it loses that runner
+            (
+                "  t:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [a, b]\n"
+                "        exclude:\n          - os: a\n        include:\n          - os: c\n"
+                "    steps:\n      - run: npm test\n"
+            ),
+            "  t:\n    runs-on: b\n    steps:\n      - run: npm test\n",
+            "drops the check `npm test` on c",
+        ),
+        (  # a toolchain version is part of where a check runs
+            (
+                "  t:\n    runs-on: x\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n"
+                "          node-version: 20\n      - run: npm test\n"
+            ),
+            (
+                "  t:\n    runs-on: x\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n"
+                "          node-version: 22\n      - run: npm test\n"
+            ),
+            "with actions/setup-node:node-version=20",
+        ),
+        (  # so is the working directory
+            (
+                "  t:\n    runs-on: x\n    defaults:\n      run:\n        working-directory: web\n"
+                "    steps:\n      - run: npm test\n"
+            ),
+            "  t:\n    runs-on: x\n    steps:\n      - run: npm test\n",
+            "on x in web",
+        ),
+        (  # and the container
+            "  t:\n    runs-on: x\n    container: node:20\n    steps:\n      - run: npm test\n",
+            "  t:\n    runs-on: x\n    steps:\n      - run: npm test\n",
+            "on x in node:20",
+        ),
+        (  # a reusable workflow job is a check too
+            "  t:\n    uses: org/repo/.github/workflows/test.yml@v1\n",
+            "  u:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+            "drops the check `uses org/repo/.github/workflows/test.yml`",
+        ),
+    ],
+)
+def test_checks_are_compared_where_they_run(before_jobs: str, after_jobs: str, expected: str) -> None:
+    head = "on: push\njobs:\n"
+    problems = _problems(head + after_jobs, head + before_jobs)
+    assert any(expected in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        (
+            "on: [push, pull_request]\n",
+            "on:\n  push:\n    branches: [main]\n  pull_request:\n",
+            "stops running for tags",
+        ),
+        ("on: [push]\n", "on:\n  push:\n    paths: ['src/**']\n", "gains a `paths` filter"),
+        ("on: [pull_request]\n", "on:\n  pull_request:\n    branches: [main]\n", "gains a `branches` filter"),
+    ],
+)
+def test_narrowed_triggers_are_rejected(before: str, after: str, expected: str) -> None:
+    jobs = "jobs:\n  t:\n    runs-on: x\n    steps:\n      - run: make test\n"
+    problems = _problems(after + jobs, before + jobs)
+    assert any(expected in p for p in problems), problems
+
+
+def test_branch_filter_that_keeps_tags_is_allowed() -> None:
+    jobs = "jobs:\n  t:\n    runs-on: x\n    steps:\n      - run: make test\n"
+    after = "on:\n  push:\n    branches: [main]\n    tags: ['**']\n  pull_request:\n"
+    assert _problems(after + jobs, "on: [push, pull_request]\n" + jobs) == []
 
 
 def test_continued_lines_and_comments_are_normalized() -> None:
@@ -112,7 +227,7 @@ def test_continued_lines_and_comments_are_normalized() -> None:
 @pytest.mark.parametrize(
     ("old", "new", "expected"),
     [
-        ("      - run: npm run lint\n", "", "drops the check command `npm run lint`"),
+        ("      - run: npm run lint\n", "", "drops the check `npm run lint` on ubuntu-latest"),
         ("npm run lint", "npm run lint || true", "ignores the exit code"),
         ("npm run lint", "set +e; npm run lint", "turns off fail-on-error"),
         ("npx playwright test", "npx playwright test --retries=2", "retries failed tests"),
@@ -128,7 +243,7 @@ def test_continued_lines_and_comments_are_normalized() -> None:
         (
             "      - uses: github/codeql-action/analyze@v3\n",
             "",
-            "drops the check action `github/codeql-action/analyze`",
+            "drops the check `uses github/codeql-action/analyze`",
         ),
         (
             "      - run: npx playwright test\n",
@@ -168,7 +283,9 @@ def test_trigger_forms_are_compared(before: str, after: str, lost: str) -> None:
 
 
 def test_removed_job_is_judged_by_its_commands_not_its_timeout() -> None:
-    before = BASE + "  docs:\n    runs-on: x\n    timeout-minutes: 5\n    steps:\n      - run: npm run lint\n"
+    before = (
+        BASE + "  docs:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - run: npm run lint\n"
+    )
     assert _problems(BASE, before) == []
 
 
@@ -198,10 +315,25 @@ def test_new_workflow_passes_with_a_warning() -> None:
     assert report.warnings == [f"{CI}: new workflow; nothing to compare against"]
 
 
-def test_unparseable_original_is_not_compared() -> None:
-    report = check_change(CI, "jobs: [unclosed", BASE)
-    assert report.ok
-    assert "could not be compared" in report.warnings[0]
+def test_unparseable_original_blocks_the_change() -> None:
+    assert _problems(BASE, before="jobs: [unclosed") == [
+        f"{CI}: the original does not parse, so the change cannot be checked"
+    ]
+
+
+def test_yaml_aliases_are_rejected() -> None:
+    bomb = "a: &a [x, x, x]\nb: &b [*a, *a, *a]\njobs:\n  t:\n    runs-on: *b\n"
+    assert _problems(bomb) == [f"{CI}: uses YAML aliases (*name); write the values out"]
+
+
+def test_oversized_file_is_rejected() -> None:
+    assert "is larger than" in _problems("#" * 200_001)[0]
+
+
+def test_oversized_matrix_is_rejected() -> None:
+    axes = "".join(f"        {axis}: [1, 2, 3, 4, 5, 6, 7]\n" for axis in "abc")
+    jobs = f"on: push\njobs:\n  t:\n    runs-on: x\n    strategy:\n      matrix:\n{axes}    steps:\n      - run: make\n"
+    assert _problems(jobs, jobs) == [f"{CI}: job `t` expands to more than 256 matrix combinations"]
 
 
 def test_other_files_are_only_parsed() -> None:
