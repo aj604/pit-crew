@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from pit_crew.lanes.analysis.critical_path import CIProfile, profile
 from pit_crew.lanes.analysis.detectors.dedupe import detect_dedupe_jobs
 from pit_crew.lanes.analysis.history import parse_runs
@@ -329,6 +331,44 @@ def test_dedupe_flags_same_script_at_different_block_indents() -> None:
 def _findings(text: str) -> int:
     p, wf = profiled(text, {"a": 100, "b": 200})
     return len(detect_dedupe_jobs(p, wf, PATH))
+
+
+@pytest.mark.parametrize(
+    ("extra_a", "extra_b"),
+    [
+        ("    env: {DB: postgres}\n", "    env: {DB: mysql}\n"),
+        ("    env: {DB: postgres}\n", ""),
+        ("    if: github.event_name == 'push'\n", "    if: github.event_name == 'pull_request'\n"),
+        ("    container: python:3.12\n", "    container: python:3.13\n"),
+        ("    services: {db: {image: postgres}}\n", "    services: {db: {image: mysql}}\n"),
+        ("    defaults: {run: {shell: bash}}\n", "    defaults: {run: {shell: sh}}\n"),
+        ("    timeout-minutes: 5\n", "    timeout-minutes: 50\n"),
+        ("    continue-on-error: true\n", ""),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_job_settings(extra_a: str, extra_b: str) -> None:
+    assert _findings(_pair(extra_a, extra_b)) == 0
+
+
+@pytest.mark.parametrize(
+    ("field_a", "field_b"),
+    [
+        ("env: {DB: postgres}", "env: {DB: mysql}"),
+        ("working-directory: frontend", "working-directory: backend"),
+        ("shell: bash", "shell: sh"),
+        ("timeout-minutes: 5", "timeout-minutes: 50"),
+        ("continue-on-error: true", "continue-on-error: false"),
+    ],
+)
+def test_dedupe_ignores_jobs_that_differ_in_step_settings(field_a: str, field_b: str) -> None:
+    step = "- run: pytest\n        "
+    assert _findings(_pair(step_a=step + field_a, step_b=step + field_b)) == 0
+    assert _findings(_pair(step_a=step + field_a, step_b=step + field_a)) == 1
+
+
+def test_dedupe_skips_jobs_with_oversized_env() -> None:
+    big = "    env: {X: " + "A" * 70_000 + "}\n"
+    assert _findings(_pair(big, big)) == 0
 
 
 def test_dedupe_does_not_treat_if_false_as_no_condition() -> None:

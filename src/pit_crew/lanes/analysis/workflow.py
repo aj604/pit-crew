@@ -65,6 +65,12 @@ class StepSpec:
     run: str | None
     with_: dict[str, str]
     if_: str | None
+    # Bounded canonical forms ("" if absent, MATRIX_TOO_LARGE if oversized) of fields that change what a step does.
+    env: str = ""
+    working_directory: str = ""
+    shell: str = ""
+    timeout_minutes: str = ""
+    continue_on_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,13 @@ class JobSpec:
     matrix_values: tuple[tuple[str, tuple[str, ...]], ...] = ()  # literal values per matrix key, include entries added
     matrix_definition: str = ""  # the whole strategy.matrix (include/exclude too) in YAML flow form, or its expression
     if_: str | None = None  # the job-level `if:`, as text
+    # Bounded canonical forms ("" if absent, MATRIX_TOO_LARGE if oversized) of fields that change what a job does.
+    env: str = ""
+    container: str = ""
+    services: str = ""
+    defaults: str = ""
+    timeout_minutes: str = ""
+    continue_on_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -139,6 +152,12 @@ def parse_workflow(text: str) -> Workflow:
             matrix_values=_matrix_values(body),
             matrix_definition=_matrix_definition(body),
             if_=_scalar(body.get("if")),
+            env=_canonical(body.get("env")),
+            container=_canonical(body.get("container")),
+            services=_canonical(body.get("services")),
+            defaults=_canonical(body.get("defaults")),
+            timeout_minutes=_canonical(body.get("timeout-minutes")),
+            continue_on_error=_canonical(body.get("continue-on-error")),
         )
     for job in jobs.values():
         unknown = [n for n in job.needs if n not in jobs]
@@ -148,7 +167,7 @@ def parse_workflow(text: str) -> Workflow:
     return Workflow(name=_text(doc.get("name")) or "", jobs=jobs)
 
 
-_NON_SCALAR = "<non-scalar>"  # stands in for a `with:` value that is a list or mapping
+NON_SCALAR = "<non-scalar>"  # stands in for a `with:` value that is a list or mapping
 
 
 def _text(value: object) -> str | None:
@@ -172,7 +191,7 @@ def _scalar(value: object) -> str | None:
 
 
 def _with_value(value: object) -> str:
-    return str(value) if isinstance(value, str | int | float | bool) or value is None else _NON_SCALAR
+    return str(value) if isinstance(value, str | int | float | bool) or value is None else NON_SCALAR
 
 
 def _step_name(item: dict[str, Any]) -> str:
@@ -196,6 +215,11 @@ def _parse_steps(raw: object) -> tuple[StepSpec, ...]:
                 str(k): _with_value(v) for k, v in (item["with"] if isinstance(item.get("with"), dict) else {}).items()
             },
             if_=_scalar(item.get("if")),
+            env=_canonical(item.get("env")),
+            working_directory=_canonical(item.get("working-directory")),
+            shell=_canonical(item.get("shell")),
+            timeout_minutes=_canonical(item.get("timeout-minutes")),
+            continue_on_error=_canonical(item.get("continue-on-error")),
         )
         for item in raw
         if isinstance(item, dict)
@@ -275,25 +299,32 @@ def _expanded_size_within(obj: object, limit: int) -> bool:
     return True
 
 
-def _matrix_definition(body: dict[str, Any]) -> str:
-    """The full `strategy.matrix` as a canonical string, so exclusions and inclusions tell matrices apart.
+def _canonical(value: object) -> str:
+    """A value as a canonical string for comparison: "" when absent, a string as written, else YAML flow form.
 
     Workflow YAML is hostile input: `safe_dump` emits anchors for shared nodes instead of expanding them,
-    and an oversized or unserializable matrix becomes a sentinel rather than being walked further.
+    and an oversized or unserializable value becomes the MATRIX_TOO_LARGE sentinel rather than being walked.
     """
-    strategy = body.get("strategy")
-    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
-    if isinstance(matrix, str):
-        return matrix  # an expression such as fromJSON(...): compared as written
-    if not isinstance(matrix, dict):
+    if value is None:
         return ""
-    if not _expanded_size_within(matrix, _MAX_MATRIX_BYTES):
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_MATRIX_BYTES else MATRIX_TOO_LARGE
+    if not _expanded_size_within(value, _MAX_MATRIX_BYTES):
         return MATRIX_TOO_LARGE
     try:
-        text = yaml.safe_dump(matrix, sort_keys=True, default_flow_style=True, width=2**31)
+        text = yaml.safe_dump(value, sort_keys=True, default_flow_style=True, width=2**31)
     except (yaml.YAMLError, TypeError, ValueError, RecursionError):
         return MATRIX_TOO_LARGE
     return text if len(text) <= _MAX_MATRIX_BYTES else MATRIX_TOO_LARGE
+
+
+def _matrix_definition(body: dict[str, Any]) -> str:
+    """The full `strategy.matrix` as a canonical string, so exclusions and inclusions tell matrices apart."""
+    strategy = body.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if isinstance(matrix, str | dict):  # a string is an expression such as fromJSON(...): compared as written
+        return _canonical(matrix)
+    return ""
 
 
 def _is_literal(value: object) -> bool:
