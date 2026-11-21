@@ -41,6 +41,14 @@ def workflow_path(workflow: str) -> Path:
     return path
 
 
+def _read_workflow(repo: str, workflow: str, *, branch: str | None = None) -> str:
+    """Read a workflow from the local checkout when present, else fetch it from GitHub."""
+    path = workflow_path(workflow)
+    if path.is_file():
+        return path.read_text()
+    return history.fetch_workflow(repo, workflow, ref=branch)
+
+
 @tool(
     lane="analysis",
     parameters={
@@ -73,7 +81,7 @@ def profile_ci(
     if not _REPO.fullmatch(repo) or ".." in repo:
         msg = f"repo must be owner/name, got {repo!r}"
         raise ValueError(msg)
-    spec = parse_workflow(workflow_path(workflow).read_text())
+    spec = parse_workflow(_read_workflow(repo, workflow, branch=branch))
     raw = history.fetch_history(repo, workflow, runs=runs, branch=branch)
     return profile(spec, history.parse_runs(raw)).to_dict()
 

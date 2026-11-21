@@ -1,0 +1,33 @@
+name: "🔴 Red Flag — Bug Report"
+description: Report a bug, regression, or unexpected verdict in Pit Crew
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: lane
+    attributes:
+      label: Affected Lane / Component
+      options:
+        - "ANA — Analysis"
+        - "OPT — Optimizer"
+        - "PRF — Proof"
+        - "DSP — Dispatcher / Server"
+        - "RAT — Rater"
+        - "Contracts / Ledger"
+        - "CLI / Tooling"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Concise description of the failure or unexpected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction Steps / Logs
+      description: Commands, fixture inputs, or JSON output that reproduce the issue.
+      render: shell
+    validations:
+      required: false

@@ -6,6 +6,7 @@
     GITHUB_TOKEN=... uv run python -m pit_crew.lanes.analysis.history fastapi/fastapi test.yml > runs.json
 """
 
+import base64
 import json
 import os
 import re
@@ -130,6 +131,32 @@ def fetch_history(  # noqa: PLR0913  keyword-only filters mirror the API's query
     with ThreadPoolExecutor(max_workers=_JOB_FETCHERS) as pool:
         jobs = list(pool.map(lambda run: _fetch_jobs(get, repo, run["id"]), selected))
     return [{**_pick(run, _RUN_FIELDS), "jobs": run_jobs} for run, run_jobs in zip(selected, jobs, strict=True)]
+
+
+def fetch_workflow(
+    repo: str,
+    workflow: str,
+    *,
+    ref: str | None = None,
+    token: str | None = None,
+    get: Getter | None = None,
+) -> str:
+    """Fetch a workflow YAML file under ``.github/workflows/`` from GitHub's Contents API."""
+    get = get or _http_getter(token if token is not None else os.environ.get("GITHUB_TOKEN"))
+    url = f"{API}/repos/{repo}/contents/.github/workflows/{workflow}"
+    if ref:
+        url = f"{url}?{urlencode({'ref': ref})}"
+    body, _ = get(url)
+    content = body.get("content") if isinstance(body, dict) else None
+    if (
+        not isinstance(body, dict)
+        or body.get("type") != "file"
+        or body.get("encoding") != "base64"
+        or not isinstance(content, str)
+    ):
+        msg = f"unexpected GitHub contents response for {repo}/.github/workflows/{workflow}"
+        raise ValueError(msg)
+    return base64.b64decode(content).decode("utf-8")
 
 
 def parse_runs(raw: list[dict[str, Any]]) -> list[WorkflowRun]:

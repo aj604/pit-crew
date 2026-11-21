@@ -1,3 +1,4 @@
+import base64
 import gzip
 import json
 from collections.abc import Sequence
@@ -11,7 +12,7 @@ from pit_crew import tools
 from pit_crew.lanes.analysis import history
 from pit_crew.lanes.analysis.buckets import Buckets, BucketStats, bucket_stats, is_setup_step, job_buckets
 from pit_crew.lanes.analysis.critical_path import critical_path, job_timings, max_saving, profile
-from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, next_link, parse_runs
+from pit_crew.lanes.analysis.history import WorkflowRun, fetch_history, fetch_workflow, next_link, parse_runs
 from pit_crew.lanes.analysis.stats import percentile
 from pit_crew.lanes.analysis.workflow import Workflow, parse_workflow, topological_order
 from pit_crew.ledger import InMemoryLedger
@@ -478,3 +479,58 @@ def test_profile_ci_rejects_a_workflow_symlinked_out_of_the_folder(
     build_request("analysis", "")
     with pytest.raises(ValueError, match="outside"):
         tools.call("profile_ci", InMemoryLedger(), {"repo": "o/r", "workflow": "ci.yml"})
+
+
+def test_fetch_workflow_decodes_github_contents_response() -> None:
+    yaml_text = "name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+    encoded = base64.encodebytes(yaml_text.encode("utf-8")).decode("ascii")
+    seen: list[str] = []
+
+    def fake_get(url: str) -> tuple[Any, str | None]:
+        seen.append(url)
+        return {"type": "file", "encoding": "base64", "content": encoded}, None
+
+    assert fetch_workflow("o/r", "ci.yml", get=fake_get) == yaml_text
+    assert fetch_workflow("o/r", "ci.yml", ref="feat/x", get=fake_get) == yaml_text
+    assert seen == [
+        "https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml",
+        "https://api.github.com/repos/o/r/contents/.github/workflows/ci.yml?ref=feat%2Fx",
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"type": "dir", "encoding": "base64", "content": ""},
+        {"type": "file", "encoding": "none", "content": ""},
+        {"type": "file", "encoding": "base64", "content": None},
+    ],
+)
+def test_fetch_workflow_rejects_unexpected_github_payloads(payload: object) -> None:
+    with pytest.raises(ValueError, match="unexpected GitHub contents response"):
+        fetch_workflow("o/r", "ci.yml", get=lambda _url: (payload, None))
+
+
+def test_profile_ci_fetches_workflow_from_github_when_workspace_has_no_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "missing"))
+    yaml_text = (FIXTURES / "fastapi" / "test.yml").read_text()
+    raw = fastapi_raw()
+    fetched: list[tuple[str, str, str | None]] = []
+
+    def fake_fetch_workflow(repo: str, workflow: str, *, ref: str | None = None) -> str:
+        fetched.append((repo, workflow, ref))
+        return yaml_text
+
+    monkeypatch.setattr(history, "fetch_workflow", fake_fetch_workflow)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw)
+
+    build_request("analysis", "")
+    result = tools.call(
+        "profile_ci", InMemoryLedger(), {"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "master"}
+    )
+
+    assert fetched == [("fastapi/fastapi", "test.yml", "master")]
+    assert result["critical_path"]["jobs"] == ["changes", "test", "coverage-combine", "test-alls-green"]

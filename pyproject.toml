@@ -4,8 +4,11 @@ version = "0.1.0"
 description = "An autonomous agent that makes CI faster and proves it still catches every bug."
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.165.0",
     "google-genai>=3.6.1",
+    "httpx>=0.28.1",
     "pyyaml>=6.0.4",
+    "uvicorn>=0.54.0",
 ]
 
 [build-system]
@@ -110,6 +113,9 @@ exclude_also = [
 [tool.deptry.package_module_name_map]
 google-genai = "google"
 
+[tool.deptry.per_rule_ignores]
+DEP002 = ["uvicorn", "httpx"]
+
 [tool.importlinter]
 root_package = "pit_crew"
 include_external_packages = true
@@ -172,3 +178,10 @@ source_modules = [
     "pit_crew.lanes",
 ]
 forbidden_modules = ["google"]
+
+[[tool.importlinter.contracts]]
+name = "The CLI reaches google-genai only through managed_agent"
+type = "forbidden"
+source_modules = ["pit_crew.cli"]
+forbidden_modules = ["google"]
+allow_indirect_imports = true

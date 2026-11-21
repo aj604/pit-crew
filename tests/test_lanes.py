@@ -1,3 +1,5 @@
+import base64
+import gzip
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +10,7 @@ import pytest
 from pit_crew import managed_agent, tools
 from pit_crew.contracts import Candidate, Hypothesis, ReplayPlan
 from pit_crew.dispatcher import next_lane
+from pit_crew.lanes.analysis import history
 from pit_crew.ledger import InMemoryLedger
 from pit_crew.managed_agent import (
     MODELS,
@@ -292,3 +295,94 @@ def test_run_lane_raises_when_exceeding_max_turns(monkeypatch: pytest.MonkeyPatc
     )
     with pytest.raises(MaxTurnsExceededError, match="exceeded 1"):
         run_lane("analysis", "loop forever", client=fake_client)
+
+
+def test_run_lane_forwards_repo_to_the_request() -> None:
+    fake_client = _FakeClient(responses=[_FakeInteraction(id="int-1", status="completed", steps=[])])
+    run_lane("analysis", "analyze", repo="org/fork", client=fake_client)
+    sources = fake_client.interactions.calls[0]["environment"]["sources"]  # type: ignore[index]
+    assert managed_agent.repository_source("org/fork") in sources
+
+
+def test_run_lane_profiles_ci_from_remote_repo_without_local_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixtures = Path(__file__).parent / "fixtures" / "fastapi"
+    workflow_yaml = (fixtures / "test.yml").read_text()
+    encoded = base64.encodebytes(workflow_yaml.encode("utf-8")).decode("ascii")
+    with gzip.open(fixtures / "runs.json.gz") as handle:
+        raw_runs = json.load(handle)
+
+    monkeypatch.setenv("PIT_CREW_WORKSPACE", str(tmp_path / "no-checkout"))
+    requested_urls: list[str] = []
+
+    def fake_getter(_token: str | None) -> history.Getter:
+        def get(url: str) -> tuple[Any, str | None]:
+            requested_urls.append(url)
+            return {"type": "file", "encoding": "base64", "content": encoded}, None
+
+        return get
+
+    monkeypatch.setattr(history, "_http_getter", fake_getter)
+    monkeypatch.setattr(history, "fetch_history", lambda *_args, **_kwargs: raw_runs)
+
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                environment_id="env-analysis",
+                steps=[
+                    _FakeStep(
+                        type="function_call",
+                        id="call-profile",
+                        name="profile_ci",
+                        arguments={"repo": "fastapi/fastapi", "workflow": "test.yml", "branch": "master"},
+                    )
+                ],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-analysis"),
+        ]
+    )
+
+    final = run_lane("analysis", "profile fastapi", repo="https://github.com/fastapi/fastapi", client=fake_client)
+    assert final.status == "completed"
+    assert requested_urls == [
+        "https://api.github.com/repos/fastapi/fastapi/contents/.github/workflows/test.yml?ref=master"
+    ]
+
+    tool_reply = fake_client.interactions.calls[1]["input"]
+    assert isinstance(tool_reply, list)
+    assert "is_error" not in tool_reply[0]
+    assert tool_reply[0]["result"]["critical_path"]["jobs"] == [
+        "changes",
+        "test",
+        "coverage-combine",
+        "test-alls-green",
+    ]
+
+
+def test_run_lane_converts_tool_oserror_into_function_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file", "ci.yml")
+
+    monkeypatch.setattr(tools, "call", boom)
+    fake_client = _FakeClient(
+        responses=[
+            _FakeInteraction(
+                id="int-1",
+                status="requires_action",
+                environment_id="env-err",
+                steps=[_FakeStep(type="function_call", id="call-err", name="profile_ci", arguments={})],
+            ),
+            _FakeInteraction(id="int-2", status="completed", steps=[], environment_id="env-err"),
+        ]
+    )
+
+    final = run_lane("analysis", "handle missing file", client=fake_client)
+    assert final.status == "completed"
+    tool_reply = fake_client.interactions.calls[1]["input"]
+    assert isinstance(tool_reply, list)
+    assert tool_reply[0]["is_error"] is True
+    assert "FileNotFoundError:" in tool_reply[0]["result"]
+    assert "ci.yml" in tool_reply[0]["result"]
