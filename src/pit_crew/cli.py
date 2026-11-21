@@ -5,6 +5,9 @@ to a SQLite ledger. It is the Milestone 2 check that a lane works end to end; se
 
 ``seed-target`` provisions a benchmark target repository from ``benchmarks/target_template`` and
 waits for its green ``workflow_dispatch`` baseline runs; see ``pit_crew.benchmark_seeder``.
+
+``check-target`` is the readiness preflight for a seeded target: Analysis must rank enough findings
+and Proof must have a fixed red commit for every required check; see ``pit_crew.check_target``.
 """
 
 import argparse
@@ -17,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from pit_crew import benchmark_seeder, managed_agent
+from pit_crew import benchmark_seeder, check_target, managed_agent
 from pit_crew.contracts import Candidate, Hypothesis, Record, ReplayPlan
 from pit_crew.ledger import Ledger, SqliteLedger, normalize_repo
 
@@ -191,6 +194,25 @@ def seed_target(
     return {**summary, **report.as_json(), "status": "seeded"}, True
 
 
+def run_check_target(
+    args: argparse.Namespace,
+    *,
+    get: check_target.Getter | None = None,
+    find_bottlenecks: check_target.FindBottlenecks | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Run ``check-target`` from parsed flags and return its JSON readiness report and whether it is ready."""
+    summary: dict[str, Any] = {"command": "check-target", "repo": args.repo, "ready": False}
+    try:
+        finder = find_bottlenecks
+        if finder is None:
+            finder = check_target.default_find_bottlenecks(Path(args.workspace))
+        readiness = check_target.check_target(args.repo, runs=args.runs, get=get, find_bottlenecks=finder)
+    except Exception as exc:  # noqa: BLE001  report every failure as JSON instead of a traceback
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        return summary, False
+    return {"command": "check-target", **readiness.as_json()}, readiness.ready
+
+
 def _repo(value: str) -> str:
     owner, _, name = value.partition("/")
     if not owner or not name or "/" in name:
@@ -225,6 +247,22 @@ def _add_seed_target(commands: "argparse._SubParsersAction[argparse.ArgumentPars
     seed.add_argument("--timeout", type=float, default=3600.0, help="seconds to wait for the baseline")
 
 
+def _add_check_target(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    check = commands.add_parser("check-target", help="check a seeded target is ready for Analysis and Proof")
+    check.add_argument("--repo", required=True, type=_repo, help="target repository, owner/name")
+    check.add_argument(
+        "--runs",
+        type=_positive_int,
+        default=check_target.DEFAULT_RUNS,
+        help="recent completed runs to read (default: %(default)s)",
+    )
+    check.add_argument(
+        "--workspace",
+        default=str(benchmark_seeder.DEFAULT_TEMPLATE),
+        help="checkout whose .github/workflows/ci.yml find_bottlenecks reads (default: the benchmark template)",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pit-crew", description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -238,6 +276,7 @@ def _parser() -> argparse.ArgumentParser:
         help=f"local checkout of --repo that analysis tools read (default: ${WORKSPACE_ENV} or {DEFAULT_WORKSPACE})",
     )
     _add_seed_target(commands)
+    _add_check_target(commands)
     return parser
 
 
@@ -246,15 +285,20 @@ def main(
     *,
     client: managed_agent.InteractionsClientLike | None = None,
     github: benchmark_seeder.GitHubClient | None = None,
+    get: check_target.Getter | None = None,
+    find_bottlenecks: check_target.FindBottlenecks | None = None,
 ) -> int:
     """Run the CLI and return its exit code: 0 when the command succeeded.
 
     ``client`` replaces the Managed Agents client for ``smoke-lane``; ``github`` replaces the
-    GitHub client for ``seed-target``.
+    GitHub client for ``seed-target``; ``get`` and ``find_bottlenecks`` replace the GitHub API
+    getter and the Analysis tool for ``check-target``.
     """
     args = _parser().parse_args(argv)
     if args.command == "seed-target":
         summary, passed = seed_target(args, github)
+    elif args.command == "check-target":
+        summary, passed = run_check_target(args, get=get, find_bottlenecks=find_bottlenecks)
     else:
         summary, passed = smoke_lane(
             args.lane, args.repo, args.ledger, args.task, workspace=args.workspace, client=client
